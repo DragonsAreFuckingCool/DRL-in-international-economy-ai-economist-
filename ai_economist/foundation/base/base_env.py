@@ -68,9 +68,10 @@ class BaseEnvironment(ABC):
     For additional detail regarding actions and action subspaces, see the
     BaseComponent class in base_component.py.
 
-    There are 2 types of agents: mobile agents and the planner agent.
-    # NOTE: Minimal update supports one or more planners while preserving legacy behavior.
-    # <<< UPDATED
+    There are 2 types of agents: mobile agents and the planner agent. There can be
+    two or more mobile agents and a single planner agent. Conceptually, mobile agents
+    represent the individual actors in the economic simulation while the planner
+    agent represents a social planner that sets macroeconomic policy.
 
     This environment framework makes extensive use of Python classes. Scenarios,
     Components, Agents, and environment entities such as Resources, Landmarks,
@@ -222,21 +223,11 @@ class BaseEnvironment(ABC):
         assert n_agents >= 2
         self.n_agents = n_agents
 
-        # --- Planner count handling (minimal extension) --------------------------
-        # If a scenario defines planner_subclasses (e.g., ["TopPlanner","BottomPlanner"]),
-        # use that length; otherwise default to 1 planner for backward compatibility.
-        # This is used only for bookkeeping (e.g., wrappers) here.
-        planner_subclasses = getattr(self, "planner_subclasses", None)  # <<< UPDATED
-        if planner_subclasses is None:  # <<< UPDATED
-            n_planners = 1              # <<< UPDATED
-        else:                           # <<< UPDATED
-            assert isinstance(planner_subclasses, (tuple, list)) and len(planner_subclasses) >= 1  # <<< UPDATED
-            n_planners = len(planner_subclasses)  # <<< UPDATED
-        # ------------------------------------------------------------------------
-
+        # Foundation assumes there's only a single planner
+        n_planners = 1
         self.num_agents = (
             n_agents + n_planners
-        )  # used in the warp_drive env wrapper (+ planners)  # <<< UPDATED (comment)
+        )  # used in the warp_drive env wrapper (+ 1 for the planner)
 
         # Components must be a tuple/list where each element is either a...
         #   tuple: ('Component Name', {Component kwargs})
@@ -322,13 +313,11 @@ class BaseEnvironment(ABC):
             self._register_entities(component_cls.required_entities)
             component_classes.append([component_cls, component_config])
 
-
-        # NEW: pull planner_subclasses from scenario if defined.
-        planner_subclasses = getattr(self, "planner_subclasses", None)
-
-
         # Initialize the world object (contains agents and world map),
         # now that we know all the entities we'll use.
+        # Multi-planner support (Scenario-level attribute)
+        planner_subclasses = getattr(self, "planner_subclasses", None)
+
         self.world = World(
             self.world_size,
             self.n_agents,
@@ -357,23 +346,17 @@ class BaseEnvironment(ABC):
             agent.register_inventory(self.resources)
             agent.register_endogenous(self.endogenous)
             agent.register_components(self._components)
+        # Single or multiple planners
+        if hasattr(self.world, "planners"):
+            for planner in self.world.planners:
+                planner.register_inventory(self.resources)
+                planner.register_components(self._components)
+        else:
+            # Legacy fallback (single planner)
+            self.world.planner.register_inventory(self.resources)
+            self.world.planner.register_components(self._components)
 
-        # --- Planner registration (supports one or many) ------------------------
-        # If World exposes multiple planners (world.planners), iterate them;
-        # otherwise, fall back to world.planner for backward compatibility.
-        planners = getattr(self.world, "planners", None)  # <<< UPDATED
-        if planners is None:                               # <<< UPDATED
-            # Legacy single-planner path                      <<< UPDATED
-            self.world.planner.register_inventory(self.resources)   # <<< UPDATED
-            self.world.planner.register_components(self._components) # <<< UPDATED
-        else:                                              # <<< UPDATED
-            for planner in planners:                       # <<< UPDATED
-                planner.register_inventory(self.resources) # <<< UPDATED
-                planner.register_components(self._components)  # <<< UPDATED
-        # ------------------------------------------------------------------------
-
-        # Build fast lookup for all agents (mobiles + planner(s))
-        self._agent_lookup = {str(agent.idx): agent for agent in self.all_agents}  # <<< UPDATED
+        self._agent_lookup = {str(agent.idx): agent for agent in self.all_agents}
 
         self._completions = 0
 
@@ -437,11 +420,11 @@ class BaseEnvironment(ABC):
 
     @property
     def all_agents(self):
-        """List of mobile agents and planner agent(s)."""  # <<< UPDATED (docstring)
-        planners = getattr(self.world, "planners", None)  # <<< UPDATED
-        if planners is None:                               # <<< UPDATED
-            return self.world.agents + [self.world.planner]  # legacy single planner  # <<< UPDATED
-        return self.world.agents + list(self.world.planners)  # multiple planners     # <<< UPDATED
+        if hasattr(self.world, "planners"):
+            """List of mobile agents and the planner agents."""
+            return self.world.agents + list(self.world.planners)
+        """List of mobile agents and the planner agent."""
+        return self.world.agents + [self.world.planner]
 
     @property
     def previous_episode_metrics(self):
@@ -555,7 +538,7 @@ class BaseEnvironment(ABC):
 
         Args:
             agent_idx (int or str): Identifier of the agent to return. Must match the
-            idx property of one of the agent objects in self.all_agents.
+                idx property of one of the agent objects in self.all_agents.
 
         Returns:
             agent (BaseAgent object)
@@ -662,13 +645,6 @@ class BaseEnvironment(ABC):
                     d[k] = d[k][0]
             return d
 
-        # If using agent/planner collation, we only support single planner (legacy).
-        # Minimal change: disallow collation with multiple planners for now.
-        if self.collate_agent_step_and_reset_data and getattr(self.world, "planners", None) is not None:  # <<< UPDATED
-            raise NotImplementedError(  # <<< UPDATED
-                "collate_agent_step_and_reset_data is not supported with multiple planners (minimal update)."  # <<< UPDATED
-            )
-
         # Initialize empty observations
         if self.collate_agent_step_and_reset_data:
             obs = {"a": {}, "p": {}}
@@ -677,6 +653,11 @@ class BaseEnvironment(ABC):
         agent_wise_planner_obs = {
             "p" + str(agent.idx): {} for agent in self.world.agents
         }
+        if self.collate_agent_step_and_reset_data and hasattr(self.world, "planners") and len(self.world.planners) > 1:
+            raise NotImplementedError(
+                "collate_agent_step_and_reset_data is not supported with multiple planners."
+            )
+
 
         # Get/process observations generated by the scenario
         world_obs = {str(k): v for k, v in self.generate_observations().items()}
@@ -729,26 +710,23 @@ class BaseEnvironment(ABC):
                         print("Agent index: {}\nRaw obs: {}\n".format(aidx, aobs))
                         raise
 
-        # Merge "agent-wise planner info" into planner observations.
-        # Legacy: put into the single planner's obs.
-        # Multi-planner (minimal): copy into every planner's obs (scenario can also choose
-        # to provide planner-specific obs keys directly).
-        planners = getattr(self.world, "planners", None)  # <<< UPDATED
-        if planners is None:                               # <<< UPDATED
-            for k, v in agent_wise_planner_obs.items():    # <<< UPDATED
-                if len(v) > 0:                             # <<< UPDATED
-                    obs[self.world.planner.idx][k] = (     # <<< UPDATED
+        
+        for k, v in agent_wise_planner_obs.items():
+            if len(v) == 0:
+                continue
+
+            if hasattr(self.world, "planners"):
+                # Multiple planners → duplicate into each planner’s obs dict
+                for planner in self.world.planners:
+                    obs[str(planner.idx)][k] = (
                         v["flat"] if flatten_observations else v
                     )
-        else:                                              # <<< UPDATED
-            for k, v in agent_wise_planner_obs.items():    # <<< UPDATED
-                if len(v) == 0:                            # <<< UPDATED
-                    continue                                # <<< UPDATED
-                for planner in planners:                   # <<< UPDATED
-                    obs[str(planner.idx)][k] = (           # <<< UPDATED
-                        v["flat"] if flatten_observations else v
-                    )
-        # ------------------------------------------------------------------------
+            else:
+                # Legacy single planner
+                obs[self.world.planner.idx][k] = (
+                    v["flat"] if flatten_observations else v
+                )
+
 
         # Get each agent's action masks and incorporate them into the observations
         for aidx, amask in self._generate_masks(flatten_masks=flatten_masks).items():
@@ -757,12 +735,6 @@ class BaseEnvironment(ABC):
         return obs
 
     def _generate_masks(self, flatten_masks=True):
-        # If using collation, we only support single planner (legacy).
-        if self.collate_agent_step_and_reset_data and getattr(self.world, "planners", None) is not None:  # <<< UPDATED
-            raise NotImplementedError(  # <<< UPDATED
-                "collate_agent_step_and_reset_data is not supported with multiple planners (minimal update)."  # <<< UPDATED
-            )
-
         if self.collate_agent_step_and_reset_data:
             masks = {"a": {}, "p": {}}
         else:
@@ -783,12 +755,16 @@ class BaseEnvironment(ABC):
         if flatten_masks:
             if self.collate_agent_step_and_reset_data:
                 flattened_masks = {}
+                planner_ids = [str(p.idx) for p in self.world.planners] if hasattr(self.world, "planners") else [str(self.world.planner.idx)]
                 for agent_id in masks.keys():
                     if agent_id == "a":
                         multi_action_mode = self.multi_action_mode_agents
                         no_op_mask = np.ones((1, self.n_agents))
-                    elif agent_id == "p":
+                    elif agent_id in planner_ids:
                         multi_action_mode = self.multi_action_mode_planner
+                        no_op_mask = [1]
+                    else:
+                        multi_action_mode = self.multi_action_mode_agents
                         no_op_mask = [1]
                     mask_dict = masks[agent_id]
                     list_of_masks = []
@@ -970,3 +946,241 @@ class BaseEnvironment(ABC):
         self.additional_reset_steps()
 
         # By default, agents take the NO-OP action for each action space.
+        # Reset actions to that default.
+        for agent in self.all_agents:
+            agent.reset_actions()
+
+        # Produce observations
+        obs = self._generate_observations(
+            flatten_observations=self._flatten_observations,
+            flatten_masks=self._flatten_masks,
+        )
+
+        if self.collate_agent_step_and_reset_data:
+            obs = self.collate_agent_obs(obs)
+
+        return obs
+
+    def step(self, actions=None, seed_state=None):
+        """
+        Execute the components, perform the scenario step, collect observations and
+        return observations, rewards, dones, and infos.
+
+        Arguments:
+            actions (dict): dictionary of {agent_idx: action} with an entry for each
+                agent (which may include the planner) that is supplying an action.
+                The key identifies which agent the action is associated with. It
+                should match that agent's agent.idx property.
+                The value indicates which action the agent will take. The environment
+                supports two formats for specifying an action, with slightly
+                different expectations for multi_action_mode.
+                If agent.multi_action_mode, action must be a list of integers
+                specifying the chosen action for each action subspace.
+                Otherwise, action must be a single integer specifying the chosen
+                action (where the action space is the concatenation of the subspaces).
+            seed_state (tuple or list): Optional state that the numpy RNG should be set
+                to prior to the reset cycle must be length 5, following the format
+                expected by np.random.set_state().
+
+        Returns:
+            obs (dict): A dictionary of {"agent_idx": agent_obs} with an entry for
+                each agent receiving observations. The "agent_idx" key identifies the
+                agent receiving the observations in the associated agent_obs value,
+                which itself is a dictionary. The "agent_idx" key matches the
+                agent.idx property for the given agent.
+            rew (dict): A dictionary of {"agent_idx": reward} with an entry for each
+                agent that also receives an observation. Each reward value is a scalar.
+            done (dict): A dictionary with a single key "__all__". The associated
+                value is False when self.world.timestep < self.episode_length and True
+                otherwise.
+            info (dict): Placeholder dictionary with structure {"agent_idx": {}},
+                with the same keys as obs and rew.
+        """
+        if actions is not None:
+            assert isinstance(actions, dict)
+            self.parse_actions(actions)
+
+        if seed_state is not None:
+            assert isinstance(seed_state, (tuple, list))
+            assert len(seed_state) == 5
+            seed_state = (
+                str(seed_state[0]),
+                np.array(seed_state[1], dtype=np.uint32),
+                int(seed_state[2]),
+                int(seed_state[3]),
+                float(seed_state[4]),
+            )
+            np.random.set_state(seed_state)
+
+        self._replay_log["step"].append(
+            dict(actions=actions, seed_state=np.random.get_state())
+        )
+
+        if self._dense_log_this_episode:
+            self._dense_log["world"].append(
+                deepcopy(self.world.maps.state_dict)
+                if (self.world.timestep % self._world_dense_log_frequency) == 0
+                else {}
+            )
+            self._dense_log["states"].append(
+                {str(agent.idx): deepcopy(agent.state) for agent in self.all_agents}
+            )
+            self._dense_log["actions"].append(
+                {
+                    str(agent.idx): {k: v for k, v in agent.action.items() if v > 0}
+                    for agent in self.all_agents
+                }
+            )
+
+        self.world.timestep += 1
+
+        for component in self._components:
+            component.component_step()
+
+        self.scenario_step()
+
+        obs = self._generate_observations(
+            flatten_observations=self._flatten_observations,
+            flatten_masks=self._flatten_masks,
+        )
+        rew = self._generate_rewards()
+        done = {"__all__": self.world.timestep >= self._episode_length}
+        info = {k: {} for k in obs.keys()}
+
+        if self._dense_log_this_episode:
+            self._dense_log["rewards"].append(rew)
+
+        for agent in self.all_agents:
+            agent.reset_actions()
+
+        if done[
+            "__all__"
+        ]:  # Complete the dense log and stash it as well as the metrics
+            self._finalize_logs()
+            self._completions += 1
+
+        if self.collate_agent_step_and_reset_data:
+            obs = self.collate_agent_obs(obs)
+            rew = self.collate_agent_rew(rew)
+            info = self.collate_agent_info(info)
+
+        return obs, rew, done, info
+
+    # The following methods must be implemented for each scenario
+    # -----------------------------------------------------------
+
+    @abstractmethod
+    def reset_starting_layout(self):
+        """
+        Part 1/2 of scenario reset. This method handles resetting the state of the
+        environment managed by the scenario (i.e. resource & landmark layout).
+        """
+
+    @abstractmethod
+    def reset_agent_states(self):
+        """
+        Part 2/2 of scenario reset. This method handles resetting the state of the
+        agents themselves (i.e. inventory, locations, etc.).
+        """
+
+    @abstractmethod
+    def scenario_step(self):
+        """
+        Update the state of the world according to whatever rules this scenario
+        implements.
+
+        This gets called in the 'step' method (of base_env) after going through each
+        component step and before generating observations, rewards, etc.
+
+        This is where things like resource regeneration, income redistribution, etc.,
+        can be implemented.
+        """
+
+    @abstractmethod
+    def generate_observations(self):
+        """
+        Generate observations associated with this scenario.
+
+        A scenario does not need to produce observations and can provide observations
+        for only some agent types; however, for a given agent type, it should either
+        always or never yield an observation. If it does yield an observation,
+        that observation should always have the same structure/sizes!
+
+        Returns:
+            obs (dict): A dictionary of {agent.idx: agent_obs_dict}. In words,
+                return a dictionary with an entry for each agent (which can including
+                the planner) for which this scenario provides an observation. For each
+                entry, the key specifies the index of the agent and the value contains
+                its associated observation dictionary.
+        """
+
+    @abstractmethod
+    def compute_reward(self):
+        """
+        Apply the reward function(s) associated with this scenario to get the rewards
+        from this step.
+
+        Returns:
+            rew (dict): A dictionary of {agent.idx: agent_obs_dict}. In words,
+                return a  dictionary with an entry for each agent in the environment
+                (including the planner). For each entry, the key specifies the index of
+                the agent and the value contains the scalar reward earned this timestep.
+        """
+
+    # Optional methods for customization
+    # ----------------------------------
+
+    def additional_reset_steps(self):
+        """
+        Extra scenario-specific steps that should be performed at the end of the reset
+        cycle.
+
+        For each reset cycle...
+            First, reset_starting_layout() and reset_agent_states() will be called.
+
+            Second, <component>.reset() will be called for each registered component.
+
+            Lastly, this method will be called to allow for any final customization of
+            the reset cycle.
+        """
+
+    def scenario_metrics(self):
+        """
+        Allows the scenario to generate metrics (collected along with component metrics
+        in the 'metrics' property).
+
+        To have the scenario add metrics, this function needs to return a dictionary of
+        {metric_key: value} where 'value' is a scalar (no nesting or lists!)
+        """
+        return
+
+
+scenario_registry = Registry(BaseEnvironment)
+"""The registry for Scenario classes.
+
+This creates a registry object for Scenario classes. This registry requires that all
+added classes are subclasses of BaseEnvironment. To make a Scenario class available
+through the registry, decorate the class definition with @scenario_registry.add.
+
+Example:
+    from ai_economist.foundation.base.base_env
+    import BaseEnvironment, scenario_registry
+
+    @scenario_registry.add
+    class ExampleScenario(BaseEnvironment):
+        name = "Example"
+        pass
+
+    assert scenario_registry.has("Example")
+
+    ScenarioClass = scenario_registry.get("Example")
+    scenario = ScenarioClass(...)
+    assert isinstance(scenario, ExampleScenario)
+
+Notes:
+    The foundation package exposes the scenario registry as: foundation.scenarios
+
+    A Scenario class that is defined and registered following the above example will
+    only be visible in foundation.scenarios if defined/registered in a file that is
+    imported in ../scenarios/__init__.py.
+"""
