@@ -358,9 +358,6 @@ class World:
             (see BaseEnvironment in base_env.py).
         multi_action_mode_planner (bool): Whether the planner agent uses multi action
             mode (see BaseEnvironment in base_env.py).
-        planner_subclasses (list[str], optional): Optional list of planner class names
-            (registered in agent_registry) to instantiate. If None or empty, a single
-            BasicPlanner is created for backward compatibility.
     """
 
     def __init__(
@@ -371,7 +368,6 @@ class World:
         world_landmarks,
         multi_action_mode_agents,
         multi_action_mode_planner,
-        planner_subclasses=None,  # <- optional, keeps backward compatibility
     ):
         self.world_size = world_size
         self.n_agents = n_agents
@@ -379,19 +375,15 @@ class World:
         self.landmarks = world_landmarks
         self.multi_action_mode_agents = bool(multi_action_mode_agents)
         self.multi_action_mode_planner = bool(multi_action_mode_planner)
-
-        # Initialize spatial state
         self.maps = Maps(world_size, n_agents, world_resources, world_landmarks)
 
-        # Instantiate mobile agents
         mobile_class = agent_registry.get("BasicMobileAgent")
+        planner_class = agent_registry.get("BasicPlanner")
         self._agents = [
             mobile_class(i, multi_action_mode=self.multi_action_mode_agents)
             for i in range(self.n_agents)
         ]
-
-        # Instantiate planner(s)
-        self._init_planners(planner_subclasses)
+        self._planner = planner_class(multi_action_mode=self.multi_action_mode_planner)
 
         self.timestep = 0
 
@@ -401,31 +393,6 @@ class World:
         self.cuda_function_manager = None
         self.cuda_data_manager = None
 
-    # -------------------------
-    # Planner initialization
-    # -------------------------
-    def _init_planners(self, planner_subclasses):
-        """
-        Create planner agent(s). If planner_subclasses is provided (list of names),
-        instantiate one planner for each. Otherwise, create a single BasicPlanner
-        for backward compatibility.
-        """
-        if planner_subclasses and isinstance(planner_subclasses, (list, tuple)):
-            self._planners = []
-            for name in planner_subclasses:
-                planner_cls = agent_registry.get(name)
-                planner_obj = planner_cls(multi_action_mode=self.multi_action_mode_planner)
-                self._planners.append(planner_obj)
-            # For legacy paths that rely on a single planner handle:
-            self._planner = self._planners[0]
-        else:
-            planner_class = agent_registry.get("BasicPlanner")
-            self._planner = planner_class(multi_action_mode=self.multi_action_mode_planner)
-            self._planners = [self._planner]
-
-    # -------------------------
-    # Accessors
-    # -------------------------
     @property
     def agents(self):
         """Return a list of the agent objects in the world (sorted by index)."""
@@ -433,22 +400,9 @@ class World:
 
     @property
     def planner(self):
-        """Return the (legacy) single planner handle (first planner in multi-planner mode)."""
+        """Return the planner agent object."""
         return self._planner
 
-    @property
-    def planners(self):
-        """Return the list of planner agents (always a list, even in single-planner mode)."""
-        return self._planners
-
-    @property
-    def all_agents(self):
-        """Return all agent objects (mobile + planners)."""
-        return self._agents + list(self._planners)
-
-    # -------------------------
-    # Spatial convenience
-    # -------------------------
     @property
     def loc_map(self):
         """Return a map indicating the agent index occupying each location.
@@ -527,47 +481,3 @@ class World:
     def consume_resource(self, resource_name, r, c):
         """Consume a unit of resource_name from location [r, c]."""
         self.maps.set_point_add(resource_name, r, c, -1)
-
-    # -------------------------
-    # (Optional) helpers you might want later
-    # -------------------------
-    def add_planner(self, planner_name_or_cls, idx=None, multi_action_mode=None):
-        """Dynamically add a planner (rarely used; provided for completeness)."""
-        if isinstance(planner_name_or_cls, str):
-            planner_cls = agent_registry.get(planner_name_or_cls)
-        else:
-            planner_cls = planner_name_or_cls
-        if multi_action_mode is None:
-            multi_action_mode = self.multi_action_mode_planner
-        # If idx is provided and planner class allows it, pass it; otherwise init without idx
-        try:
-            planner = planner_cls(idx=idx, multi_action_mode=multi_action_mode)
-        except TypeError:
-            planner = planner_cls(multi_action_mode=multi_action_mode)
-        self._planners.append(planner)
-        # keep legacy pointer on first planner
-        if self._planner is None:
-            self._planner = planner
-        return planner
-
-    def remove_planner(self, planner_idx_or_obj):
-        """Remove a planner by reference or idx (use with caution)."""
-        if not self._planners:
-            return False
-        if hasattr(planner_idx_or_obj, "idx"):
-            target_idx = str(planner_idx_or_obj.idx)
-        else:
-            target_idx = str(planner_idx_or_obj)
-        kept = []
-        removed = False
-        for p in self._planners:
-            if str(p.idx) == target_idx and not removed:
-                removed = True
-                continue
-            kept.append(p)
-        self._planners = kept if kept else []
-        if not self._planners:
-            self._planner = None
-        else:
-            self._planner = self._planners[0]
-        return removed
