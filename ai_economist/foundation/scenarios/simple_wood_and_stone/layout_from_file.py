@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 from scipy import signal
 
-from ai_economist.foundation.base.base_env import BaseEnvironment, scenario_registry
+from ai_economist.foundation.base.base_env_original import BaseEnvironment, scenario_registry
 from ai_economist.foundation.scenarios.utils import rewards, social_metrics
 
 
@@ -209,8 +209,8 @@ class LayoutFromFile(BaseEnvironment):
             # Based on skill, assign each agent to one of the location groups
             skill_groups = np.floor(
                 np.arange(self.n_agents) * (4 / self.n_agents),
-            ).astype(np.int)
-            n_in_group = np.zeros(4, dtype=np.int)
+            ).astype(np.int32)
+            n_in_group = np.zeros(4, dtype=np.int32)
             for g in skill_groups:
                 # The position within the group is given by the number of agents
                 # counted in the group thus far.

@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 import GPUtil
 import numpy as np
 
-from ai_economist.foundation.base.base_env import BaseEnvironment, scenario_registry
+from ai_economist.foundation.base.base_env_original import BaseEnvironment, scenario_registry
 from ai_economist.foundation.utils import verify_activation_code
 
 try:

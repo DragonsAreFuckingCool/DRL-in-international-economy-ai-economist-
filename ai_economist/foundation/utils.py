@@ -12,7 +12,7 @@ from hashlib import sha512
 import lz4.frame
 from Crypto.PublicKey import RSA
 
-from ai_economist.foundation.base.base_env import BaseEnvironment
+from ai_economist.foundation.base.base_env_original import BaseEnvironment
 
 
 def save_episode_log(game_object, filepath, compression_level=16):

@@ -10,7 +10,7 @@ import numpy as np
 
 from ai_economist.foundation.agents import agent_registry
 from ai_economist.foundation.base.registrar import Registry
-from ai_economist.foundation.base.world import World
+from ai_economist.foundation.base.world_original import World
 
 
 class BaseComponent(ABC):
