@@ -12,7 +12,7 @@ import numpy as np
 
 from ai_economist.foundation.agents import agent_registry
 from ai_economist.foundation.base.registrar import Registry
-from ai_economist.foundation.base.world_original import World
+from ai_economist.foundation.base.world import World
 from ai_economist.foundation.components import component_registry
 from ai_economist.foundation.entities import (
     endogenous_registry,
@@ -325,7 +325,7 @@ class BaseEnvironment(ABC):
             self.landmarks,
             self.multi_action_mode_agents,
             self.multi_action_mode_planner,
-            planner_subclasses=planner_subclasses,
+            #planner_subclasses=planner_subclasses,
         )
 
         # Initialize the component objects.
