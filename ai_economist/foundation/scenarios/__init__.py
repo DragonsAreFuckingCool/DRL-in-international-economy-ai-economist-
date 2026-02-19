@@ -6,7 +6,7 @@
 
 from ai_economist.foundation.base.base_env_original import scenario_registry
 
-from .covid19 import covid19_env
+#from .covid19 import covid19_env
 from .one_step_economy import one_step_economy
 from .simple_wood_and_stone import dynamic_layout, layout_from_file
 

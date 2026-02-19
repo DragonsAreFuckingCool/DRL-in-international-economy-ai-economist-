@@ -9,7 +9,7 @@ from ai_economist.foundation.base.base_component import component_registry
 from . import (
     build,
     continuous_double_auction,
-    covid19_components,
+    #covid19_components,
     move,
     redistribution,
     simple_labor,
