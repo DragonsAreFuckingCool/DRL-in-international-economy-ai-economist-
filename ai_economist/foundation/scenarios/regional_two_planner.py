@@ -4,6 +4,8 @@
 import numpy as np
 from copy import deepcopy
 
+from ai_economist.foundation.agents.regional_planner import TopPlanner, BottomPlanner 
+
 from ai_economist.foundation.base.base_env import BaseEnvironment, scenario_registry
 # IMPORTANT: import the multi-planner capable SplitLayout (yours)
 # If SplitLayout is in ai_economist.foundation.scenarios.layout_from_file, import it:
