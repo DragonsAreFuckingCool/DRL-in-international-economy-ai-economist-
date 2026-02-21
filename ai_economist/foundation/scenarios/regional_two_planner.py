@@ -91,11 +91,22 @@ class SplitLayoutTwoPlanner(SplitLayout):
             self.agent_to_planner[str(a.idx)] = pid
             self.planner_to_agents[pid].append(str(a.idx))
 
+
     def _get_region_arrays(self, agent_ids):
-        """Return coin_endowments and utilities arrays for a list of agent string ids."""
-        coin = np.array([self.get_agent(aid).total_endowment("Coin") for aid in agent_ids], dtype=np.float32)
-        util = np.array([self.curr_optimization_metric[aid] for aid in agent_ids], dtype=np.float32)
-        return coin, util
+        coins, utils = [], []
+        for aid in agent_ids:
+            a = self.get_agent(aid)
+            c = a.total_endowment("Coin")
+            coins.append(c)
+            utils.append(
+                rewards.isoelastic_coin_minus_labor(
+                    coin_endowment=c,
+                    total_labor=a.state["endogenous"]["Labor"],
+                    isoelastic_eta=self.isoelastic_eta,
+                    labor_coefficient=self.energy_weight * self.energy_cost,
+                )
+            )
+        return np.array(coins, dtype=np.float32), np.array(utils, dtype=np.float32)
 
     # ------------------------------
     # Reset / Step plumbing
@@ -128,11 +139,21 @@ class SplitLayoutTwoPlanner(SplitLayout):
         for p in self.world.planners:
             pid = str(p.idx)
             coin_endowments, utilities = self._get_region_arrays(self.planner_to_agents[pid])
+
             if self.planner_reward_type == "coin_eq_times_productivity":
-                curr[pid] = rewards.coin_eq_times_productivity(
-                    coin_endowments=coin_endowments,
-                    equality_weight=1 - self.mixing_weight_gini_vs_coin
-                )
+                n = len(coin_endowments)
+                eq_weight = 1.0 - self.mixing_weight_gini_vs_coin  # 0.0 for productivity-only
+                if n == 0:
+                    curr[pid] = 0.0
+                elif eq_weight <= 0.0 or n <= 1:
+                    # Productivity-only OR too few agents to define Gini: equality := 1, reward = prod/n
+                    curr[pid] = float(np.sum(coin_endowments)) / n
+                else:
+                    curr[pid] = rewards.coin_eq_times_productivity(
+                        coin_endowments=coin_endowments,
+                        equality_weight=eq_weight,
+                    )
+
             elif self.planner_reward_type == "inv_income_weighted_coin_endowments":
                 curr[pid] = rewards.inv_income_weighted_coin_endowments(
                     coin_endowments=coin_endowments
@@ -170,41 +191,52 @@ class SplitLayoutTwoPlanner(SplitLayout):
     # Observations
     # ------------------------------
     def generate_observations(self):
-        """
-        - Mobile agents: reuse SplitLayout obs behavior (egocentric or full map + inventories)
-        - Planners ("p_top"/"p_bottom"): provide **regional summaries** only.
-        """
+        
         obs = super().generate_observations()
 
-        # Add compact per-planner regional stats
+        def _keep(x):
+            # Make 2D so the flattener keeps the key
+            return np.array([[x]], dtype=np.float32)
+
+        # --- Regional planner summaries (ensure keys survive flattening) ---
         for p in self.world.planners:
             pid = str(p.idx)
-            assigned = self.planner_to_agents[pid]
+            assigned = self.planner_to_agents.get(pid, [])
             if len(assigned) == 0:
-                n = 0
-                avg_coin = 0.0
-                eq = 1.0
-                prod = 0.0
+                n, avg_coin, eq, prod = 0, 0.0, 1.0, 0.0
             else:
                 coin_endowments, _ = self._get_region_arrays(assigned)
                 n = len(assigned)
-                avg_coin = float(np.mean(coin_endowments))
-                eq = float(social_metrics.get_equality(coin_endowments))
-                prod = float(social_metrics.get_productivity(coin_endowments))
-            # Ensure the planner obs key exists (create if not returned by super)
+                avg_coin = float(np.mean(coin_endowments)) if n > 0 else 0.0
+                if n <= 1:
+                    eq = 1.0
+                else:
+                    eq = float(social_metrics.get_equality(coin_endowments))
+                prod = float(social_metrics.get_productivity(coin_endowments)) if n > 0 else 0.0
+
             if pid not in obs:
                 obs[pid] = {}
-            obs[pid].update(
-                {
-                    "n_region": np.array([n], dtype=np.float32),
-                    "avg_coin_region": np.array([avg_coin], dtype=np.float32),
-                    "equality_region": np.array([eq], dtype=np.float32),
-                    "productivity_region": np.array([prod], dtype=np.float32),
-                }
-            )
+
+            # Make values 2D to preserve keys after flattening
+            obs[pid]["n_region"] = _keep(n)
+            obs[pid]["avg_coin_region"] = _keep(avg_coin)
+            obs[pid]["equality_region"] = _keep(eq)
+            obs[pid]["productivity_region"] = _keep(prod)
+
+        # Ensure spatial maps are visible under p_top if enabled
+        legacy_pid = str(self.world.planner.idx)  # should be "p_top"
+        if self._planner_gets_spatial_info and legacy_pid in obs:
+            if "p_top" not in obs:
+                obs["p_top"] = {}
+            # NOTE: BaseEnvironment prefixes scenario obs with "world-".
+            # So the spatial maps arrive as "world-map" and "world-idx_map".
+            if "world-map" in obs[legacy_pid]:
+                obs["p_top"]["world-map"] = obs[legacy_pid]["world-map"]
+            if "world-idx_map" in obs[legacy_pid]:
+                obs["p_top"]["world-idx_map"] = obs[legacy_pid]["world-idx_map"]
 
         return obs
-
+    
     # ------------------------------
     # Rewards
     # ------------------------------
@@ -214,22 +246,30 @@ class SplitLayoutTwoPlanner(SplitLayout):
           - Agents: change in utility (isoelastic coin - labor)
           - Planners: change in **regional SWF** over assigned agents only
         """
-        # Keep previous snapshot for marginal difference
         util_last = deepcopy(self.curr_optimization_metric)
 
-        # 1) Update current agent utilities
+        # Recompute agent utilities (current)
         curr = self._compute_objectives_snapshot()
 
-        # 2) Update per-planner objective (regional)
+        # Recompute per-planner objective from assigned agents only
         for p in self.world.planners:
             pid = str(p.idx)
             assigned = self.planner_to_agents[pid]
             coin_endowments, utilities = self._get_region_arrays(assigned)
+
             if self.planner_reward_type == "coin_eq_times_productivity":
-                curr[pid] = rewards.coin_eq_times_productivity(
-                    coin_endowments=coin_endowments,
-                    equality_weight=1 - self.mixing_weight_gini_vs_coin
-                )
+                n = len(coin_endowments)
+                eq_weight = 1.0 - self.mixing_weight_gini_vs_coin
+                if n == 0:
+                    curr[pid] = 0.0
+                elif eq_weight <= 0.0 or n <= 1:
+                    curr[pid] = float(np.sum(coin_endowments)) / n
+                else:
+                    curr[pid] = rewards.coin_eq_times_productivity(
+                        coin_endowments=coin_endowments,
+                        equality_weight=eq_weight,
+                    )
+
             elif self.planner_reward_type == "inv_income_weighted_coin_endowments":
                 curr[pid] = rewards.inv_income_weighted_coin_endowments(
                     coin_endowments=coin_endowments
@@ -242,29 +282,40 @@ class SplitLayoutTwoPlanner(SplitLayout):
             else:
                 raise NotImplementedError
 
-        # 3) Marginal reward = curr - last
+        # Marginal reward
         rew = {k: float(curr[k] - util_last[k]) for k in curr.keys()}
 
-        # 4) Book-keeping
         self.prev_optimization_metric.update(util_last)
         self.curr_optimization_metric = deepcopy(curr)
 
-        # Done
+
+
+        # ===== TEMP DEBUG START =====
+        assigned_top = self.planner_to_agents["p_top"]
+        assigned_bottom = self.planner_to_agents["p_bottom"]
+        top_coins, _ = self._get_region_arrays(assigned_top)
+        bottom_coins, _ = self._get_region_arrays(assigned_bottom)
+        print("[DBG] top ids:", assigned_top, "sum_coin:", float(np.sum(top_coins)))
+        print("[DBG] bottom ids:", assigned_bottom, "sum_coin:", float(np.sum(bottom_coins)))
+        print("[DBG] rew:", rew)
+        # ===== TEMP DEBUG END =====
+
         return rew
 
     # ------------------------------
-    # Metrics (optional but useful)
+    # Metrics
     # ------------------------------
+    
     def scenario_metrics(self):
-        """
-        Report per-region equality/productivity and global stats for quick sanity checks.
-        """
         metrics = {}
 
         # Global
         coin = np.array([a.total_endowment("Coin") for a in self.world.agents], dtype=np.float32)
         metrics["global/productivity"] = social_metrics.get_productivity(coin)
-        metrics["global/equality"] = social_metrics.get_equality(coin)
+        # Guard when the number of agents is too small for Gini (0 or 1)
+        metrics["global/equality"] = (
+            1.0 if len(coin) <= 1 else social_metrics.get_equality(coin)
+        )
 
         # Regions
         for pid in ("p_top", "p_bottom"):
@@ -277,6 +328,9 @@ class SplitLayoutTwoPlanner(SplitLayout):
                 c, _ = self._get_region_arrays(assigned)
                 metrics[f"{pid}/n"] = len(assigned)
                 metrics[f"{pid}/productivity"] = social_metrics.get_productivity(c)
-                metrics[f"{pid}/equality"] = social_metrics.get_equality(c)
+                # Guard for n <= 1 to avoid divide-by-zero in Gini
+                metrics[f"{pid}/equality"] = (
+                    1.0 if len(assigned) <= 1 else social_metrics.get_equality(c)
+                )
 
         return metrics
