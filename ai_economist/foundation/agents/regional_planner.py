@@ -1,13 +1,7 @@
-# Copyright (...)
-# SPDX-License-Identifier: BSD-3-Clause
 
-from ai_economist.foundation.base.base_agent import BaseAgent
-from ai_economist.foundation.agents import agent_registry
+from ai_economist.foundation.base.base_agent import BaseAgent, agent_registry
 
 
-# ---------------------------------------------------------------------
-# Base class for multi-planner support
-# ---------------------------------------------------------------------
 @agent_registry.add
 class RegionalPlannerBase(BaseAgent):
     """
@@ -42,9 +36,8 @@ class RegionalPlannerBase(BaseAgent):
         )
 
 
-# ---------------------------------------------------------------------
 # TOP REGION PLANNER
-# ---------------------------------------------------------------------
+
 @agent_registry.add
 class TopPlanner(RegionalPlannerBase):
     """
@@ -57,9 +50,8 @@ class TopPlanner(RegionalPlannerBase):
         super().__init__(idx="p_top", multi_action_mode=multi_action_mode)
 
 
-# ---------------------------------------------------------------------
 # BOTTOM REGION PLANNER
-# ---------------------------------------------------------------------
+
 @agent_registry.add
 class BottomPlanner(RegionalPlannerBase):
     """
