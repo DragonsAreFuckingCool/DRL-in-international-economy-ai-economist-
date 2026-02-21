@@ -93,7 +93,7 @@ class SplitLayoutTwoPlanner(SplitLayout):
 
     def _get_region_arrays(self, agent_ids):
         """Return coin_endowments and utilities arrays for a list of agent string ids."""
-        coin = np.array([self.world.get_agent(aid).total_endowment("Coin") for aid in agent_ids], dtype=np.float32)
+        coin = np.array([self.get_agent(aid).total_endowment("Coin") for aid in agent_ids], dtype=np.float32)
         util = np.array([self.curr_optimization_metric[aid] for aid in agent_ids], dtype=np.float32)
         return coin, util
 
