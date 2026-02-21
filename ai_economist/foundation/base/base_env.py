@@ -325,7 +325,7 @@ class BaseEnvironment(ABC):
             self.landmarks,
             self.multi_action_mode_agents,
             self.multi_action_mode_planner,
-            #planner_subclasses=planner_subclasses,
+            planner_subclasses=planner_subclasses,
         )
 
         # Initialize the component objects.
