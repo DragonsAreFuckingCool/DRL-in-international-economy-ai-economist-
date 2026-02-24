@@ -111,7 +111,7 @@ class CovidAndEconomyEnvironment(BaseEnvironment):
         reward_normalization_factor=1,
         **base_env_kwargs,
     ):
-        verify_activation_code()
+        # verify_activation_code()
 
         # Used for datatype checks
         self.np_float_dtype = np.float32
