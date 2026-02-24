@@ -159,7 +159,7 @@ testpath==0.6.0
 tinycss2==1.2.1
 toml==0.10.2
 tomlkit==0.14.0
-torch==2.10.0
+torch==2.9.1+cu130
 tornado==6.5.4
 tqdm==4.67.3
 traitlets==5.14.3

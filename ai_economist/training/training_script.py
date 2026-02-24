@@ -14,6 +14,12 @@ using `pip install rl-warp-drive`, and Pytorch(https://pytorch.org/)
 import argparse
 import logging
 import os
+import traceback
+
+import sys, os
+
+sys.path.append(r'C:\Users\adria\coding\katja\DRL-in-international-economy-ai-economist-')
+
 
 import GPUtil
 
@@ -23,9 +29,10 @@ try:
     print(f"Inside training_script.py: {num_gpus_available} GPUs are available.")
     import torch
     import yaml
-    from warp_drive.training.trainer import Trainer
+    from warp_drive.training.deprecate.trainer import Trainer
     from warp_drive.utils.env_registrar import EnvironmentRegistrar
 except ModuleNotFoundError:
+    print(traceback.format_exc())
     raise ModuleNotFoundError(
         "This training script requires the 'WarpDrive' package, please run "
         "'pip install rl-warp-drive' first."
