@@ -10,77 +10,106 @@ import numpy as np
 from ai_economist.foundation import landmarks, resources
 
 
-def plot_map(maps, locs, ax=None, cmap_order=None):
-    world_size = np.array(maps.get("Wood")).shape
-    max_health = {"Wood": 1, "Stone": 1, "House": 1}
-    n_agents = len(locs)
+def plot_map(maps, locs, ax=None, cmap_order=None, show_water=True):
+    """Universal map renderer that works for live env (Maps) and dense logs (dict).
+    Handles large worlds cleanly and can optionally hide water for debugging.
+    """
+    # Helpers
+    def _map_keys(m):
+        # Both Maps and dict expose .keys()
+        return list(m.keys()) if hasattr(m, "keys") else []
+
+    def _map_get(m, key, default=None):
+        try:
+            return m.get(key)
+        except Exception:
+            return default
+
+    keys = _map_keys(maps)
+    if not keys:
+        raise ValueError("plot_map: No map keys found to infer world size.")
+
+    # Pick any entity to infer world size
+    example_map = _map_get(maps, keys[0])
+    world_size = np.array(example_map).shape
 
     if ax is None:
-        _, ax = plt.subplots(1, 1, figsize=(10, 10))
+        _, ax = plt.subplots(1, 1, figsize=(min(0.4*world_size[1], 16), min(0.4*world_size[0], 16)))
     else:
         ax.cla()
-    tmp = np.zeros((3, world_size[0], world_size[1]))
+
+    tmp = np.zeros((3, world_size[0], world_size[1]), dtype=float)
+    n_agents = len(locs)
     cmap = plt.get_cmap("jet", n_agents)
 
     if cmap_order is None:
         cmap_order = list(range(n_agents))
-    else:
-        cmap_order = list(cmap_order)
-        assert len(cmap_order) == n_agents
 
-    scenario_entities = [k for k in maps.keys() if "source" not in k.lower()]
-    for entity in scenario_entities:
-        if entity == "House":
+    # Dynamically draw all non-source entities
+    for key in keys:
+        if key is None:
             continue
-        elif resources.has(entity):
-            if resources.get(entity).collectible:
-                map_ = (
-                    resources.get(entity).color[:, None, None]
-                    * np.array(maps.get(entity))[None]
-                )
-                map_ /= max_health[entity]
-                tmp += map_
-        elif landmarks.has(entity):
-            map_ = (
-                landmarks.get(entity).color[:, None, None]
-                * np.array(maps.get(entity))[None]
-            )
-            tmp += map_
+        if "source" in str(key).lower():
+            continue
+
+        arr = _map_get(maps, key)
+        if arr is None:
+            continue
+
+        # Skip water if we don't want to show it
+        if not show_water and str(key).lower() == "water":
+            continue
+
+        if resources.has(key):
+            rdef = resources.get(key)
+            if rdef.collectible:
+                a = np.array(arr, dtype=float)
+                tmp += rdef.color[:, None, None] * a[None]
+
+        elif landmarks.has(key):
+            ldef = landmarks.get(key)
+            a = np.array(arr)
+            if a.ndim == 2:
+                tmp += ldef.color[:, None, None] * a[None].astype(float)
+            elif isinstance(arr, dict):  # e.g., House in logs
+                health = np.array(arr.get("health", np.zeros(world_size)), dtype=float)
+                tmp += ldef.color[:, None, None] * health[None]
+
+    # Agent-owned houses with per-agent colors
+    if "House" in keys:
+        house = _map_get(maps, "House")
+        if isinstance(house, dict):
+            house_idx = np.array(house.get("owner", np.zeros(world_size)), dtype=int)
+            house_health = np.array(house.get("health", np.zeros(world_size)), dtype=float)
         else:
-            continue
+            h = np.array(house, dtype=float)
+            house_idx = np.zeros_like(h, dtype=int)
+            house_health = h
 
-    if isinstance(maps, dict):
-        house_idx = np.array(maps.get("House")["owner"])
-        house_health = np.array(maps.get("House")["health"])
-    else:
-        house_idx = maps.get("House", owner=True)
-        house_health = maps.get("House")
-    for i in range(n_agents):
-        houses = house_health * (house_idx == cmap_order[i])
-        agent = np.zeros_like(houses)
-        agent += houses
-        col = np.array(cmap(i)[:3])
-        map_ = col[:, None, None] * agent[None]
-        tmp += map_
+        for i in range(n_agents):
+            houses = (house_idx == cmap_order[i]) * house_health
+            col = np.array(cmap(i)[:3])
+            tmp += col[:, None, None] * houses[None]
 
-    tmp *= 0.7
-    tmp += 0.3
+    # brighten + clip
+    tmp = 0.7 * tmp + 0.3
+    tmp = np.transpose(np.minimum(tmp, 1.0), [1, 2, 0])
 
-    tmp = np.transpose(tmp, [1, 2, 0])
-    tmp = np.minimum(tmp, 1.0)
+    im = ax.imshow(tmp, vmax=1.0, interpolation='nearest')  # keep grid crisp
+    ax.set_aspect('equal')  # no stretching
 
-    ax.imshow(tmp, vmax=1.0, aspect="auto")
-
-    bbox = ax.get_window_extent()
-
+    # Agent markers scale with axes size, not world size
+    bbox = ax.get_window_extent().transformed(ax.figure.dpi_scale_trans.inverted())
+    pix_h = bbox.height * ax.figure.dpi
     for i in range(n_agents):
         r, c = locs[cmap_order[i]]
         col = np.array(cmap(i)[:3])
-        ax.plot(c, r, "o", markersize=bbox.height * 20 / 550, color="w")
-        ax.plot(c, r, "*", markersize=bbox.height * 15 / 550, color=col)
+        ax.plot(c, r, "o", markersize=max(4, pix_h * 0.03), color="w")
+        ax.plot(c, r, "*", markersize=max(3, pix_h * 0.02), color=col)
 
     ax.set_xticks([])
     ax.set_yticks([])
+    return im
 
 
 def plot_env_state(env, ax=None, remap_key=None):
