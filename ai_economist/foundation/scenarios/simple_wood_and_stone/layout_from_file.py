@@ -81,6 +81,7 @@ class LayoutFromFile(BaseEnvironment):
         energy_warmup_method="decay",
         planner_reward_type="coin_eq_times_productivity",
         mixing_weight_gini_vs_coin=0.0,
+        agent_start_locs=None,
         **base_env_kwargs,
     ):
         super().__init__(*base_env_args, **base_env_kwargs)
@@ -92,6 +93,8 @@ class LayoutFromFile(BaseEnvironment):
         self._full_observability = bool(full_observability)
 
         self._mobile_agent_observation_range = int(mobile_agent_observation_range)
+
+        self.agent_start_locs = agent_start_locs
 
         # Load in the layout
         path_to_layout_file = Path(f"{Path(__file__).parent}/map_txt/{env_layout_file}")
@@ -579,6 +582,46 @@ class LayoutFromFile(BaseEnvironment):
         the four fixed skill/loc combinations. The agent-->skill/loc assignment is
         permuted so that all four skill/loc combinations are used.
         """
+        # --- CUSTOM STARTING LOCATIONS (minimal safe patch) ---
+        # If user provided custom start positions, apply them here and override
+        # any default/random/fixed-four placement.
+        if hasattr(self, "agent_start_locs") and self.agent_start_locs is not None:
+            # Validate provided list
+            if len(self.agent_start_locs) != self.n_agents:
+                raise ValueError(
+                    f"agent_start_locs must have {self.n_agents} entries, "
+                    f"got {len(self.agent_start_locs)}"
+                )
+
+            self.world.clear_agent_locs()
+            H, W = self.world_size
+
+            for agent, (r, c) in zip(self.world.agents, self.agent_start_locs):
+                r = int(r)
+                c = int(c)
+
+                # Validate bounds
+                if not (0 <= r < H and 0 <= c < W):
+                    raise ValueError(
+                        f"Custom start position {(r,c)} out of bounds for world size {self.world_size}"
+                    )
+
+                # Check if cell is occupiable
+                if not self.world.can_agent_occupy(r, c, agent):
+                    raise ValueError(
+                        f"Cannot place agent at specified location {(r,c)}; "
+                        "cell is blocked or not occupiable."
+                    )
+
+                self.world.set_agent_loc(agent, r, c)
+
+            # Recompute objective trackers and return early
+            curr_optimization_metric = self.get_current_optimization_metrics()
+            self.curr_optimization_metric = deepcopy(curr_optimization_metric)
+            self.init_optimization_metric = deepcopy(curr_optimization_metric)
+            self.prev_optimization_metric = deepcopy(curr_optimization_metric)
+            return
+
         if self.fixed_four_skill_and_loc:
             self.world.clear_agent_locs()
             for i, agent in enumerate(self.world.get_random_order_agents()):
@@ -715,14 +758,27 @@ class SplitLayout(LayoutFromFile):
             )
 
         # Augment the fixed layout to include a row of water through the middle
+        # --- REPLACE the entire augmentation block in SplitLayout.__init__ with this ---
+
+        # Decide barrier row
         if water_row is None:
             self._water_line = self.world_size[0] // 2
         else:
             self._water_line = int(water_row)
             assert 0 < self._water_line < self.world_size[0] - 1
+
+        # 1) Start with a CLEAN water map (removes any water from the layout file)
+        clean_water = np.zeros(self.world_size, dtype=np.int32)
+        # 2) Draw only the horizontal barrier line
+        clean_water[self._water_line, :] = 1
+        self._source_maps["Water"] = clean_water
+
+        # 3) Ensure no Wood/Stone sits on the barrier row
         for landmark, landmark_map in self._source_maps.items():
-            landmark_map[self._water_line, :] = 1 if landmark == "Water" else 0
-            self._source_maps[landmark] = landmark_map
+            if landmark in ["Wood", "Stone"]:
+                m = np.array(landmark_map, copy=True)
+                m[self._water_line, :] = 0
+                self._source_maps[landmark] = m
 
         # Controls logic for which agents (by skill rank) get placed on the top
         if skill_rank_of_top_agents is None:
