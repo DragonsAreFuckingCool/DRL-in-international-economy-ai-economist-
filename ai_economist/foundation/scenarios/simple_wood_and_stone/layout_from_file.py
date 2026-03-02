@@ -692,6 +692,77 @@ class LayoutFromFile(BaseEnvironment):
 
         return metrics
 
+@scenario_registry.add
+class CustomLayoutWithStarts(LayoutFromFile):
+    """
+    A clean scenario that:
+      - Loads the full world exactly from the text file (no water editing at all)
+      - Uses LayoutFromFile reset logic
+      - ONLY adds the ability to specify explicit starting positions via
+            agent_start_locs=[(r,c), ...]
+    """
+
+    name = "custom/layout_with_starts"
+
+    def __init__(self, *args, agent_start_locs=None, **kwargs):
+        # Let LayoutFromFile load everything normally
+        super().__init__(*args, **kwargs)
+
+        # Save custom start list
+        self.agent_start_locs = agent_start_locs
+
+    def additional_reset_steps(self):
+        """
+        Order:
+            1. If agent_start_locs is set → force these starts and return.
+            2. Else → fall back to LayoutFromFile behavior.
+        """
+
+        # 1) Handle custom starting positions
+        if self.agent_start_locs is not None:
+            if len(self.agent_start_locs) != self.n_agents:
+                raise ValueError(
+                    f"agent_start_locs must contain {self.n_agents} coordinates"
+                )
+
+            H, W = self.world_size
+            self.world.clear_agent_locs()
+
+            for agent, (r, c) in zip(self.world.agents, self.agent_start_locs):
+
+                r = int(r); c = int(c)
+
+                if not (0 <= r < H and 0 <= c < W):
+                    raise ValueError(f"Invalid start {(r,c)} for world size {self.world_size}")
+
+                # If spot can't be occupied, try a 5×5 neighborhood
+                if not self.world.can_agent_occupy(r, c, agent):
+                    placed = False
+                    for dr in range(-2,3):
+                        for dc in range(-2,3):
+                            rr = np.clip(r+dr, 0, H-1)
+                            cc = np.clip(c+dc, 0, W-1)
+                            if self.world.can_agent_occupy(rr, cc, agent):
+                                self.world.set_agent_loc(agent, rr, cc)
+                                placed = True
+                                break
+                        if placed:
+                            break
+                    if not placed:
+                        raise ValueError(f"Cannot place agent at or near {r,c}")
+
+                else:
+                    self.world.set_agent_loc(agent, r, c)
+
+            # update optimization metrics
+            curr = self.get_current_optimization_metrics()
+            self.curr_optimization_metric = deepcopy(curr)
+            self.init_optimization_metric = deepcopy(curr)
+            self.prev_optimization_metric = deepcopy(curr)
+            return
+
+        # 2) If not using custom starts, fall back on original behavior
+        return LayoutFromFile.additional_reset_steps(self)
 
 @scenario_registry.add
 class SplitLayout(LayoutFromFile):
@@ -886,9 +957,14 @@ class CustomSplitOverlayFromFile(LayoutFromFile):
         gap_width=3,                      # width of each gap in cols
         random_gap_count=0,               # if >0, add N random gaps
         random_gap_seed=None,             # for reproducibility
+        vertical_gap_rows=None,    # ← NEW
+        vertical_gap_height=3,     # ← NEW (size of gap)
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+
+        self.vertical_gap_rows = vertical_gap_rows
+        self.vertical_gap_height = int(vertical_gap_height)
 
         H, W = self.world_size
         if water_row is None:
@@ -927,13 +1003,33 @@ class CustomSplitOverlayFromFile(LayoutFromFile):
             water_map[water_row, c0:c1] = 0  # open water -> no barrier here
 
         # ---- Optional vertical line (you said you don't want it now) ----
+        # if add_vertical_line:
+        #     if vertical_col is None:
+        #         vertical_col = W // 2
+        #     vertical_col = int(vertical_col)
+        #     assert 0 <= vertical_col < W, "vertical_col must be within bounds"
+        #     water_map[:, vertical_col] = 1
+        #     # (If you also want vertical gaps: do similar carving on `water_map[:, vertical_col]`)
         if add_vertical_line:
+            # Default vertical_col = middle
             if vertical_col is None:
                 vertical_col = W // 2
             vertical_col = int(vertical_col)
-            assert 0 <= vertical_col < W, "vertical_col must be within bounds"
+
+            # Add full vertical line first
             water_map[:, vertical_col] = 1
-            # (If you also want vertical gaps: do similar carving on `water_map[:, vertical_col]`)
+
+            # Carve vertical gaps (rows where line should be broken)
+            if self.vertical_gap_rows is not None:
+                gap_h = max(1, self.vertical_gap_height)
+                half_upper = gap_h // 2
+                half_lower = gap_h - half_upper
+
+                for r in self.vertical_gap_rows:
+                    r0 = max(0, int(r - half_upper))
+                    r1 = min(H, int(r + half_lower))
+                    # punch out the vertical barrier in this band
+                    water_map[r0:r1, vertical_col] = 0
 
         # ---- Push water map back ----
         self._source_maps["Water"] = water_map
