@@ -1200,3 +1200,278 @@ class PeriodicBracketTax(BaseComponent):
         if self.disable_taxes:
             return None
         return self.taxes
+
+
+
+
+@component_registry.add
+class RegionalPeriodicBracketTax(PeriodicBracketTax):
+    """
+    Regional version of PeriodicBracketTax.
+
+    This component behaves exactly like PeriodicBracketTax, except:
+
+    - It is bound to a specific planner (planner_id = "p_top" or "p_bottom")
+    - It only applies taxes to agents in its assigned region ("top" or "bottom")
+    - It produces observations and action masks ONLY for its assigned planner
+    """
+
+    name = "RegionalPeriodicBracketTax"
+    agent_subclasses = ["BasicMobileAgent", "BasicPlanner", "TopPlanner", "BottomPlanner"]
+
+    def __init__(self, *args, region=None, planner_id=None, **kwargs):
+        # Store and REMOVE custom args before calling parent
+        self._region = str(region) if region is not None else None      # "top" / "bottom"
+        self._planner_id = str(planner_id) if planner_id is not None else None
+
+        # Call original init without extra kwargs
+        super().__init__(*args, **kwargs)
+
+    # ---------------------------------------------------------------------
+    # Utilities
+    # ---------------------------------------------------------------------
+
+    def _get_bound_planner(self, world):
+        """Return the planner object corresponding to self._planner_id."""
+        if hasattr(world, "planners"):
+            for p in world.planners:
+                if getattr(p, "idx", None) == self._planner_id:
+                    return p
+        # Fallback to legacy single-planner handle
+        return getattr(world, "planner", None)
+
+    def _in_region(self, agent, split):
+        """Return True if agent belongs to this component's region."""
+        if self._region == "top":
+            return agent.loc[0] < split
+        else:
+            return agent.loc[0] > split
+
+    def _get_split_row(self, world):
+        """Retrieve waterline/split row from scenario."""
+        scenario = getattr(world, "scenario", None)
+        if scenario is None:
+            return world.size[0] // 2
+
+        # Try scenario fields in order of your implementation
+        if hasattr(scenario, "_overlay_water_row"):
+            return scenario._overlay_water_row
+        if hasattr(scenario, "_water_line"):
+            return scenario._water_line
+
+        return world.size[0] // 2
+
+    # ---------------------------------------------------------------------
+    # Action spaces: restrict to correct planner subclasses
+    # ---------------------------------------------------------------------
+
+    def get_n_actions(self, agent_cls_name):
+        """Return bracket action specs but only for the bound planner."""
+        # Allow actions for planner subclasses
+        if agent_cls_name in ["TopPlanner", "BottomPlanner", "BasicPlanner"]:
+            if self.tax_model == "model_wrapper" and not self.disable_taxes:
+                return [
+                    ("TaxIndexBracket_{:03d}".format(int(r)), self.n_disc_rates)
+                    for r in self.bracket_cutoffs
+                ]
+        return 0
+
+    # ---------------------------------------------------------------------
+    # Select correct planner actions
+    # ---------------------------------------------------------------------
+
+    def set_new_period_rates_model(self):
+        """Use ONLY the bound planner's actions."""
+        if self.disable_taxes:
+            return
+
+        planner = self._get_bound_planner(self.world)
+        if planner is None:
+            return  # fail-safe
+
+        for i, bracket in enumerate(self.bracket_cutoffs):
+            action_name = "TaxIndexBracket_{:03d}".format(int(bracket))
+            planner_action = planner.get_component_action(self.name, action_name)
+
+            if planner_action == 0:
+                pass
+            elif planner_action <= self.n_disc_rates:
+                self.curr_rate_indices[i] = int(planner_action - 1)
+            else:
+                raise ValueError
+
+    # ---------------------------------------------------------------------
+    # Apply taxes ONLY to correct region
+    # ---------------------------------------------------------------------
+
+    def enact_taxes(self):
+        """Same as base but filtered to region."""
+        split = self._get_split_row(self.world)
+        net_tax_revenue = 0
+        tax_dict = dict(
+            schedule=np.array(self.curr_marginal_rates),
+            cutoffs=np.array(self.bracket_cutoffs),
+        )
+
+        # Track bracket schedules
+        for curr_rate, bracket_cutoff in zip(
+            self.curr_marginal_rates, self.bracket_cutoffs
+        ):
+            self._schedules["{:03d}".format(int(bracket_cutoff))].append(float(curr_rate))
+
+        # Reset period trackers
+        self.last_income = []
+        self.last_effective_tax_rate = []
+        self.last_marginal_rate = []
+
+        # ----- Collect taxes only in region -----
+        for agent, last_coin in zip(self.world.agents, self.last_coin):
+
+            # SKIP agents outside region
+            if not self._in_region(agent, split):
+                # No taxes for this agent; fill zeros for logs
+                tax_dict[str(agent.idx)] = {
+                    "income": 0.0,
+                    "tax_paid": 0.0,
+                    "marginal_rate": 0.0,
+                    "effective_rate": 0.0,
+                }
+                self.last_income.append(0.0)
+                self.last_marginal_rate.append(0.0)
+                self.last_effective_tax_rate.append(0.0)
+                self.all_effective_tax_rates.append(0.0)
+                continue
+
+            # Normal tax logic
+            income = agent.total_endowment("Coin") - last_coin
+            tax_due = self.taxes_due(income)
+            effective_taxes = np.minimum(agent.state["inventory"]["Coin"], tax_due)
+            marginal_rate = self.marginal_rate(income)
+            effective_tax_rate = float(effective_taxes / max(1e-6, income))
+
+            tax_dict[str(agent.idx)] = dict(
+                income=float(income),
+                tax_paid=float(effective_taxes),
+                marginal_rate=marginal_rate,
+                effective_rate=effective_tax_rate,
+            )
+
+            # Take taxes
+            agent.state["inventory"]["Coin"] -= effective_taxes
+            net_tax_revenue += effective_taxes
+
+            # Log
+            self.last_income.append(float(income))
+            self.last_marginal_rate.append(float(marginal_rate))
+            self.last_effective_tax_rate.append(effective_tax_rate)
+            self.all_effective_tax_rates.append(effective_tax_rate)
+            self._occupancy["{:03d}".format(int(self.income_bin(income)))] += 1
+
+        # ----- Redistribute lump sum to agents IN THIS REGION only -----
+        # (Option C typically redistributes within region)
+        lump_sum = net_tax_revenue / max(1, self.n_agents)
+        for agent in self.world.agents:
+            if self._in_region(agent, split):
+                agent.state["inventory"]["Coin"] += lump_sum
+                tax_dict[str(agent.idx)]["lump_sum"] = float(lump_sum)
+            else:
+                # No lump sum to other region
+                tax_dict[str(agent.idx)]["lump_sum"] = 0.0
+
+            self.last_coin[agent.idx] = float(agent.total_endowment("Coin"))
+
+        self.taxes.append(tax_dict)
+
+        # Update period logs
+        self._last_income_obs = np.array(self.last_income) / self.period
+        self._last_income_obs_sorted = self._last_income_obs[np.argsort(self._last_income_obs)]
+
+        # Saez buffer
+        if self.tax_model == "saez":
+            self._update_saez_buffer(tax_dict)
+
+    # ---------------------------------------------------------------------
+    # Observations: only for bound planner
+    # ---------------------------------------------------------------------
+
+    def generate_observations(self):
+        """Return obs ONLY for the planner_id assigned to this component."""
+        planner = self._get_bound_planner(self.world)
+        if planner is None:
+            return {}
+
+        is_tax_day = float(self.tax_cycle_pos >= self.period)
+        is_first_day = float(self.tax_cycle_pos == 1)
+        tax_phase = self.tax_cycle_pos / self.period
+
+        obs = {}
+
+        # Planner obs
+        obs[planner.idx] = dict(
+            is_tax_day=is_tax_day,
+            is_first_day=is_first_day,
+            tax_phase=tax_phase,
+            last_incomes=self._last_income_obs_sorted,
+            curr_rates=self._curr_rates_obs,
+        )
+
+        # Agents (these can be shared)
+        for agent in self.world.agents:
+            idx = str(agent.idx)
+
+            curr_marginal_rate = self.marginal_rate(
+                agent.total_endowment("Coin") - self.last_coin[agent.idx]
+            )
+
+            obs[idx] = dict(
+                is_tax_day=is_tax_day,
+                is_first_day=is_first_day,
+                tax_phase=tax_phase,
+                last_incomes=self._last_income_obs_sorted,
+                curr_rates=self._curr_rates_obs,
+                marginal_rate=curr_marginal_rate,
+            )
+
+            # Planner-per-agent info:
+            obs["p" + idx] = dict(
+                last_income=self._last_income_obs[agent.idx],
+                last_marginal_rate=self.last_marginal_rate[agent.idx],
+                curr_marginal_rate=curr_marginal_rate,
+            )
+
+        return obs
+
+    # ---------------------------------------------------------------------
+    # Masks: only for bound planner
+    # ---------------------------------------------------------------------
+
+    def generate_masks(self, completions=0):
+        planner = self._get_bound_planner(self.world)
+        if planner is None:
+            return {}
+
+        # Ask the parent first (lets it use its caching logic, annealing, etc.)
+        masks = super().generate_masks(completions)
+
+        # If parent returned the legacy key (world.planner), remap it to OUR planner_id
+        if isinstance(masks, dict) and (self.world.planner.idx in masks):
+            return {planner.idx: masks[self.world.planner.idx]}
+
+        # ------------------------------
+        # Fallback: construct a valid mask set for OUR planner
+        # ------------------------------
+        # We only need masks when tax_model == "model_wrapper" and taxes enabled.
+        if self.tax_model == "model_wrapper" and not self.disable_taxes:
+            # Bracket action names
+            keys = ["TaxIndexBracket_{:03d}".format(int(r)) for r in self.bracket_cutoffs]
+            # On day 1 of each period -> enable choices (ones), otherwise -> disable (zeros)
+            if self.tax_cycle_pos == 1:
+                base_vec = np.ones(self.n_disc_rates, dtype=np.float32)
+            else:
+                base_vec = np.zeros(self.n_disc_rates, dtype=np.float32)
+            fallback = {k: base_vec for k in keys}
+            return {planner.idx: fallback}
+
+        # If taxes are disabled or using a non-model tax model, safely return empty
+        return {}
+
