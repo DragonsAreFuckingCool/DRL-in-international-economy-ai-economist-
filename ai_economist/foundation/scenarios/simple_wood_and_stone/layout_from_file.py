@@ -52,7 +52,7 @@ class LayoutFromFile(BaseEnvironment):
             energy_warmup_method.
         energy_warmup_method (str): How to schedule energy annealing (warmup). If
             "decay" (default), use the number of completed episodes. If "auto",
-            use the number of timesteps where the average agent reward was positive.
+            use the number of timesteps where the average agent reward was pos itive.
         planner_reward_type (str): The type of reward used for the planner. Options
             are "coin_eq_times_productivity" (default),
             "inv_income_weighted_coin_endowment", and "inv_income_weighted_utility".
@@ -456,15 +456,30 @@ class LayoutFromFile(BaseEnvironment):
             for agent in self.world.agents
         }
 
-        obs[self.world.planner.idx] = {
+        # obs[self.world.planner.idx] = {
+        #     "inventory-" + k: v * self.inv_scale
+        #     for k, v in self.world.planner.inventory.items()
+        # }
+        # if self._planner_gets_spatial_info:
+        #     obs[self.world.planner.idx].update(
+        #         dict(map=curr_map, idx_map=agent_idx_maps)
+        #     )
+        # Keep component-generated planner obs instead of overwriting it
+        planner_obs = obs.get(self.world.planner.idx, {})
+
+        # Add planner inventory to it
+        planner_obs.update({
             "inventory-" + k: v * self.inv_scale
             for k, v in self.world.planner.inventory.items()
-        }
-        if self._planner_gets_spatial_info:
-            obs[self.world.planner.idx].update(
-                dict(map=curr_map, idx_map=agent_idx_maps)
-            )
+        })
 
+        # Add spatial info if requested
+        if self._planner_gets_spatial_info:
+            planner_obs.update(dict(map=curr_map, idx_map=agent_idx_maps))
+
+        # Write back merged version
+        obs[self.world.planner.idx] = planner_obs
+        
         # Mobile agents see the full map. Convey location info via one-hot map channels.
         if self._full_observability:
             for agent in self.world.agents:
@@ -763,6 +778,51 @@ class CustomLayoutWithStarts(LayoutFromFile):
 
         # 2) If not using custom starts, fall back on original behavior
         return LayoutFromFile.additional_reset_steps(self)
+
+class RegionalPlannerMixin:
+    """
+    Mixin: overrides planner obs so that each planner receives only
+    the top or bottom half of the spatial world.
+    """
+
+    def get_obs(self, agent):
+        # Get the obs dict from the parent class
+        obs = super().get_obs(agent)
+
+        # Only modify obs for planners
+        if agent.idx not in ("p_top", "p_bottom"):
+            return obs
+
+        H, W = self.world_size
+        split = self._water_line  # Provided by SplitLayout or your overlay scenarios
+
+        # These keys contain 2D/3D maps in standard foundation envs
+        spatial_keys = [k for k in obs if isinstance(obs[k], np.ndarray)
+                        and obs[k].ndim in (2, 3)]
+
+        for key in spatial_keys:
+            arr = obs[key]
+
+            # arr is either (C, H, W) or (H, W)
+            if arr.ndim == 3:
+                C, HH, WW = arr.shape
+                assert HH == H and WW == W, f"Unexpected map shape in {key}: {arr.shape}"
+                if agent.idx == "p_top":
+                    obs[key] = arr[:, :split, :]
+                else:  # p_bottom
+                    obs[key] = arr[:, split+1:, :]
+
+            elif arr.ndim == 2:
+                HH, WW = arr.shape
+                assert HH == H and WW == W
+                if agent.idx == "p_top":
+                    obs[key] = arr[:split, :]
+                else:
+                    obs[key] = arr[split+1:, :]
+
+        return obs
+
+
 
 @scenario_registry.add
 class SplitLayout(LayoutFromFile):
@@ -1121,3 +1181,30 @@ class CustomSplitOverlayFromFile(LayoutFromFile):
         self.curr_optimization_metric = deepcopy(curr_optimization_metric)
         self.init_optimization_metric = deepcopy(curr_optimization_metric)
         self.prev_optimization_metric = deepcopy(curr_optimization_metric)
+
+
+@scenario_registry.add
+class SplitWorldOverlayRegional(CustomSplitOverlayFromFile, RegionalPlannerMixin):
+    name = "custom/splitworld_overlay_regional"
+
+    def __init__(self, *args, **kwargs):
+
+        # --- POP ALL CUSTOM MULTI-PLANNER KEYS HERE ---
+        self.planner_subclasses = kwargs.pop("planner_subclasses", None)
+        self.planner_ids        = kwargs.pop("planner_ids", None)
+        self.planner_classes    = kwargs.pop("planner_classes", None)
+
+        # If you added these keys:
+        self.multi_action_mode_planner = kwargs.pop("multi_action_mode_planner", True)
+        self.multi_action_mode_agents   = kwargs.pop("multi_action_mode_agents", False)
+
+        # --- NOW call the parent constructors safely ---
+        super().__init__(*args, **kwargs)
+
+        # --- Initialize planners on the world AFTER base env exists ---
+        if self.planner_subclasses:
+            self.world._init_planners(self.planner_subclasses)
+
+        # You can also store planner IDs here:
+        if self.planner_ids:
+            self._planner_ids = self.planner_ids
