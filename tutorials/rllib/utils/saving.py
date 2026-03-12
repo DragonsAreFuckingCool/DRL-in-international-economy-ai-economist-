@@ -10,6 +10,10 @@ import pickle
 import shutil
 import sys
 
+import os, signal, sys, time
+
+sys.path.append(r'C:\Users\adria\coding\katja\DRL-in-international-economy-ai-economist-')
+
 import yaml
 from ai_economist import foundation
 from .remote import remote_env_fun

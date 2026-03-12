@@ -14,6 +14,9 @@ import pickle
 import random
 import warnings
 
+import sys
+sys.path.append(r'C:\Users\adria\coding\katja\DRL-in-international-economy-ai-economist-')
+
 import numpy as np
 from ai_economist import foundation
 from gym import spaces
