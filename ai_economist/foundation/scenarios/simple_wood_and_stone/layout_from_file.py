@@ -330,6 +330,7 @@ class LayoutFromFile(BaseEnvironment):
 
         Here, reset to the layout in the fixed layout file
         """
+        self._regional_prev_metrics = None
         self.world.maps.clear()
         for landmark, landmark_map in self._source_maps.items():
             self.world.maps.set(landmark, landmark_map)
@@ -993,6 +994,195 @@ import numpy as np
 from ai_economist.foundation.scenarios import scenario_registry
 # LayoutFromFile must be defined above in this module
 
+# @scenario_registry.add
+# class CustomSplitOverlayFromFile(LayoutFromFile):
+#     """
+#     Overlay-only split on top of file map:
+#       - Preserve all water from the file.
+#       - Overlay a horizontal water line at `water_row`.
+#       - Optional vertical line (off by default).
+#       - Optional gaps in the horizontal line so the map is not closed off.
+#       - Honors agent_start_locs (if provided) and multi-top skill ranks.
+#     """
+#     name = "custom/split_overlay_from_file"
+
+#     def __init__(
+#         self,
+#         *args,
+#         water_row=None,
+#         add_vertical_line=False,          # default OFF
+#         vertical_col=None,
+#         skill_rank_of_top_agents=None,
+#         preserve_file_water=True,         # keep file lakes/ponds
+#         horizontal_gap_cols=None,         # e.g. [12, 25, 38]
+#         gap_width=3,                      # width of each gap in cols
+#         random_gap_count=0,               # if >0, add N random gaps
+#         random_gap_seed=None,             # for reproducibility
+#         vertical_gap_rows=None,    # ← NEW
+#         vertical_gap_height=3,     # ← NEW (size of gap)
+#         **kwargs,
+#     ):
+#         super().__init__(*args, **kwargs)
+
+#         self.vertical_gap_rows = vertical_gap_rows
+#         self.vertical_gap_height = int(vertical_gap_height)
+
+#         H, W = self.world_size
+#         if water_row is None:
+#             water_row = H // 2
+#         water_row = int(water_row)
+#         assert 0 <= water_row < H, "water_row must be within map bounds"
+
+#         # ---- Start from file water (preserve) or from empty water map ----
+#         if "Water" not in self._source_maps:
+#             self._source_maps["Water"] = np.zeros(self.world_size, dtype=np.int32)
+
+#         if preserve_file_water:
+#             water_map = np.array(self._source_maps["Water"], copy=True)
+#         else:
+#             water_map = np.zeros(self.world_size, dtype=np.int32)
+
+#         # ---- Overlay horizontal barrier (full row first) ----
+#         water_map[water_row, :] = 1
+
+#         # ---- Carve gaps in the horizontal barrier ----
+#         if horizontal_gap_cols is None:
+#             horizontal_gap_cols = []
+#         if random_gap_count and random_gap_count > 0:
+#             rng = np.random.RandomState(random_gap_seed)
+#             # avoid edges so gaps are visible and valid
+#             candidate_cols = list(range(2, W - 2))
+#             rng.shuffle(candidate_cols)
+#             horizontal_gap_cols.extend(candidate_cols[:int(random_gap_count)])
+
+#         gap_w = max(1, int(gap_width))
+#         half_left = gap_w // 2
+#         half_right = gap_w - half_left
+#         for c in horizontal_gap_cols:
+#             c0 = max(0, int(c) - half_left)
+#             c1 = min(W, int(c) + half_right)
+#             water_map[water_row, c0:c1] = 0  # open water -> no barrier here
+
+#         # ---- Optional vertical line (you said you don't want it now) ----
+#         # if add_vertical_line:
+#         #     if vertical_col is None:
+#         #         vertical_col = W // 2
+#         #     vertical_col = int(vertical_col)
+#         #     assert 0 <= vertical_col < W, "vertical_col must be within bounds"
+#         #     water_map[:, vertical_col] = 1
+#         #     # (If you also want vertical gaps: do similar carving on `water_map[:, vertical_col]`)
+#         if add_vertical_line:
+#             # Default vertical_col = middle
+#             if vertical_col is None:
+#                 vertical_col = W // 2
+#             vertical_col = int(vertical_col)
+
+#             # Add full vertical line first
+#             water_map[:, vertical_col] = 1
+
+#             # Carve vertical gaps (rows where line should be broken)
+#             if self.vertical_gap_rows is not None:
+#                 gap_h = max(1, self.vertical_gap_height)
+#                 half_upper = gap_h // 2
+#                 half_lower = gap_h - half_upper
+
+#                 for r in self.vertical_gap_rows:
+#                     r0 = max(0, int(r - half_upper))
+#                     r1 = min(H, int(r + half_lower))
+#                     # punch out the vertical barrier in this band
+#                     water_map[r0:r1, vertical_col] = 0
+
+#         # ---- Push water map back ----
+#         self._source_maps["Water"] = water_map
+
+#         # Avoid stone/wood on top of overlayed lines (but keep file lakes everywhere else)
+#         for landmark in ["Wood", "Stone"]:
+#             if landmark in self._source_maps:
+#                 m = np.array(self._source_maps[landmark], copy=True)
+#                 m[water_row, :] = 0
+#                 if add_vertical_line:
+#                     m[:, vertical_col] = 0
+#                 self._source_maps[landmark] = m
+
+#         # ---------- Top-half by skill rank (unchanged from your custom class) ----------
+#         if skill_rank_of_top_agents is None:
+#             skill_rank_of_top_agents = [0]
+#         if isinstance(skill_rank_of_top_agents, (int, float)):
+#             self.skill_rank_of_top_agents = [int(skill_rank_of_top_agents)]
+#         elif isinstance(skill_rank_of_top_agents, (tuple, list)):
+#             self.skill_rank_of_top_agents = list(dict.fromkeys(skill_rank_of_top_agents))
+#         else:
+#             raise TypeError("skill_rank_of_top_agents must be scalar or list/tuple.")
+#         for rank in self.skill_rank_of_top_agents:
+#             assert 0 <= int(rank) < self.n_agents, \
+#                 f"Skill rank {rank} must be in [0, {self.n_agents-1}]"
+
+#         # Pre-compute skills (same logic as before)
+#         bm = self.get_component("Build")
+#         assert bm is not None, "Build component required for skill-based placement."
+#         pmsm = getattr(bm, "payment_max_skill_multiplier", 1)
+#         if getattr(bm, "skill_dist", None) == "pareto":
+#             pareto_samples = np.random.pareto(4, size=(100_000, self.n_agents))
+#             clipped = np.minimum(pmsm, (pmsm - 1) * pareto_samples + 1)
+#             avg_sorted = np.sort(clipped, axis=1).mean(axis=0)
+#             self._avg_ranked_skill = avg_sorted[::-1] * bm.payment
+#         else:
+#             self._avg_ranked_skill = np.array([bm.payment] * self.n_agents, dtype=float)
+
+#         # Save overlay positions we used for placement in additional_reset_steps
+#         self._overlay_water_row = water_row
+#         self._overlay_vertical = add_vertical_line
+#         self._overlay_vertical_col = int(vertical_col) if add_vertical_line else None
+
+#     def additional_reset_steps(self):
+#         """
+#         Placement order:
+#             1) If LayoutFromFile supports agent_start_locs and it's provided -> use it (and return).
+#             2) Else if fixed_four_skill_and_loc -> defer to parent logic.
+#             3) Else -> place using skill_rank_of_top_agents (top/bottom halves).
+#         """
+#         # 1) Defer to LayoutFromFile custom starts if present (your earlier patch)
+#         if hasattr(self, "agent_start_locs") and self.agent_start_locs is not None:
+#             return LayoutFromFile.additional_reset_steps(self)
+
+#         # 2) Respect fixed-four logic from LayoutFromFile if enabled
+#         if getattr(self, "fixed_four_skill_and_loc", False):
+#             return LayoutFromFile.additional_reset_steps(self)
+
+#         # 3) Place by skill rank: TOP vs BOTTOM halves
+#         self.world.clear_agent_locs()
+
+#         # Random order breaks ties; then assign ranked skills and positions
+#         for i, agent in enumerate(self.world.get_random_order_agents()):
+#             # Assign the pre-computed skill for rank i
+#             agent.state["build_payment"] = float(self._avg_ranked_skill[i])
+
+#             # Decide which half this rank belongs to
+#             if i in self.skill_rank_of_top_agents:
+#                 r_min, r_max = 0, self._overlay_water_row
+#             else:
+#                 r_min, r_max = self._overlay_water_row + 1, self.world_size[0]
+
+#             # Sample a valid spot in that half
+#             r = np.random.randint(r_min, r_max)
+#             c = np.random.randint(0, self.world_size[1])
+
+#             # Avoid water/blocked tiles
+#             n_tries = 0
+#             while not self.world.can_agent_occupy(r, c, agent):
+#                 r = np.random.randint(r_min, r_max)
+#                 c = np.random.randint(0, self.world_size[1])
+#                 n_tries += 1
+#                 if n_tries > 200:
+#                     raise TimeoutError("Could not place agent in the desired half.")
+#             self.world.set_agent_loc(agent, r, c)
+
+#         # Update optimization metrics
+#         curr_optimization_metric = self.get_current_optimization_metrics()
+#         self.curr_optimization_metric = deepcopy(curr_optimization_metric)
+#         self.init_optimization_metric = deepcopy(curr_optimization_metric)
+#         self.prev_optimization_metric = deepcopy(curr_optimization_metric)
+
 @scenario_registry.add
 class CustomSplitOverlayFromFile(LayoutFromFile):
     """
@@ -1001,7 +1191,7 @@ class CustomSplitOverlayFromFile(LayoutFromFile):
       - Overlay a horizontal water line at `water_row`.
       - Optional vertical line (off by default).
       - Optional gaps in the horizontal line so the map is not closed off.
-      - Honors agent_start_locs (if provided) and multi-top skill ranks.
+      - Honors agent_start_locs directly and reliably.
     """
     name = "custom/split_overlay_from_file"
 
@@ -1009,22 +1199,24 @@ class CustomSplitOverlayFromFile(LayoutFromFile):
         self,
         *args,
         water_row=None,
-        add_vertical_line=False,          # default OFF
+        add_vertical_line=False,
         vertical_col=None,
         skill_rank_of_top_agents=None,
-        preserve_file_water=True,         # keep file lakes/ponds
-        horizontal_gap_cols=None,         # e.g. [12, 25, 38]
-        gap_width=3,                      # width of each gap in cols
-        random_gap_count=0,               # if >0, add N random gaps
-        random_gap_seed=None,             # for reproducibility
-        vertical_gap_rows=None,    # ← NEW
-        vertical_gap_height=3,     # ← NEW (size of gap)
+        preserve_file_water=True,
+        horizontal_gap_cols=None,
+        gap_width=3,
+        random_gap_count=0,
+        random_gap_seed=None,
+        vertical_gap_rows=None,
+        vertical_gap_height=3,
+        agent_start_locs=None,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, agent_start_locs=agent_start_locs, **kwargs)
 
         self.vertical_gap_rows = vertical_gap_rows
         self.vertical_gap_height = int(vertical_gap_height)
+        self.agent_start_locs = agent_start_locs
 
         H, W = self.world_size
         if water_row is None:
@@ -1032,7 +1224,6 @@ class CustomSplitOverlayFromFile(LayoutFromFile):
         water_row = int(water_row)
         assert 0 <= water_row < H, "water_row must be within map bounds"
 
-        # ---- Start from file water (preserve) or from empty water map ----
         if "Water" not in self._source_maps:
             self._source_maps["Water"] = np.zeros(self.world_size, dtype=np.int32)
 
@@ -1041,18 +1232,17 @@ class CustomSplitOverlayFromFile(LayoutFromFile):
         else:
             water_map = np.zeros(self.world_size, dtype=np.int32)
 
-        # ---- Overlay horizontal barrier (full row first) ----
+        # Horizontal barrier
         water_map[water_row, :] = 1
 
-        # ---- Carve gaps in the horizontal barrier ----
+        # Horizontal gaps
         if horizontal_gap_cols is None:
             horizontal_gap_cols = []
         if random_gap_count and random_gap_count > 0:
             rng = np.random.RandomState(random_gap_seed)
-            # avoid edges so gaps are visible and valid
             candidate_cols = list(range(2, W - 2))
             rng.shuffle(candidate_cols)
-            horizontal_gap_cols.extend(candidate_cols[:int(random_gap_count)])
+            horizontal_gap_cols = list(horizontal_gap_cols) + candidate_cols[:int(random_gap_count)]
 
         gap_w = max(1, int(gap_width))
         half_left = gap_w // 2
@@ -1060,41 +1250,31 @@ class CustomSplitOverlayFromFile(LayoutFromFile):
         for c in horizontal_gap_cols:
             c0 = max(0, int(c) - half_left)
             c1 = min(W, int(c) + half_right)
-            water_map[water_row, c0:c1] = 0  # open water -> no barrier here
+            water_map[water_row, c0:c1] = 0
 
-        # ---- Optional vertical line (you said you don't want it now) ----
-        # if add_vertical_line:
-        #     if vertical_col is None:
-        #         vertical_col = W // 2
-        #     vertical_col = int(vertical_col)
-        #     assert 0 <= vertical_col < W, "vertical_col must be within bounds"
-        #     water_map[:, vertical_col] = 1
-        #     # (If you also want vertical gaps: do similar carving on `water_map[:, vertical_col]`)
+        # Optional vertical barrier
         if add_vertical_line:
-            # Default vertical_col = middle
             if vertical_col is None:
                 vertical_col = W // 2
             vertical_col = int(vertical_col)
+            assert 0 <= vertical_col < W, "vertical_col must be within bounds"
 
-            # Add full vertical line first
             water_map[:, vertical_col] = 1
 
-            # Carve vertical gaps (rows where line should be broken)
             if self.vertical_gap_rows is not None:
                 gap_h = max(1, self.vertical_gap_height)
                 half_upper = gap_h // 2
                 half_lower = gap_h - half_upper
-
                 for r in self.vertical_gap_rows:
-                    r0 = max(0, int(r - half_upper))
-                    r1 = min(H, int(r + half_lower))
-                    # punch out the vertical barrier in this band
+                    r0 = max(0, int(r) - half_upper)
+                    r1 = min(H, int(r) + half_lower)
                     water_map[r0:r1, vertical_col] = 0
+        else:
+            vertical_col = None
 
-        # ---- Push water map back ----
         self._source_maps["Water"] = water_map
 
-        # Avoid stone/wood on top of overlayed lines (but keep file lakes everywhere else)
+        # Clear resources on overlay barrier cells
         for landmark in ["Wood", "Stone"]:
             if landmark in self._source_maps:
                 m = np.array(self._source_maps[landmark], copy=True)
@@ -1103,23 +1283,24 @@ class CustomSplitOverlayFromFile(LayoutFromFile):
                     m[:, vertical_col] = 0
                 self._source_maps[landmark] = m
 
-        # ---------- Top-half by skill rank (unchanged from your custom class) ----------
+        # Skill-rank setup for fallback placement only
         if skill_rank_of_top_agents is None:
             skill_rank_of_top_agents = [0]
+
         if isinstance(skill_rank_of_top_agents, (int, float)):
             self.skill_rank_of_top_agents = [int(skill_rank_of_top_agents)]
         elif isinstance(skill_rank_of_top_agents, (tuple, list)):
             self.skill_rank_of_top_agents = list(dict.fromkeys(skill_rank_of_top_agents))
         else:
             raise TypeError("skill_rank_of_top_agents must be scalar or list/tuple.")
-        for rank in self.skill_rank_of_top_agents:
-            assert 0 <= int(rank) < self.n_agents, \
-                f"Skill rank {rank} must be in [0, {self.n_agents-1}]"
 
-        # Pre-compute skills (same logic as before)
+        for rank in self.skill_rank_of_top_agents:
+            assert 0 <= int(rank) < self.n_agents
+
         bm = self.get_component("Build")
-        assert bm is not None, "Build component required for skill-based placement."
+        assert bm is not None, "Build component required."
         pmsm = getattr(bm, "payment_max_skill_multiplier", 1)
+
         if getattr(bm, "skill_dist", None) == "pareto":
             pareto_samples = np.random.pareto(4, size=(100_000, self.n_agents))
             clipped = np.minimum(pmsm, (pmsm - 1) * pareto_samples + 1)
@@ -1128,45 +1309,85 @@ class CustomSplitOverlayFromFile(LayoutFromFile):
         else:
             self._avg_ranked_skill = np.array([bm.payment] * self.n_agents, dtype=float)
 
-        # Save overlay positions we used for placement in additional_reset_steps
         self._overlay_water_row = water_row
         self._overlay_vertical = add_vertical_line
         self._overlay_vertical_col = int(vertical_col) if add_vertical_line else None
 
+    def _apply_custom_start_locs(self):
+        if self.agent_start_locs is None:
+            return False
+
+        if len(self.agent_start_locs) != self.n_agents:
+            raise ValueError(
+                f"agent_start_locs must contain {self.n_agents} coordinates"
+            )
+
+        H, W = self.world_size
+        self.world.clear_agent_locs()
+
+        for agent, (r, c) in zip(self.world.agents, self.agent_start_locs):
+            r = int(r)
+            c = int(c)
+
+            if not (0 <= r < H and 0 <= c < W):
+                raise ValueError(
+                    f"Invalid custom start {(r, c)} for world size {self.world_size}"
+                )
+
+            if self.world.can_agent_occupy(r, c, agent):
+                self.world.set_agent_loc(agent, r, c)
+                continue
+
+            placed = False
+            for dr in range(-2, 3):
+                for dc in range(-2, 3):
+                    rr = int(np.clip(r + dr, 0, H - 1))
+                    cc = int(np.clip(c + dc, 0, W - 1))
+                    if self.world.can_agent_occupy(rr, cc, agent):
+                        self.world.set_agent_loc(agent, rr, cc)
+                        placed = True
+                        break
+                if placed:
+                    break
+
+            if not placed:
+                raise ValueError(f"Cannot place agent at or near {(r, c)}")
+
+        curr = self.get_current_optimization_metrics()
+        self.curr_optimization_metric = deepcopy(curr)
+        self.init_optimization_metric = deepcopy(curr)
+        self.prev_optimization_metric = deepcopy(curr)
+        return True
+
     def additional_reset_steps(self):
         """
-        Placement order:
-            1) If LayoutFromFile supports agent_start_locs and it's provided -> use it (and return).
-            2) Else if fixed_four_skill_and_loc -> defer to parent logic.
-            3) Else -> place using skill_rank_of_top_agents (top/bottom halves).
+        Reset order:
+          1) If custom starts are provided, use them and stop.
+          2) Else if fixed_four_skill_and_loc, defer to LayoutFromFile.
+          3) Else use top/bottom split placement by skill rank.
         """
-        # 1) Defer to LayoutFromFile custom starts if present (your earlier patch)
-        if hasattr(self, "agent_start_locs") and self.agent_start_locs is not None:
-            return LayoutFromFile.additional_reset_steps(self)
+        # 1) Custom starts always win
+        if self._apply_custom_start_locs():
+            return
 
-        # 2) Respect fixed-four logic from LayoutFromFile if enabled
+        # 2) Preserve LayoutFromFile behavior if requested
         if getattr(self, "fixed_four_skill_and_loc", False):
             return LayoutFromFile.additional_reset_steps(self)
 
-        # 3) Place by skill rank: TOP vs BOTTOM halves
+        # 3) Fallback split placement
         self.world.clear_agent_locs()
 
-        # Random order breaks ties; then assign ranked skills and positions
         for i, agent in enumerate(self.world.get_random_order_agents()):
-            # Assign the pre-computed skill for rank i
             agent.state["build_payment"] = float(self._avg_ranked_skill[i])
 
-            # Decide which half this rank belongs to
             if i in self.skill_rank_of_top_agents:
                 r_min, r_max = 0, self._overlay_water_row
             else:
                 r_min, r_max = self._overlay_water_row + 1, self.world_size[0]
 
-            # Sample a valid spot in that half
             r = np.random.randint(r_min, r_max)
             c = np.random.randint(0, self.world_size[1])
 
-            # Avoid water/blocked tiles
             n_tries = 0
             while not self.world.can_agent_occupy(r, c, agent):
                 r = np.random.randint(r_min, r_max)
@@ -1174,37 +1395,316 @@ class CustomSplitOverlayFromFile(LayoutFromFile):
                 n_tries += 1
                 if n_tries > 200:
                     raise TimeoutError("Could not place agent in the desired half.")
+
             self.world.set_agent_loc(agent, r, c)
 
-        # Update optimization metrics
-        curr_optimization_metric = self.get_current_optimization_metrics()
-        self.curr_optimization_metric = deepcopy(curr_optimization_metric)
-        self.init_optimization_metric = deepcopy(curr_optimization_metric)
-        self.prev_optimization_metric = deepcopy(curr_optimization_metric)
+        curr = self.get_current_optimization_metrics()
+        self.curr_optimization_metric = deepcopy(curr)
+        self.init_optimization_metric = deepcopy(curr)
+        self.prev_optimization_metric = deepcopy(curr)
 
+
+from ai_economist.foundation.scenarios import scenario_registry
+import numpy as np
 
 @scenario_registry.add
-class SplitWorldOverlayRegional(CustomSplitOverlayFromFile, RegionalPlannerMixin):
+class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
+    """
+    Split-world + overlay-from-file scenario with multiple planners (p_top, p_bottom)
+    and optional fixed agent starting positions.
+
+    Main fixes:
+      - Correct row/col logic for top-vs-bottom split
+      - Proper multi-planner optimization metrics
+      - Marginal planner rewards, consistent with LayoutFromFile
+      - Custom starts applied safely at reset
+      - Planner observations sliced by region without breaking component obs
+    """
+
     name = "custom/splitworld_overlay_regional"
 
     def __init__(self, *args, **kwargs):
+        planner_subclasses = kwargs.pop("planner_subclasses", None)
+        #agent_start_locs = kwargs.pop("agent_start_locs", None)
 
-        # --- POP ALL CUSTOM MULTI-PLANNER KEYS HERE ---
-        self.planner_subclasses = kwargs.pop("planner_subclasses", None)
-        self.planner_ids        = kwargs.pop("planner_ids", None)
-        self.planner_classes    = kwargs.pop("planner_classes", None)
+        if planner_subclasses is not None:
+            self.planner_subclasses = planner_subclasses
 
-        # If you added these keys:
-        self.multi_action_mode_planner = kwargs.pop("multi_action_mode_planner", True)
-        self.multi_action_mode_agents   = kwargs.pop("multi_action_mode_agents", False)
+        #self.agent_start_locs = agent_start_locs
 
-        # --- NOW call the parent constructors safely ---
         super().__init__(*args, **kwargs)
 
-        # --- Initialize planners on the world AFTER base env exists ---
-        if self.planner_subclasses:
-            self.world._init_planners(self.planner_subclasses)
+        # Expose scenario to components
+        self.world.scenario = self
 
-        # You can also store planner IDs here:
-        if self.planner_ids:
-            self._planner_ids = self.planner_ids
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _split_row(self):
+        """Row index of the horizontal water barrier."""
+        return int(getattr(self, "_overlay_water_row",
+                   getattr(self, "_water_line", self.world_size[0] // 2)))
+
+    def _is_top_agent(self, agent):
+        """Top/bottom is determined by ROW, not column."""
+        r = int(agent.loc[0]) if hasattr(agent, "loc") else int(agent.state["loc"][0])
+        return r < self._split_row()
+
+    def _agent_coin(self, agent):
+        if hasattr(agent, "total_endowment") and callable(agent.total_endowment):
+            return float(agent.total_endowment("Coin"))
+
+        if hasattr(agent, "total_endowment") and isinstance(agent.total_endowment, dict):
+            return float(agent.total_endowment.get("Coin", 0.0))
+
+        if hasattr(agent, "inventory") and isinstance(agent.inventory, dict):
+            inv = float(agent.inventory.get("Coin", 0.0))
+            esc = 0.0
+            if hasattr(agent, "escrow") and isinstance(agent.escrow, dict):
+                esc = float(agent.escrow.get("Coin", 0.0))
+            return inv + esc
+
+        if hasattr(agent, "state") and isinstance(agent.state, dict):
+            inv = float(agent.state.get("inventory", {}).get("Coin", 0.0))
+            esc = float(agent.state.get("escrow", {}).get("Coin", 0.0))
+            return inv + esc
+
+        if hasattr(agent, "coin"):
+            return float(agent.coin)
+
+        return 0.0
+
+    def _regional_coin_eq_times_productivity(self, agents):
+        coin_endowments = np.array([self._agent_coin(a) for a in agents], dtype=float)
+
+        if len(coin_endowments) == 0:
+            return 0.0
+
+        eq_weight = 1.0 - self.mixing_weight_gini_vs_coin
+
+        val = rewards.coin_eq_times_productivity(
+            coin_endowments=coin_endowments,
+            equality_weight=eq_weight,
+        )
+        return float(np.nan_to_num(val, nan=0.0, posinf=0.0, neginf=0.0))
+
+    def _regional_agent_lists(self):
+        top_agents = []
+        bottom_agents = []
+        for agent in self.world.agents:
+            if self._is_top_agent(agent):
+                top_agents.append(agent)
+            else:
+                bottom_agents.append(agent)
+        return top_agents, bottom_agents
+
+    # ------------------------------------------------------------------
+    # Reset hook for custom starts
+    # ------------------------------------------------------------------
+    def additional_reset_steps(self):
+        """
+        If custom starts are provided, use them.
+        Otherwise defer to parent logic (which handles split placement).
+        """
+        #print("DEBUG agent_start_locs:", self.agent_start_locs)
+        #print("DEBUG using custom starts?", self.agent_start_locs is not None)
+
+        if self.agent_start_locs is not None:
+            if len(self.agent_start_locs) != self.n_agents:
+                raise ValueError(
+                    f"agent_start_locs must contain {self.n_agents} coordinates"
+                )
+
+            H, W = self.world_size
+            self.world.clear_agent_locs()
+
+            for agent, (r, c) in zip(self.world.agents, self.agent_start_locs):
+                r = int(r)
+                c = int(c)
+
+                if not (0 <= r < H and 0 <= c < W):
+                    raise ValueError(
+                        f"Invalid start {(r, c)} for world size {self.world_size}"
+                    )
+
+                # Try exact cell first; if blocked, search a small neighborhood
+                if self.world.can_agent_occupy(r, c, agent):
+                    self.world.set_agent_loc(agent, r, c)
+                else:
+                    placed = False
+                    for dr in range(-2, 3):
+                        for dc in range(-2, 3):
+                            rr = int(np.clip(r + dr, 0, H - 1))
+                            cc = int(np.clip(c + dc, 0, W - 1))
+                            if self.world.can_agent_occupy(rr, cc, agent):
+                                self.world.set_agent_loc(agent, rr, cc)
+                                placed = True
+                                break
+                        if placed:
+                            break
+
+                    if not placed:
+                        raise ValueError(f"Cannot place agent at or near {(r, c)}")
+
+            curr = self.get_current_optimization_metrics()
+            self.curr_optimization_metric = deepcopy(curr)
+            self.init_optimization_metric = deepcopy(curr)
+            self.prev_optimization_metric = deepcopy(curr)
+            return
+        
+        #print("DEBUG falling back to parent additional_reset_steps()")
+        return super().additional_reset_steps()
+
+    # ------------------------------------------------------------------
+    # Multi-planner optimization metrics
+    # ------------------------------------------------------------------
+    def get_current_optimization_metrics(self):
+        """
+        Compute current optimization metric for:
+          - each mobile agent
+          - p_top planner (top-region welfare)
+          - p_bottom planner (bottom-region welfare)
+        """
+        curr_optimization_metric = {}
+
+        # Agent utilities: same as LayoutFromFile
+        for agent in self.world.agents:
+            curr_optimization_metric[agent.idx] = rewards.isoelastic_coin_minus_labor(
+                coin_endowment=agent.total_endowment("Coin"),
+                total_labor=agent.state["endogenous"]["Labor"],
+                isoelastic_eta=self.isoelastic_eta,
+                labor_coefficient=self.energy_weight * self.energy_cost,
+            )
+
+        top_agents, bottom_agents = self._regional_agent_lists()
+
+        # Planner utilities: regional welfare
+        for planner in getattr(self.world, "planners", []):
+            pid = str(planner.idx)
+            if "top" in pid:
+                curr_optimization_metric[pid] = self._regional_coin_eq_times_productivity(top_agents)
+            elif "bottom" in pid:
+                curr_optimization_metric[pid] = self._regional_coin_eq_times_productivity(bottom_agents)
+            else:
+                # Fallback: global welfare if some unexpected planner id appears
+                curr_optimization_metric[pid] = float(np.nan_to_num(
+                    rewards.coin_eq_times_productivity(
+                        coin_endowments=np.array(
+                            [agent.total_endowment("Coin") for agent in self.world.agents]
+                        ),
+                        equality_weight=1.0 - self.mixing_weight_gini_vs_coin,
+                    ),
+                    nan=0.0, posinf=0.0, neginf=0.0
+                ))
+
+        return curr_optimization_metric
+
+    # ------------------------------------------------------------------
+    # Rewards with correct keys
+    # ------------------------------------------------------------------
+    def compute_reward(self):
+        """
+        Marginal rewards for agents and planners.
+        This mirrors LayoutFromFile logic:
+            reward_t = metric_t - metric_{t-1}
+        """
+        utility_at_end_of_last_time_step = deepcopy(self.curr_optimization_metric)
+        self.curr_optimization_metric = self.get_current_optimization_metrics()
+
+        rew = {}
+        for k, v in self.curr_optimization_metric.items():
+            prev = utility_at_end_of_last_time_step.get(k, v)
+            rew[str(k)] = float(np.nan_to_num(v - prev, nan=0.0, posinf=0.0, neginf=0.0))
+
+        self.prev_optimization_metric.update(utility_at_end_of_last_time_step)
+
+        # Automatic Energy Cost Annealing (same as LayoutFromFile)
+        avg_agent_rew = np.mean([rew[str(a.idx)] for a in self.world.agents])
+        if avg_agent_rew > 0:
+            self._auto_warmup_integrator += 1
+
+        return rew
+
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
+    def scenario_metrics(self):
+        metrics = {}
+
+        coin_endowments = np.array(
+            [agent.total_endowment("Coin") for agent in self.world.agents], dtype=float
+        )
+        metrics["social/productivity"] = social_metrics.get_productivity(coin_endowments)
+        metrics["social/equality"] = social_metrics.get_equality(coin_endowments)
+
+        metrics["social_welfare/global_coin_eq_times_productivity"] = rewards.coin_eq_times_productivity(
+            coin_endowments=coin_endowments,
+            equality_weight=1.0 - self.mixing_weight_gini_vs_coin,
+        )
+
+        top_agents, bottom_agents = self._regional_agent_lists()
+        metrics["social_welfare/top_coin_eq_times_productivity"] = self._regional_coin_eq_times_productivity(top_agents)
+        metrics["social_welfare/bottom_coin_eq_times_productivity"] = self._regional_coin_eq_times_productivity(bottom_agents)
+
+        metrics["region/n_top_agents"] = len(top_agents)
+        metrics["region/n_bottom_agents"] = len(bottom_agents)
+
+        for agent in self.world.agents:
+            for resource, _ in agent.inventory.items():
+                metrics[f"endow/{agent.idx}/{resource}"] = agent.total_endowment(resource)
+
+            if agent.endogenous is not None:
+                for resource, quantity in agent.endogenous.items():
+                    metrics[f"endogenous/{agent.idx}/{resource}"] = quantity
+
+            if agent.idx in self.curr_optimization_metric:
+                metrics[f"util/{agent.idx}"] = self.curr_optimization_metric[agent.idx]
+
+        for planner in getattr(self.world, "planners", []):
+            pid = str(planner.idx)
+            metrics[f"util/{pid}"] = self.curr_optimization_metric.get(pid, 0.0)
+
+        metrics["labor/weighted_cost"] = self.energy_cost * self.energy_weight
+        metrics["labor/warmup_integrator"] = int(self._auto_warmup_integrator)
+
+        return metrics
+
+    # ------------------------------------------------------------------
+    # Per-planner regional spatial observations
+    # ------------------------------------------------------------------
+    def generate_observations(self):
+        obs = super().generate_observations()
+
+        if not hasattr(self.world, "planners") or len(self.world.planners) <= 1:
+            return obs
+
+        curr_map = self.world.maps.state
+        owner_map = self.world.maps.owner_state
+        loc_map = self.world.loc_map
+        idx_map = np.concatenate([owner_map, loc_map[None, :, :]], axis=0)
+        idx_map = idx_map + 2
+        idx_map[idx_map == 1] = 0
+
+        split = self._split_row()
+
+        for planner in self.world.planners:
+            pid = str(planner.idx)
+
+            if pid not in obs:
+                obs[pid] = {}
+
+            # Keep component-generated fields and add planner inventory
+            obs[pid].update({
+                "inventory-" + k: v * self.inv_scale
+                for k, v in planner.inventory.items()
+            })
+
+            # Slice along ROW axis (axis=1 of map tensor, not width axis)
+            if "top" in pid:
+                obs[pid]["map"] = curr_map[:, :split, :]
+                obs[pid]["idx_map"] = idx_map[:, :split, :]
+            else:
+                obs[pid]["map"] = curr_map[:, split + 1:, :]
+                obs[pid]["idx_map"] = idx_map[:, split + 1:, :]
+
+        return obs
