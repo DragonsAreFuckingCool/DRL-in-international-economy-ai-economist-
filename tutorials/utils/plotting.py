@@ -9,6 +9,13 @@ import numpy as np
 
 from ai_economist.foundation import landmarks, resources
 
+def numeric_agent_ids_from_states(state_dict):
+    """
+    Return sorted list of numeric agent IDs (ints), ignoring planners like 'p', 'p_top', 'p_bottom'.
+    Works for both legacy (single planner) and your 2-planner extension.
+    """
+    return sorted([int(k) for k in state_dict.keys() if str(k).isdigit()])
+
 
 def plot_map(maps, locs, ax=None, cmap_order=None, show_water=True):
     """Universal map renderer that works for live env (Maps) and dense logs (dict).
@@ -126,27 +133,29 @@ def plot_env_state(env, ax=None, remap_key=None):
 
     plot_map(maps, locs, ax, cmap_order)
 
-
 def plot_log_state(dense_log, t, ax=None, remap_key=None):
     maps = dense_log["world"][t]
     states = dense_log["states"][t]
 
-    n_agents = len(states) - 1
-    locs = []
-    for i in range(n_agents):
-        r, c = states[str(i)]["loc"]
-        locs.append([r, c])
+    # --- MULTI-PLANNER SAFE: only numeric agent ids ---
+    agent_ids = numeric_agent_ids_from_states(states)
+    n_agents = len(agent_ids)
 
+    # Agent locations in the order of agent_ids
+    locs = [states[str(i)]["loc"] for i in agent_ids]
+
+    # Build color order (optional remap)
     if remap_key is None:
+        # No remap: keep the agent_ids’ order; colormap expects 0..n_agents-1 positions
         cmap_order = None
     else:
         assert isinstance(remap_key, str)
-        key_val = np.array(
-            [dense_log["states"][0][str(i)][remap_key] for i in range(n_agents)]
-        )
+        key_val = np.array([dense_log["states"][0][str(i)][remap_key] for i in agent_ids])
+        # Order refers to positions within the current agent_ids array
         cmap_order = np.argsort(key_val).tolist()
 
     plot_map(maps, locs, ax, cmap_order)
+
 
 
 def _format_logs_and_eps(dense_logs, eps):
@@ -296,24 +305,34 @@ def report(c_trades, all_builds, n_agents, a_indices=None):
             print(full_trade_str(c_trades, resource, a_indices, income=True))
     print(full_build_str(all_builds, a_indices))
 
-
 def breakdown(log, remap_key=None):
+    """
+    Multi-planner safe breakdown plotter:
+      - Counts only numeric agent IDs (ignores planners).
+      - Supports legacy single-planner and your 2-planner extension.
+    """
+    # Snapshot montage figure (uses plot_log_state which is already updated to ignore planners)
     fig0 = vis_world_range(log, remap_key=remap_key)
 
-    n = len(list(log["states"][0].keys())) - 1
+    # --- Only numeric mobile agents ---
+    agent_ids = numeric_agent_ids_from_states(log["states"][0])
+    n = len(agent_ids)
     trading_active = "Trade" in log
 
+    # Agent ordering (optionally by remap_key)
     if remap_key is None:
-        aidx = list(range(n))
+        aidx = agent_ids[:]  # keep numeric agent IDs as-is
     else:
         assert isinstance(remap_key, str)
-        key_vals = np.array([log["states"][0][str(i)][remap_key] for i in range(n)])
-        aidx = np.argsort(key_vals).tolist()
+        key_vals = np.array([log["states"][0][str(i)][remap_key] for i in agent_ids])
+        order = np.argsort(key_vals).tolist()
+        aidx = [agent_ids[j] for j in order]
 
+    # --- Collect builds over time ---
     all_builds = []
-    for t, builds in enumerate(log["Build"]):
+    for t, builds in enumerate(log.get("Build", [])):
         if isinstance(builds, dict):
-            builds_ = builds["builds"]
+            builds_ = builds.get("builds", [])
         else:
             builds_ = builds
         for build in builds_:
@@ -321,37 +340,38 @@ def breakdown(log, remap_key=None):
             this_build.update(build)
             all_builds.append(this_build)
 
+    # --- Collect trades if present ---
     if trading_active:
         c_trades = {"Stone": [], "Wood": []}
         for t, trades in enumerate(log["Trade"]):
             if isinstance(trades, dict):
-                trades_ = trades["trades"]
+                trades_ = trades.get("trades", [])
             else:
                 trades_ = trades
             for trade in trades_:
                 this_trade = {
                     "t": t,
-                    "t_ask": t - trade["ask_lifetime"],
-                    "t_bid": t - trade["bid_lifetime"],
+                    "t_ask": t - trade.get("ask_lifetime", 0),
+                    "t_bid": t - trade.get("bid_lifetime", 0),
                 }
                 this_trade.update(trade)
                 c_trades[trade["commodity"]].append(this_trade)
 
         incomes = {
             "Sell Stone": [
-                sum([t["income"] for t in c_trades["Stone"] if t["seller"] == aidx[i]])
+                sum([tr["income"] for tr in c_trades["Stone"] if tr["seller"] == aidx[i]])
                 for i in range(n)
             ],
             "Buy Stone": [
-                sum([-t["price"] for t in c_trades["Stone"] if t["buyer"] == aidx[i]])
+                sum([-tr["price"] for tr in c_trades["Stone"] if tr["buyer"] == aidx[i]])
                 for i in range(n)
             ],
             "Sell Wood": [
-                sum([t["income"] for t in c_trades["Wood"] if t["seller"] == aidx[i]])
+                sum([tr["income"] for tr in c_trades["Wood"] if tr["seller"] == aidx[i]])
                 for i in range(n)
             ],
             "Buy Wood": [
-                sum([-t["price"] for t in c_trades["Wood"] if t["buyer"] == aidx[i]])
+                sum([-tr["price"] for tr in c_trades["Wood"] if tr["buyer"] == aidx[i]])
                 for i in range(n)
             ],
             "Build": [
@@ -359,7 +379,6 @@ def breakdown(log, remap_key=None):
                 for i in range(n)
             ],
         }
-
     else:
         c_trades = None
         incomes = {
@@ -369,8 +388,10 @@ def breakdown(log, remap_key=None):
             ],
         }
 
+    # Total income per agent (position-aligned with aidx)
     incomes["Total"] = np.stack([v for v in incomes.values()]).sum(axis=0)
 
+    # Endowments at episode end
     endows = [
         int(
             log["states"][-1][str(aidx[i])]["inventory"]["Coin"]
@@ -379,14 +400,14 @@ def breakdown(log, remap_key=None):
         for i in range(n)
     ]
 
-    n_small = np.minimum(4, n)
-
+    # Text report
     report(c_trades, all_builds, n, aidx)
 
+    # --- Time series plots: resources + labor ---
     cmap = plt.get_cmap("jet", n)
     rs = ["Wood", "Stone", "Coin"]
-
     fig1, axes = plt.subplots(1, len(rs) + 1, figsize=(16, 4), sharey=False)
+
     for r, ax in zip(rs, axes):
         for i in range(n):
             ax.plot(
@@ -412,7 +433,9 @@ def breakdown(log, remap_key=None):
     ax.legend()
     ax.grid(True)
 
+    # --- Movement tracks (subsampled) ---
     tmp = np.array(log["world"][0]["Stone"])
+    n_small = np.minimum(4, n)
     fig2, axes = plt.subplots(
         2 if trading_active else 1,
         n_small,
@@ -421,6 +444,8 @@ def breakdown(log, remap_key=None):
         sharey="row",
         squeeze=False,
     )
+
+    # Trajectories
     for i, ax in enumerate(axes[0]):
         rows = np.array([x[str(aidx[i])]["loc"][0] for x in log["states"]]) * -1
         cols = np.array([x[str(aidx[i])]["loc"][1] for x in log["states"]])
@@ -431,12 +456,12 @@ def breakdown(log, remap_key=None):
         ax.set_xlim([-1, 1 + tmp.shape[1]])
         ax.set_ylim([-(1 + tmp.shape[0]), 1])
 
+    # Trade timelines (if any)
     if trading_active:
         for i, ax in enumerate(axes[1]):
             for r in ["Wood", "Stone"]:
-                tmp = [
-                    (s["t"], s["income"]) for s in c_trades[r] if s["seller"] == aidx[i]
-                ]
+                # Seller incomes
+                tmp = [(s["t"], s["income"]) for s in c_trades[r] if s["seller"] == aidx[i]]
                 if tmp:
                     ts, prices = [np.array(x) for x in zip(*tmp)]
                     ax.plot(
@@ -444,13 +469,10 @@ def breakdown(log, remap_key=None):
                         np.stack([np.zeros_like(prices), prices]),
                         color=resources.get(r).color,
                     )
-                    ax.plot(
-                        ts, prices, ".", color=resources.get(r).color, markersize=12
-                    )
+                    ax.plot(ts, prices, ".", color=resources.get(r).color, markersize=12)
 
-                tmp = [
-                    (s["t"], -s["cost"]) for s in c_trades[r] if s["buyer"] == aidx[i]
-                ]
+                # Buyer costs (negative)
+                tmp = [(s["t"], -s["cost"]) for s in c_trades[r] if s["buyer"] == aidx[i]]
                 if tmp:
                     ts, prices = [np.array(x) for x in zip(*tmp)]
                     ax.plot(
@@ -458,17 +480,14 @@ def breakdown(log, remap_key=None):
                         np.stack([np.zeros_like(prices), prices]),
                         color=resources.get(r).color,
                     )
-                    ax.plot(
-                        ts, prices, ".", color=resources.get(r).color, markersize=12
-                    )
+                    ax.plot(ts, prices, ".", color=resources.get(r).color, markersize=12)
+
             ax.plot([-20, len(log["states"]) + 19], [0, 0], "w-")
-            # ax.set_ylim([-10.2, 10.2]);
             ax.set_xlim([-20, len(log["states"]) + 19])
             ax.grid(True)
             ax.set_facecolor([0.3, 0.3, 0.3])
 
     return (fig0, fig1, fig2), incomes, endows, c_trades, all_builds
-
 
 def plot_for_each_n(y_fun, n, ax=None):
     if ax is None:
@@ -478,3 +497,253 @@ def plot_for_each_n(y_fun, n, ax=None):
         ax.plot(y_fun(i), color=cmap(i), label=i)
     ax.legend()
     ax.grid(True)
+
+def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
+    """
+    Like breakdown(...), but:
+      - shows ALL mobile agents
+      - uses up to n_cols columns (8 agents -> 2 rows of 4)
+      - labels legend so highest/lowest skill agents are explicit
+      - does NOT overwrite breakdown()
+
+    Returns:
+        (fig0, fig1, fig2), incomes, endows, c_trades, all_builds
+    """
+    import math
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    # Snapshot montage figure
+    fig0 = vis_world_range(log, remap_key=remap_key)
+
+    # --- Only numeric mobile agents ---
+    agent_ids = numeric_agent_ids_from_states(log["states"][0])
+    n = len(agent_ids)
+    trading_active = "Trade" in log
+
+    # Agent ordering
+    if remap_key is None:
+        aidx = agent_ids[:]
+    else:
+        key_vals = np.array([log["states"][0][str(i)][remap_key] for i in agent_ids])
+        order = np.argsort(key_vals).tolist()
+        aidx = [agent_ids[j] for j in order]
+
+    # Labels with skill-rank annotation
+    rank_labels = []
+    for i, aid in enumerate(aidx):
+        if i == 0:
+            rank_labels.append(f"Agent {aid} (Lowest Skill)")
+        elif i == len(aidx) - 1:
+            rank_labels.append(f"Agent {aid} (Highest Skill)")
+        else:
+            rank_labels.append(f"Agent {aid}")
+
+    # --- Collect builds over time ---
+    all_builds = []
+    for t, builds in enumerate(log.get("Build", [])):
+        builds_ = builds.get("builds", []) if isinstance(builds, dict) else builds
+        for build in builds_:
+            this_build = {"t": t}
+            this_build.update(build)
+            all_builds.append(this_build)
+
+    # --- Collect trades if present ---
+    if trading_active:
+        c_trades = {"Stone": [], "Wood": []}
+        for t, trades in enumerate(log.get("Trade", [])):
+            trades_ = trades.get("trades", []) if isinstance(trades, dict) else trades
+            for trade in trades_:
+                this_trade = {
+                    "t": t,
+                    "t_ask": t - trade.get("ask_lifetime", 0),
+                    "t_bid": t - trade.get("bid_lifetime", 0),
+                }
+                this_trade.update(trade)
+                c_trades[trade["commodity"]].append(this_trade)
+
+        incomes = {
+            "Sell Stone": [
+                sum([tr["income"] for tr in c_trades["Stone"] if tr["seller"] == aidx[i]])
+                for i in range(n)
+            ],
+            "Buy Stone": [
+                sum([-tr["price"] for tr in c_trades["Stone"] if tr["buyer"] == aidx[i]])
+                for i in range(n)
+            ],
+            "Sell Wood": [
+                sum([tr["income"] for tr in c_trades["Wood"] if tr["seller"] == aidx[i]])
+                for i in range(n)
+            ],
+            "Buy Wood": [
+                sum([-tr["price"] for tr in c_trades["Wood"] if tr["buyer"] == aidx[i]])
+                for i in range(n)
+            ],
+            "Build": [
+                sum([b["income"] for b in all_builds if b["builder"] == aidx[i]])
+                for i in range(n)
+            ],
+        }
+    else:
+        c_trades = None
+        incomes = {
+            "Build": [
+                sum([b["income"] for b in all_builds if b["builder"] == aidx[i]])
+                for i in range(n)
+            ],
+        }
+
+    incomes["Total"] = np.stack([v for v in incomes.values()]).sum(axis=0)
+
+    endows = [
+        int(
+            log["states"][-1][str(aidx[i])]["inventory"]["Coin"]
+            + log["states"][-1][str(aidx[i])]["escrow"]["Coin"]
+        )
+        for i in range(n)
+    ]
+
+    report(c_trades, all_builds, n, aidx)
+
+    # --- Time series plots: resources + labor + utility ---
+    cmap = plt.get_cmap("jet", n)
+    rs = ["Wood", "Stone", "Coin"]
+
+    fig1, axes = plt.subplots(1, len(rs) + 2, figsize=(22, 4), sharey=False)
+
+    for r, ax in zip(rs, axes[:3]):
+        for i in range(n):
+            ax.plot(
+                [
+                    x[str(aidx[i])]["inventory"][r] + x[str(aidx[i])]["escrow"][r]
+                    for x in log["states"]
+                ],
+                label=rank_labels[i],
+                color=cmap(i),
+            )
+        ax.set_title(r)
+        ax.grid(True)
+
+    # Labor
+    ax = axes[3]
+    for i in range(n):
+        ax.plot(
+            [x[str(aidx[i])]["endogenous"]["Labor"] for x in log["states"]],
+            label=rank_labels[i],
+            color=cmap(i),
+        )
+    ax.set_title("Labor")
+    ax.grid(True)
+
+    # Utility (if remap_key exists and you want final curves from state)
+    ax = axes[4]
+    utility_ok = False
+    try:
+        for i in range(n):
+            vals = [x[str(aidx[i])].get("utility", np.nan) for x in log["states"]]
+            if np.any(np.isfinite(vals)):
+                utility_ok = True
+                ax.plot(vals, label=rank_labels[i], color=cmap(i))
+        if utility_ok:
+            ax.set_title("Utility")
+        else:
+            # fallback: plot coin again if utility not stored in state
+            for i in range(n):
+                vals = [
+                    x[str(aidx[i])]["inventory"]["Coin"] + x[str(aidx[i])]["escrow"]["Coin"]
+                    for x in log["states"]
+                ]
+                ax.plot(vals, label=rank_labels[i], color=cmap(i))
+            ax.set_title("Coin (duplicate)")
+    except Exception:
+        for i in range(n):
+            vals = [
+                x[str(aidx[i])]["inventory"]["Coin"] + x[str(aidx[i])]["escrow"]["Coin"]
+                for x in log["states"]
+            ]
+            ax.plot(vals, label=rank_labels[i], color=cmap(i))
+        ax.set_title("Coin (duplicate)")
+    ax.grid(True)
+
+    # Put legend on rightmost time-series axis
+    axes[-1].legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
+
+    # --- Movement tracks / trade timelines for ALL agents ---
+    tmp_map = np.array(log["world"][0]["Stone"])
+    n_cols = min(n_cols, n)
+    n_agent_rows = int(math.ceil(n / n_cols))
+
+    total_rows = n_agent_rows + (n_agent_rows if trading_active else 0)
+    fig2, axes = plt.subplots(
+        total_rows,
+        n_cols,
+        figsize=(4 * n_cols, 4 * total_rows),
+        sharex=False,
+        sharey=False,
+        squeeze=False,
+    )
+
+    # Turn off unused axes
+    for rr in range(total_rows):
+        for cc in range(n_cols):
+            idx = rr * n_cols + cc
+            if rr < n_agent_rows:
+                if idx >= n:
+                    axes[rr, cc].axis("off")
+            else:
+                trade_idx = (rr - n_agent_rows) * n_cols + cc
+                if trade_idx >= n:
+                    axes[rr, cc].axis("off")
+
+    # Trajectories
+    for i in range(n):
+        rr = i // n_cols
+        cc = i % n_cols
+        ax = axes[rr, cc]
+
+        rows = np.array([x[str(aidx[i])]["loc"][0] for x in log["states"]]) * -1
+        cols = np.array([x[str(aidx[i])]["loc"][1] for x in log["states"]])
+
+        ax.plot(cols[::20], rows[::20], color=cmap(i))
+        ax.plot(cols[0], rows[0], "r*", markersize=12)
+        ax.plot(cols[-1], rows[-1], "g*", markersize=12)
+        ax.set_title(rank_labels[i])
+        ax.set_xlim([-1, 1 + tmp_map.shape[1]])
+        ax.set_ylim([-(1 + tmp_map.shape[0]), 1])
+        ax.grid(True)
+
+    # Trade timelines
+    if trading_active:
+        for i in range(n):
+            rr = n_agent_rows + (i // n_cols)
+            cc = i % n_cols
+            ax = axes[rr, cc]
+
+            for r in ["Wood", "Stone"]:
+                tmp = [(s["t"], s["income"]) for s in c_trades[r] if s["seller"] == aidx[i]]
+                if tmp:
+                    ts, prices = [np.array(x) for x in zip(*tmp)]
+                    ax.plot(
+                        np.stack([ts, ts]),
+                        np.stack([np.zeros_like(prices), prices]),
+                        color=resources.get(r).color,
+                    )
+                    ax.plot(ts, prices, ".", color=resources.get(r).color, markersize=10)
+
+                tmp = [(s["t"], -s["cost"]) for s in c_trades[r] if s["buyer"] == aidx[i]]
+                if tmp:
+                    ts, prices = [np.array(x) for x in zip(*tmp)]
+                    ax.plot(
+                        np.stack([ts, ts]),
+                        np.stack([np.zeros_like(prices), prices]),
+                        color=resources.get(r).color,
+                    )
+                    ax.plot(ts, prices, ".", color=resources.get(r).color, markersize=10)
+
+            ax.plot([-20, len(log["states"]) + 19], [0, 0], "w-")
+            ax.set_xlim([-20, len(log["states"]) + 19])
+            ax.grid(True)
+            ax.set_facecolor([0.3, 0.3, 0.3])
+            ax.set_title(rank_labels[i])
+
+    return (fig0, fig1, fig2), incomes, endows, c_trades, all_builds
