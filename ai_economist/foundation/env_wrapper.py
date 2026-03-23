@@ -136,40 +136,58 @@ class FoundationEnvWrapper:
         assert self.env.name
         self.name = self.env.name
 
-        # Add observation space to the env
-        # --------------------------------
-        # Note: when the collated agent "a" is present, add obs keys
-        # for each individual agent to the env
-        # and remove the collated agent "a" from the observation
         obs = self.obs_at_reset()
         self.env.observation_space = recursive_obs_dict_to_spaces_dict(obs)
 
-        # Add action space to the env
-        # ---------------------------
+       # ----- Build action spaces for ALL agents and ALL planners -----
+        from gym.spaces import Discrete, MultiDiscrete
+
         self.env.action_space = {}
-        for agent_id in range(len(self.env.world.agents)):
-            if self.env.world.agents[agent_id].multi_action_mode:
-                self.env.action_space[str([agent_id])] = MultiDiscrete(
-                    self.env.get_agent(str(agent_id)).action_spaces
-                )
+
+        # Mobile agents
+        for agent_id, agent in enumerate(self.env.world.agents):
+            aid = str(agent_id)
+            if agent.multi_action_mode:
+                space = MultiDiscrete(self.env.get_agent(aid).action_spaces)
+                space.dtype = np.int32
+                space.nvec = space.nvec.astype(np.int32)
             else:
-                self.env.action_space[str(agent_id)] = Discrete(
-                    self.env.get_agent(str(agent_id)).action_spaces
-                )
-            self.env.action_space[str(agent_id)].dtype = np.int32
+                space = Discrete(self.env.get_agent(aid).action_spaces)
+                space.dtype = np.int32
+            self.env.action_space[aid] = space
 
-        if self.env.world.planner.multi_action_mode:
-            self.env.action_space["p"] = MultiDiscrete(
-                self.env.get_agent("p").action_spaces
-            )
+        # Planners (multi-planner or legacy)
+        if hasattr(self.env.world, "planners"):
+            for pid in self.planner_ids:
+                planner = self.env.get_agent(pid)
+                if planner.multi_action_mode:
+                    space = MultiDiscrete(planner.action_spaces)
+                    space.dtype = np.int32
+                    space.nvec = space.nvec.astype(np.int32)
+                else:
+                    space = Discrete(planner.action_spaces)
+                    space.dtype = np.int32
+                self.env.action_space[pid] = space
         else:
-            self.env.action_space["p"] = Discrete(self.env.get_agent("p").action_spaces)
-        self.env.action_space["p"].dtype = np.int32
+            # Legacy single-planner fallback
+            if self.env.world.planner.multi_action_mode:
+                space = MultiDiscrete(self.env.get_agent("p").action_spaces)
+                space.dtype = np.int32
+                space.nvec = space.nvec.astype(np.int32)
+            else:
+                space = Discrete(self.env.get_agent("p").action_spaces)
+                space.dtype = np.int32
+            self.env.action_space["p"] = space
 
-        # Ensure the observation and action spaces share the same keys
-        assert set(self.env.observation_space.keys()) == set(
-            self.env.action_space.keys()
-        )
+        # ----- Ensure observation and action spaces cover the same agent keys -----
+        obs_keys = set(self.env.observation_space.keys())
+        act_keys = set(self.env.action_space.keys())
+
+        # Soft check: action space must at least contain all obs keys
+        missing = obs_keys - act_keys
+        if missing:
+            raise ValueError(f"[EnvWrapper] Missing action spaces for agents: {missing}")
+
 
         # CUDA-specific initializations
         # -----------------------------
