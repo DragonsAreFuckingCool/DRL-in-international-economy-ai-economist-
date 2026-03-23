@@ -74,8 +74,54 @@ class RLlibEnvWrapper(MultiAgentEnv):
 
         obs = self.env.reset()
 
+
+
+        # Detect planner IDs (supports multi-planner)
+        if hasattr(self.env.world, "planners"):
+            self.planner_ids = [str(p.idx) for p in self.env.world.planners]
+        else:
+            # Legacy single-planner fallback
+            self.planner_ids = ["p"]
+        
+        # Detect all planner IDs
+        self.planner_ids = [str(p.idx) for p in self.env.world.planners]
+
+
         self.observation_space = self._dict_to_spaces_dict(obs["0"])
-        self.observation_space_pl = self._dict_to_spaces_dict(obs["p"])
+        #self.observation_space_pl = self._dict_to_spaces_dict(obs["p"])
+        
+        # self.observation_space_pl = {
+        #     pid: self._dict_to_spaces_dict(obs[pid])
+        #     for pid in self.planner_ids
+        # }
+
+        # Build per-planner observation spaces
+        self.observation_space_pl = {}
+        for pid in self.planner_ids:
+            if pid not in obs:
+                raise ValueError(f"[EnvWrapper] Missing planner obs for {pid}")
+            self.observation_space_pl[pid] = self._dict_to_spaces_dict(obs[pid])
+                
+
+        # if self.verbose:
+        #     print("[EnvWrapper] Spaces")
+        #     print("[EnvWrapper] Obs (a)   ")
+        #     pretty_print(self.observation_space)
+        #     print("[EnvWrapper] Obs (p)   ")
+        #     for pid, space in self.observation_space_pl.items():
+        #         print(f"  [{pid}]")
+        #         pretty_print(space)
+        #     print("[EnvWrapper] Action (a)", self.action_space)
+        #     print("[EnvWrapper] Action (p)", {pid: self.action_space[pid] for pid in self.planner_ids})
+
+        # if self.verbose:
+        #     print("[EnvWrapper] Spaces")
+        #     print("[EnvWrapper] Obs (a)   ")
+        #     pretty_print(self.observation_space)
+        #     print("[EnvWrapper] Obs (p)   ")
+        #     for pid, space in self.observation_space_pl.items():
+        #         print(f"  [{pid}]")
+        #         pretty_print(space)
 
         if self.env.world.agents[0].multi_action_mode:
             self.action_space = spaces.MultiDiscrete(
@@ -90,26 +136,45 @@ class RLlibEnvWrapper(MultiAgentEnv):
             )
             self.action_space.dtype = np.int64
 
-        if self.env.world.planner.multi_action_mode:
-            self.action_space_pl = spaces.MultiDiscrete(
-                self.env.get_agent("p").action_spaces
-            )
-            self.action_space_pl.dtype = np.int64
-            self.action_space_pl.nvec = self.action_space_pl.nvec.astype(np.int64)
+        # if self.env.world.planner.multi_action_mode:
+        #     self.action_space_pl = spaces.MultiDiscrete(
+        #         self.env.get_agent("p").action_spaces
+        #     )
+        #     self.action_space_pl.dtype = np.int64
+        #     self.action_space_pl.nvec = self.action_space_pl.nvec.astype(np.int64)
 
-        else:
-            self.action_space_pl = spaces.Discrete(
-                self.env.get_agent("p").action_spaces
-            )
-            self.action_space_pl.dtype = np.int64
+        # else:
+        #     self.action_space_pl = spaces.Discrete(
+        #         self.env.get_agent("p").action_spaces
+        #     )
+        #     self.action_space_pl.dtype = np.int64
+
+                
+        self.action_space_pl = {}
+        for pid in self.planner_ids:
+            planner = self.env.get_agent(pid)
+            if planner.multi_action_mode:
+                space = spaces.MultiDiscrete(planner.action_spaces)
+                space.dtype = np.int64
+                space.nvec = space.nvec.astype(np.int64)
+                self.action_space_pl[pid] = space
+            else:
+                space = spaces.Discrete(planner.action_spaces)
+                space.dtype = np.int64
+                self.action_space_pl[pid] = space
+
 
         self._seed = None
         if self.verbose:
             print("[EnvWrapper] Spaces")
             print("[EnvWrapper] Obs (a)   ")
             pretty_print(self.observation_space)
-            print("[EnvWrapper] Obs (p)   ")
-            pretty_print(self.observation_space_pl)
+            # print("[EnvWrapper] Obs (p)   ")
+            # pretty_print(self.observation_space_pl)
+            print("[EnvWrapper] Obs (p)")
+            for pid, space in self.observation_space_pl.items():
+                print(f"  [{pid}]")
+                pretty_print(space)
             print("[EnvWrapper] Action (a)", self.action_space)
             print("[EnvWrapper] Action (p)", self.action_space_pl)
 
@@ -208,7 +273,11 @@ class RLlibEnvWrapper(MultiAgentEnv):
         return recursive_list_to_np_array(obs)
 
     def step(self, action_dict):
+        # obs, rew, done, info = self.env.step(action_dict)
+        # assert isinstance(obs[self.sample_agent_idx]["action_mask"], np.ndarray)
+
         obs, rew, done, info = self.env.step(action_dict)
-        assert isinstance(obs[self.sample_agent_idx]["action_mask"], np.ndarray)
+        for pid in self.planner_ids:
+            assert isinstance(obs[pid]["action_mask"], np.ndarray)
 
         return recursive_list_to_np_array(obs), rew, done, info
