@@ -423,6 +423,21 @@ class World:
             self._planner = planner_class(multi_action_mode=self.multi_action_mode_planner)
             self._planners = [self._planner]
 
+    # def get_planner_by_id(self, pid):
+    #     if hasattr(self, "planners"):
+    #         for p in self._planners:
+    #             if str(p.idx) == str(pid):
+    #                 return p
+    #     return getattr(self, "_planner", None)
+    
+    
+    def get_planner_by_id(self, pid):
+        for p in self._planners:
+            if str(p.idx) == str(pid):
+                return p
+        return None
+
+    
     # -------------------------
     # Accessors
     # -------------------------
