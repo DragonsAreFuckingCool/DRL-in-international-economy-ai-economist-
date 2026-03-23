@@ -194,6 +194,51 @@ class BaseComponent(ABC):
             where, in this example, the Planner agent can choose 10 different tax
             levels for each Mobile agent.
         """
+        # Tell BaseEnv that only planners HAVE action subspaces,
+        # but do NOT specify how many here — we filter in get_action_spaces.
+        if agent_cls_name in ["TopPlanner", "BottomPlanner", "BasicPlanner"]:
+            if self.tax_model == "model_wrapper" and not self.disable_taxes:
+                return [
+                    ("TaxIndexBracket_{:03d}".format(int(r)), self.n_disc_rates)
+                    for r in self.bracket_cutoffs
+                ]
+        return 0
+    # def get_action_spaces(self, agent):
+    #     if not getattr(agent, "is_planner", False):
+    #         return []
+
+    #     if str(agent.idx) != self._planner_id:
+    #         return []
+
+    #     if self.tax_model == "model_wrapper" and not self.disable_taxes:
+    #         return [
+    #             ("TaxIndexBracket_{:03d}".format(int(r)), self.n_disc_rates)
+    #             for r in self.bracket_cutoffs
+    #         ]
+    #     return []
+
+    def get_action_spaces(self, agent):
+        """
+        Return ONLY the seven regional bracket action subspaces that belong
+        to THIS component's planner (p_top or p_bottom).
+        DOES NOT shrink the global MultiDiscrete action space, but gives
+        the correct list of intended subspaces for masking/plotting.
+        """
+
+        # Only planners have tax actions
+        if not getattr(agent, "is_planner", False):
+            return []
+
+        # Only the bound planner gets this component's brackets
+        if str(agent.idx) != str(self._planner_id):
+            return []
+
+        # Only return the seven REGIONAL bracket subspaces
+        return [
+            (f"TaxIndexBracket_{int(r):03d}", self.n_disc_rates)
+            for r in self.regional_brackets
+        ]
+
 
     @abstractmethod
     def get_additional_state_fields(self, agent_cls_name):
