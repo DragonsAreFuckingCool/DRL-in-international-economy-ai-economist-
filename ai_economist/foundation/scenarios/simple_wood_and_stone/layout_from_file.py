@@ -1406,47 +1406,44 @@ class CustomSplitOverlayFromFile(LayoutFromFile):
 
 from ai_economist.foundation.scenarios import scenario_registry
 import numpy as np
-
 @scenario_registry.add
 class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
     """
-    Split-world + overlay-from-file scenario with multiple planners (p_top, p_bottom)
-    and optional fixed agent starting positions.
+    Split-world + overlay-from-file scenario with multiple planners (p_top, p_bottom).
 
-    Main fixes:
-      - Correct row/col logic for top-vs-bottom split
-      - Proper multi-planner optimization metrics
-      - Marginal planner rewards, consistent with LayoutFromFile
-      - Custom starts applied safely at reset
-      - Planner observations sliced by region without breaking component obs
+    Supports:
+      - planner_subclasses=["TopPlanner", "BottomPlanner"]
+      - agent_start_locs=[(r,c), ...]
+      - fixed_four_skill_and_loc=True for any n_agents
+      - region-specific planner rewards
+      - top/bottom planner spatial observations
     """
 
     name = "custom/splitworld_overlay_regional"
 
     def __init__(self, *args, **kwargs):
         planner_subclasses = kwargs.pop("planner_subclasses", None)
-        #agent_start_locs = kwargs.pop("agent_start_locs", None)
 
         if planner_subclasses is not None:
             self.planner_subclasses = planner_subclasses
 
-        #self.agent_start_locs = agent_start_locs
-
         super().__init__(*args, **kwargs)
 
-        # Expose scenario to components
         self.world.scenario = self
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     def _split_row(self):
-        """Row index of the horizontal water barrier."""
-        return int(getattr(self, "_overlay_water_row",
-                   getattr(self, "_water_line", self.world_size[0] // 2)))
+        return int(
+            getattr(
+                self,
+                "_overlay_water_row",
+                getattr(self, "_water_line", self.world_size[0] // 2),
+            )
+        )
 
     def _is_top_agent(self, agent):
-        """Top/bottom is determined by ROW, not column."""
         r = int(agent.loc[0]) if hasattr(agent, "loc") else int(agent.state["loc"][0])
         return r < self._split_row()
 
@@ -1476,12 +1473,10 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
 
     def _regional_coin_eq_times_productivity(self, agents):
         coin_endowments = np.array([self._agent_coin(a) for a in agents], dtype=float)
-
         if len(coin_endowments) == 0:
             return 0.0
 
         eq_weight = 1.0 - self.mixing_weight_gini_vs_coin
-
         val = rewards.coin_eq_times_productivity(
             coin_endowments=coin_endowments,
             equality_weight=eq_weight,
@@ -1489,8 +1484,7 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
         return float(np.nan_to_num(val, nan=0.0, posinf=0.0, neginf=0.0))
 
     def _regional_agent_lists(self):
-        top_agents = []
-        bottom_agents = []
+        top_agents, bottom_agents = [], []
         for agent in self.world.agents:
             if self._is_top_agent(agent):
                 top_agents.append(agent)
@@ -1498,18 +1492,135 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
                 bottom_agents.append(agent)
         return top_agents, bottom_agents
 
+    def _candidate_positions_from_anchor(self, anchor_r, anchor_c, row_dir, col_dir, r_min, r_max):
+        """
+        Generate positions expanding from an anchor in a local grid.
+        row_dir, col_dir should be +1 or -1.
+        r_min inclusive, r_max exclusive.
+        """
+        H, W = self.world_size
+
+        max_row_span = max(anchor_r - r_min, (r_max - 1) - anchor_r)
+        max_col_span = max(anchor_c, (W - 1) - anchor_c)
+        max_layer = max(max_row_span, max_col_span, 8)
+
+        candidates = []
+        for layer in range(max_layer + 1):
+            for dc in range(layer + 1):
+                dr = layer - dc
+                r = anchor_r + row_dir * dr
+                c = anchor_c + col_dir * dc
+                if r_min <= r < r_max and 0 <= c < W:
+                    candidates.append((int(r), int(c)))
+        return candidates
+
+    def _place_agents_fixed_four_split(self):
+        """
+        Generalized fixed_four_skill_and_loc placement for split worlds.
+
+        Group meanings:
+          g=0 -> top-right
+          g=1 -> bottom-left
+          g=2 -> top-left
+          g=3 -> bottom-right
+
+        Works for arbitrary n_agents.
+        """
+        self.world.clear_agent_locs()
+
+        split = self._split_row()
+        H, W = self.world_size
+
+        # Need ranked skills from LayoutFromFile init
+        if not hasattr(self, "_avg_ranked_skill"):
+            raise ValueError("Expected _avg_ranked_skill to exist when fixed_four_skill_and_loc=True")
+
+        # Randomize which concrete agent gets which rank, as in base code
+        ranked_agents = self.world.get_random_order_agents()
+
+        # Divide agent ranks into 4 groups evenly
+        skill_groups = np.floor(np.arange(self.n_agents) * (4 / self.n_agents)).astype(np.int32)
+
+        # Anchor corners respecting the split
+        top_r = 0
+        bot_r = H - 1
+        left_c = 0
+        right_c = W - 1
+
+        group_specs = {
+            0: dict(anchor=(top_r, right_c), row_dir=+1, col_dir=-1, r_min=0,        r_max=split),
+            1: dict(anchor=(bot_r, left_c),  row_dir=-1, col_dir=+1, r_min=split + 1, r_max=H),
+            2: dict(anchor=(top_r, left_c),  row_dir=+1, col_dir=+1, r_min=0,        r_max=split),
+            3: dict(anchor=(bot_r, right_c), row_dir=-1, col_dir=-1, r_min=split + 1, r_max=H),
+        }
+
+        # Precompute candidate lists
+        candidate_lists = {}
+        for g, spec in group_specs.items():
+            ar, ac = spec["anchor"]
+            candidate_lists[g] = self._candidate_positions_from_anchor(
+                anchor_r=ar,
+                anchor_c=ac,
+                row_dir=spec["row_dir"],
+                col_dir=spec["col_dir"],
+                r_min=spec["r_min"],
+                r_max=spec["r_max"],
+            )
+
+        used = set()
+        group_cursor = {0: 0, 1: 0, 2: 0, 3: 0}
+
+        for rank, agent in enumerate(ranked_agents):
+            agent.state["build_payment"] = float(self._avg_ranked_skill[rank])
+            g = int(skill_groups[rank])
+
+            placed = False
+            candidates = candidate_lists[g]
+
+            for j in range(group_cursor[g], len(candidates)):
+                r, c = candidates[j]
+                if (r, c) in used:
+                    continue
+                if self.world.can_agent_occupy(r, c, agent):
+                    self.world.set_agent_loc(agent, r, c)
+                    used.add((r, c))
+                    group_cursor[g] = j + 1
+                    placed = True
+                    break
+
+            if not placed:
+                # fallback: random valid spot in intended half
+                spec = group_specs[g]
+                n_tries = 0
+                while True:
+                    r = np.random.randint(spec["r_min"], spec["r_max"])
+                    c = np.random.randint(0, W)
+                    if (r, c) not in used and self.world.can_agent_occupy(r, c, agent):
+                        self.world.set_agent_loc(agent, r, c)
+                        used.add((r, c))
+                        placed = True
+                        break
+                    n_tries += 1
+                    if n_tries > 500:
+                        raise TimeoutError(f"Could not place agent rank {rank} in group {g}")
+
+        curr = self.get_current_optimization_metrics()
+        self.curr_optimization_metric = deepcopy(curr)
+        self.init_optimization_metric = deepcopy(curr)
+        self.prev_optimization_metric = deepcopy(curr)
+
     # ------------------------------------------------------------------
-    # Reset hook for custom starts
+    # Reset hook
     # ------------------------------------------------------------------
     def additional_reset_steps(self):
         """
-        If custom starts are provided, use them.
-        Otherwise defer to parent logic (which handles split placement).
+        Priority:
+          1) agent_start_locs
+          2) fixed_four_skill_and_loc
+          3) parent split placement
         """
-        #print("DEBUG agent_start_locs:", self.agent_start_locs)
-        #print("DEBUG using custom starts?", self.agent_start_locs is not None)
-
-        if self.agent_start_locs is not None:
+        # 1) Explicit custom starts win
+        if getattr(self, "agent_start_locs", None) is not None:
             if len(self.agent_start_locs) != self.n_agents:
                 raise ValueError(
                     f"agent_start_locs must contain {self.n_agents} coordinates"
@@ -1527,7 +1638,6 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
                         f"Invalid start {(r, c)} for world size {self.world_size}"
                     )
 
-                # Try exact cell first; if blocked, search a small neighborhood
                 if self.world.can_agent_occupy(r, c, agent):
                     self.world.set_agent_loc(agent, r, c)
                 else:
@@ -1542,7 +1652,6 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
                                 break
                         if placed:
                             break
-
                     if not placed:
                         raise ValueError(f"Cannot place agent at or near {(r, c)}")
 
@@ -1551,23 +1660,21 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
             self.init_optimization_metric = deepcopy(curr)
             self.prev_optimization_metric = deepcopy(curr)
             return
-        
-        #print("DEBUG falling back to parent additional_reset_steps()")
+
+        # 2) Generalized fixed-four support
+        if getattr(self, "fixed_four_skill_and_loc", False):
+            self._place_agents_fixed_four_split()
+            return
+
+        # 3) Parent split placement
         return super().additional_reset_steps()
 
     # ------------------------------------------------------------------
     # Multi-planner optimization metrics
     # ------------------------------------------------------------------
     def get_current_optimization_metrics(self):
-        """
-        Compute current optimization metric for:
-          - each mobile agent
-          - p_top planner (top-region welfare)
-          - p_bottom planner (bottom-region welfare)
-        """
         curr_optimization_metric = {}
 
-        # Agent utilities: same as LayoutFromFile
         for agent in self.world.agents:
             curr_optimization_metric[agent.idx] = rewards.isoelastic_coin_minus_labor(
                 coin_endowment=agent.total_endowment("Coin"),
@@ -1578,7 +1685,6 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
 
         top_agents, bottom_agents = self._regional_agent_lists()
 
-        # Planner utilities: regional welfare
         for planner in getattr(self.world, "planners", []):
             pid = str(planner.idx)
             if "top" in pid:
@@ -1586,7 +1692,6 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
             elif "bottom" in pid:
                 curr_optimization_metric[pid] = self._regional_coin_eq_times_productivity(bottom_agents)
             else:
-                # Fallback: global welfare if some unexpected planner id appears
                 curr_optimization_metric[pid] = float(np.nan_to_num(
                     rewards.coin_eq_times_productivity(
                         coin_endowments=np.array(
@@ -1600,14 +1705,9 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
         return curr_optimization_metric
 
     # ------------------------------------------------------------------
-    # Rewards with correct keys
+    # Rewards
     # ------------------------------------------------------------------
     def compute_reward(self):
-        """
-        Marginal rewards for agents and planners.
-        This mirrors LayoutFromFile logic:
-            reward_t = metric_t - metric_{t-1}
-        """
         utility_at_end_of_last_time_step = deepcopy(self.curr_optimization_metric)
         self.curr_optimization_metric = self.get_current_optimization_metrics()
 
@@ -1616,9 +1716,6 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
             prev = utility_at_end_of_last_time_step.get(k, v)
             rew[str(k)] = float(np.nan_to_num(v - prev, nan=0.0, posinf=0.0, neginf=0.0))
 
-        self.prev_optimization_metric.update(utility_at_end_of_last_time_step)
-
-        # Automatic Energy Cost Annealing (same as LayoutFromFile)
         avg_agent_rew = np.mean([rew[str(a.idx)] for a in self.world.agents])
         if avg_agent_rew > 0:
             self._auto_warmup_integrator += 1
@@ -1670,7 +1767,7 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
         return metrics
 
     # ------------------------------------------------------------------
-    # Per-planner regional spatial observations
+    # Planner observations
     # ------------------------------------------------------------------
     def generate_observations(self):
         obs = super().generate_observations()
@@ -1693,13 +1790,11 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
             if pid not in obs:
                 obs[pid] = {}
 
-            # Keep component-generated fields and add planner inventory
             obs[pid].update({
                 "inventory-" + k: v * self.inv_scale
                 for k, v in planner.inventory.items()
             })
 
-            # Slice along ROW axis (axis=1 of map tensor, not width axis)
             if "top" in pid:
                 obs[pid]["map"] = curr_map[:, :split, :]
                 obs[pid]["idx_map"] = idx_map[:, :split, :]
