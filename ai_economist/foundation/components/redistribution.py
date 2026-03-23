@@ -1226,19 +1226,45 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
 
         # Call original init without extra kwargs
         super().__init__(*args, **kwargs)
+            
+        # self.disc_rates = np.concatenate([[0.0], self.disc_rates])
+        # self.n_disc_rates = len(self.disc_rates)
+
+    # ---------------------------------------------------------------------
+    # Tax brackets
+    # ---------------------------------------------------------------------
+        usd_scaling = 1000
+        self.regional_brackets = np.array([
+            0,
+            9700,
+            39475,
+            84200,
+            160725,
+            204100,
+            510300
+        ]) / usd_scaling
 
     # ---------------------------------------------------------------------
     # Utilities
     # ---------------------------------------------------------------------
 
     def _get_bound_planner(self, world):
-        """Return the planner object corresponding to self._planner_id."""
+        # """Return the planner object corresponding to self._planner_id."""
+        # if hasattr(world, "planners"):
+        #     for p in world.planners:
+        #         if getattr(p, "idx", None) == self._planner_id:
+        #             return p
+        # # Fallback to legacy single-planner handle
+        # #return getattr(world, "planner", None)
+        # return None
+        
+        want = str(self._planner_id)
         if hasattr(world, "planners"):
             for p in world.planners:
-                if getattr(p, "idx", None) == self._planner_id:
+                if str(p.idx) == want:
                     return p
-        # Fallback to legacy single-planner handle
-        return getattr(world, "planner", None)
+        return None
+
 
     def _in_region(self, agent, split):
         """Return True if agent belongs to this component's region."""
@@ -1266,8 +1292,7 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
     # ---------------------------------------------------------------------
 
     def get_n_actions(self, agent_cls_name):
-        """Return bracket action specs but only for the bound planner."""
-        # Allow actions for planner subclasses
+
         if agent_cls_name in ["TopPlanner", "BottomPlanner", "BasicPlanner"]:
             if self.tax_model == "model_wrapper" and not self.disable_taxes:
                 return [
@@ -1275,7 +1300,7 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
                     for r in self.bracket_cutoffs
                 ]
         return 0
-
+        
     # ---------------------------------------------------------------------
     # Select correct planner actions
     # ---------------------------------------------------------------------
@@ -1444,34 +1469,61 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
     # ---------------------------------------------------------------------
     # Masks: only for bound planner
     # ---------------------------------------------------------------------
-
     def generate_masks(self, completions=0):
+        """
+        Build masks for all bracket subspaces, but:
+        - Enable ONLY this component's 7 regional brackets for its bound planner.
+        - On tax day (tax_cycle_pos == 1), allow a BAND of legal rate choices
+            [0 .. max_idx] based on annealing, with a FLOOR (min_band) to ensure >1 choice.
+        - On non-tax days, allow only NO-OP (i.e., all-zero rate masks; RLlib adds no-op).
+        """
         planner = self._get_bound_planner(self.world)
         if planner is None:
             return {}
 
-        # Ask the parent first (lets it use its caching logic, annealing, etc.)
-        masks = super().generate_masks(completions)
+        # Only the bound planner should get this component's mask dict
+        if str(planner.idx) != str(self._planner_id):
+            return {}
 
-        # If parent returned the legacy key (world.planner), remap it to OUR planner_id
-        if isinstance(masks, dict) and (self.world.planner.idx in masks):
-            return {planner.idx: masks[self.world.planner.idx]}
+        # All bracket keys (full set from both components, 14 total in your setup)
+        all_keys = [f"TaxIndexBracket_{int(r):03d}" for r in self.bracket_cutoffs]
 
-        # ------------------------------
-        # Fallback: construct a valid mask set for OUR planner
-        # ------------------------------
-        # We only need masks when tax_model == "model_wrapper" and taxes enabled.
-        if self.tax_model == "model_wrapper" and not self.disable_taxes:
-            # Bracket action names
-            keys = ["TaxIndexBracket_{:03d}".format(int(r)) for r in self.bracket_cutoffs]
-            # On day 1 of each period -> enable choices (ones), otherwise -> disable (zeros)
-            if self.tax_cycle_pos == 1:
-                base_vec = np.ones(self.n_disc_rates, dtype=np.float32)
-            else:
-                base_vec = np.zeros(self.n_disc_rates, dtype=np.float32)
-            fallback = {k: base_vec for k in keys}
-            return {planner.idx: fallback}
+        # This component's 7 regional bracket keys
+        my_keys = [f"TaxIndexBracket_{int(r):03d}" for r in self.regional_brackets]
 
-        # If taxes are disabled or using a non-model tax model, safely return empty
-        return {}
+        # --- Determine allowed rate indices for tax day ---
+        # If no annealing configured, allow everything; otherwise cap by _annealed_rate_max.
+        disc = np.array(self.disc_rates, dtype=float)
+        n = len(disc)
 
+        # Default: allow all
+        allowed_idx = np.arange(n)
+
+        # Apply annealing cap if present
+        if getattr(self, "tax_annealing_schedule", None) is not None:
+            cap = float(getattr(self, "_annealed_rate_max", disc[-1]))
+            allowed_idx = np.where(disc <= cap)[0]
+
+        # Guarantee a minimum band size to avoid single-choice collapse
+        # e.g., allow at least the first 4 choices (0%, 5%, 10%, 15%) early on.
+        min_band = 4  # tune 3..5 if you like
+        if allowed_idx.size < min_band:
+            allowed_idx = np.arange(min_band)
+            allowed_idx = allowed_idx[allowed_idx < n]  # guard
+
+        # --- Rate masks for tax day vs non-tax day ---
+        if self.tax_cycle_pos == 1:
+            rate_mask_active = np.zeros(n, dtype=np.float32)
+            rate_mask_active[allowed_idx] = 1.0
+        else:
+            # not a decision step: only no-op is legal; return all-zero rate mask
+            rate_mask_active = np.zeros(n, dtype=np.float32)
+
+        # Fill dict for ALL subspaces: my 7 get active mask, others get zeros
+        zero_mask = np.zeros_like(rate_mask_active, dtype=np.float32)
+        masks = {}
+        for k in all_keys:
+            masks[k] = rate_mask_active if (k in my_keys) else zero_mask
+
+        # Return per-planner dict
+        return {str(planner.idx): masks}
