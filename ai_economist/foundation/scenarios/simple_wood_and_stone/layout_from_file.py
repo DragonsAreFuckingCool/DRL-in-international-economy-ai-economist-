@@ -82,6 +82,7 @@ class LayoutFromFile(BaseEnvironment):
         planner_reward_type="coin_eq_times_productivity",
         mixing_weight_gini_vs_coin=0.0,
         agent_start_locs=None,
+        agent_start_build_payment_multipliers=None,
         **base_env_kwargs,
     ):
         super().__init__(*base_env_args, **base_env_kwargs)
@@ -95,6 +96,9 @@ class LayoutFromFile(BaseEnvironment):
         self._mobile_agent_observation_range = int(mobile_agent_observation_range)
 
         self.agent_start_locs = agent_start_locs
+
+        self.agent_start_build_payment_multipliers = agent_start_build_payment_multipliers
+
 
         # Load in the layout
         path_to_layout_file = Path(f"{Path(__file__).parent}/map_txt/{env_layout_file}")
@@ -1615,45 +1619,187 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
     def additional_reset_steps(self):
         """
         Priority:
-          1) agent_start_locs
-          2) fixed_four_skill_and_loc
-          3) parent split placement
+        1) explicit agent_start_locs
+        2) fixed_four_skill_and_loc with deterministic split-region ranking
+        3) parent behavior
         """
-        # 1) Explicit custom starts win
-        if getattr(self, "agent_start_locs", None) is not None:
+        # ------------------------------------------------------------
+        # 1) Explicit custom starts
+        # ------------------------------------------------------------
+        # if getattr(self, "agent_start_locs", None) is not None:
+        #     if len(self.agent_start_locs) != self.n_agents:
+        #         raise ValueError(
+        #             f"agent_start_locs must contain {self.n_agents} coordinates"
+        #         )
+
+        #     H, W = self.world_size
+        #     self.world.clear_agent_locs()
+
+        #     for agent, (r, c) in zip(self.world.agents, self.agent_start_locs):
+        #         r = int(r)
+        #         c = int(c)
+
+        #         if not (0 <= r < H and 0 <= c < W):
+        #             raise ValueError(f"Invalid start {(r, c)} for world size {self.world_size}")
+
+        #         if self.world.can_agent_occupy(r, c, agent):
+        #             self.world.set_agent_loc(agent, r, c)
+        #         else:
+        #             placed = False
+        #             for dr in range(-2, 3):
+        #                 for dc in range(-2, 3):
+        #                     rr = int(np.clip(r + dr, 0, H - 1))
+        #                     cc = int(np.clip(c + dc, 0, W - 1))
+        #                     if self.world.can_agent_occupy(rr, cc, agent):
+        #                         self.world.set_agent_loc(agent, rr, cc)
+        #                         placed = True
+        #                         break
+        #                 if placed:
+        #                     break
+        #             if not placed:
+        #                 raise ValueError(f"Cannot place agent at or near {(r, c)}")
+
+        #     curr = self.get_current_optimization_metrics()
+        #     self.curr_optimization_metric = deepcopy(curr)
+        #     self.init_optimization_metric = deepcopy(curr)
+        #     self.prev_optimization_metric = deepcopy(curr)
+        #     return
+        # --- CUSTOM STARTING LOCATIONS / SKILL MULTIPLIERS ---
+        if hasattr(self, "agent_start_locs") and self.agent_start_locs is not None:
             if len(self.agent_start_locs) != self.n_agents:
                 raise ValueError(
-                    f"agent_start_locs must contain {self.n_agents} coordinates"
+                    f"agent_start_locs must have {self.n_agents} entries, "
+                    f"got {len(self.agent_start_locs)}"
                 )
 
-            H, W = self.world_size
-            self.world.clear_agent_locs()
+            if (
+                hasattr(self, "agent_start_build_payment_multipliers")
+                and self.agent_start_build_payment_multipliers is not None
+            ):
+                if len(self.agent_start_build_payment_multipliers) != self.n_agents:
+                    raise ValueError(
+                        f"agent_start_build_payment_multipliers must have {self.n_agents} entries, "
+                        f"got {len(self.agent_start_build_payment_multipliers)}"
+                    )
 
-            for agent, (r, c) in zip(self.world.agents, self.agent_start_locs):
+            self.world.clear_agent_locs()
+            H, W = self.world_size
+
+            bm = self.get_component("Build")
+            if bm is None:
+                raise ValueError("Custom build skill multipliers require the Build component.")
+
+            for i, (agent, (r, c)) in enumerate(zip(self.world.agents, self.agent_start_locs)):
                 r = int(r)
                 c = int(c)
 
                 if not (0 <= r < H and 0 <= c < W):
                     raise ValueError(
-                        f"Invalid start {(r, c)} for world size {self.world_size}"
+                        f"Custom start position {(r, c)} out of bounds for world size {self.world_size}"
                     )
 
-                if self.world.can_agent_occupy(r, c, agent):
-                    self.world.set_agent_loc(agent, r, c)
-                else:
+                if not self.world.can_agent_occupy(r, c, agent):
+                    raise ValueError(
+                        f"Cannot place agent at specified location {(r, c)}; "
+                        "cell is blocked or not occupiable."
+                    )
+
+                self.world.set_agent_loc(agent, r, c)
+
+                # Optional custom skill multiplier -> build payment
+                if (
+                    hasattr(self, "agent_start_build_payment_multipliers")
+                    and self.agent_start_build_payment_multipliers is not None
+                ):
+                    mult = float(self.agent_start_build_payment_multipliers[i])
+                    agent.state["build_payment"] = float(bm.payment * mult)
+
+            # Recompute objective trackers and return early
+            curr_optimization_metric = self.get_current_optimization_metrics()
+            self.curr_optimization_metric = deepcopy(curr_optimization_metric)
+            self.init_optimization_metric = deepcopy(curr_optimization_metric)
+            self.prev_optimization_metric = deepcopy(curr_optimization_metric)
+            return
+
+        # ------------------------------------------------------------
+        # 2) Fixed skill + deterministic split placement
+        # ------------------------------------------------------------
+        if getattr(self, "fixed_four_skill_and_loc", False):
+            self.world.clear_agent_locs()
+
+            split = self._split_row()
+            H, W = self.world_size
+
+            # randomize which physical agent gets which rank, same spirit as base code
+            ranked_agents = self.world.get_random_order_agents()
+
+            # base code gives ascending skill list: rank 0 = lowest, rank n-1 = highest
+            skills = np.array(self._avg_ranked_skill, dtype=float)
+            if len(skills) != self.n_agents:
+                raise ValueError("Expected _avg_ranked_skill to have length n_agents")
+
+            # We want 4 agents in north and 4 in south, with both low and high in each region.
+            # Use alternating global ranks:
+            #   top gets  [0, 2, 4, 6]
+            #   bottom gets [1, 3, 5, 7]
+            # then within each region:
+            #   local lowest -> bottom-left
+            #   local highest -> top-right
+            top_rank_ids = list(range(0, self.n_agents, 2))
+            bottom_rank_ids = list(range(1, self.n_agents, 2))
+
+            # sort within region by skill ascending
+            top_rank_ids = sorted(top_rank_ids, key=lambda i: skills[i])
+            bottom_rank_ids = sorted(bottom_rank_ids, key=lambda i: skills[i])
+
+            # Desired positions, low -> high within each region
+            # top region (rows 0..split-1)
+            top_positions = [
+                (split - 1, 0),          # lowest top -> bottom-left
+                (split - 6, 3),
+                (5, W - 6),
+                (0, W - 1),              # highest top -> top-right
+            ]
+
+            # bottom region (rows split+1..H-1)
+            bottom_positions = [
+                (H - 1, 0),              # lowest bottom -> bottom-left
+                (H - 6, 3),
+                (split + 5, W - 6),
+                (split + 1, W - 1),      # highest bottom -> top-right of bottom region
+            ]
+
+            def place_ranked(rank_ids, positions):
+                used = set()
+                for rank_id, (r, c) in zip(rank_ids, positions):
+                    agent = ranked_agents[rank_id]
+                    agent.state["build_payment"] = float(skills[rank_id])
+
+                    if self.world.can_agent_occupy(r, c, agent) and (r, c) not in used:
+                        self.world.set_agent_loc(agent, r, c)
+                        used.add((r, c))
+                        continue
+
                     placed = False
-                    for dr in range(-2, 3):
-                        for dc in range(-2, 3):
+                    for dr in range(-3, 4):
+                        for dc in range(-3, 4):
                             rr = int(np.clip(r + dr, 0, H - 1))
                             cc = int(np.clip(c + dc, 0, W - 1))
+                            if (rr, cc) in used:
+                                continue
                             if self.world.can_agent_occupy(rr, cc, agent):
                                 self.world.set_agent_loc(agent, rr, cc)
+                                used.add((rr, cc))
                                 placed = True
                                 break
                         if placed:
                             break
+
                     if not placed:
-                        raise ValueError(f"Cannot place agent at or near {(r, c)}")
+                        raise ValueError(f"Could not place rank {rank_id} near {(r, c)}")
+
+            place_ranked(top_rank_ids, top_positions)
+            place_ranked(bottom_rank_ids, bottom_positions)
 
             curr = self.get_current_optimization_metrics()
             self.curr_optimization_metric = deepcopy(curr)
@@ -1661,12 +1807,9 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
             self.prev_optimization_metric = deepcopy(curr)
             return
 
-        # 2) Generalized fixed-four support
-        if getattr(self, "fixed_four_skill_and_loc", False):
-            self._place_agents_fixed_four_split()
-            return
-
-        # 3) Parent split placement
+        # ------------------------------------------------------------
+        # 3) fallback
+        # ------------------------------------------------------------
         return super().additional_reset_steps()
 
     # ------------------------------------------------------------------
