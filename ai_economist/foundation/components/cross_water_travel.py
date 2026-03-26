@@ -8,6 +8,7 @@ from ai_economist.foundation.base.base_component import (
 class CrossWaterTravel(BaseComponent):
 
     name = "CrossWaterTravel"
+    required_entities = ["Coin", "Labor"]
     agent_subclasses = ["BasicMobileAgent"]
 
     def __init__(
@@ -16,9 +17,10 @@ class CrossWaterTravel(BaseComponent):
         travel_cost_coin=5.0,
         travel_cost_labor=0.0,
         cooldown=10,
-        target_top=(12, 12),
-        target_bottom=(38, 12),
-        allow_only_agent=None,  # e.g. 0 for testing
+        target_top=(7, 12),
+        target_bottom=(43, 12),
+        allow_only_agent=None,
+        enabled=True,
         **kwargs
     ):
         super().__init__(*args, **kwargs)
@@ -26,11 +28,18 @@ class CrossWaterTravel(BaseComponent):
         self.travel_cost_coin = float(travel_cost_coin)
         self.travel_cost_labor = float(travel_cost_labor)
         self.cooldown = int(cooldown)
-
         self.target_top = target_top
         self.target_bottom = target_bottom
-
         self.allow_only_agent = allow_only_agent
+        self.enabled = bool(enabled)
+
+        print(
+            f"[CrossWaterTravel INIT] enabled={self.enabled}, "
+            f"target_top={self.target_top}, target_bottom={self.target_bottom}, "
+            f"travel_cost_coin={self.travel_cost_coin}, "
+            f"travel_cost_labor={self.travel_cost_labor}, cooldown={self.cooldown}, "
+            f"allow_only_agent={self.allow_only_agent}"
+        )
 
     # --------------------------------------------------
     # ACTION SPACE
@@ -56,6 +65,9 @@ class CrossWaterTravel(BaseComponent):
 
     def component_step(self):
 
+        if not self.enabled:
+            return
+
         world = self.world
         waterline = world.world_size[0] // 2  # row split
 
@@ -64,9 +76,8 @@ class CrossWaterTravel(BaseComponent):
             action = agent.get_component_action(self.name)
 
             # TEMP SANITY CHECK:
-            # Force agent 0 to take the travel action on the first few steps,
-            # regardless of what the policy outputs. Remove after verifying
-            # that cross-world travel works correctly.
+            # Force agent 0 to take the travel action whenever cooldown is 0.
+            # Remove after verifying that cross-world travel works correctly.
             if agent.idx == 0 and agent.state["travel_cooldown"] == 0:
                 action = 1
 
@@ -82,27 +93,50 @@ class CrossWaterTravel(BaseComponent):
                 continue
 
             # Cost check
-            if agent.inventory["Coin"] < self.travel_cost_coin:
+            coin_before = float(agent.inventory["Coin"])
+            if coin_before < self.travel_cost_coin:
+                print(
+                    #f"[TRAVEL BLOCKED] Agent {agent.idx} | coin={coin_before:.2f} "
+                    #f"< cost={self.travel_cost_coin:.2f}"
+                )
                 continue
 
             old_r, old_c = agent.loc
 
-            # Determine destination
+            # Desired destination region
             if old_r < waterline:
-                target_r, target_c = self.target_bottom
+                desired_r, desired_c = self.target_bottom
             else:
-                target_r, target_c = self.target_top
+                desired_r, desired_c = self.target_top
 
-            # Deduct costs
-            agent.inventory["Coin"] -= self.travel_cost_coin
-            agent.state["endogenous"]["Labor"] += self.travel_cost_labor
+            target = self._find_valid_target(agent, desired_r, desired_c, max_radius=6)
+            if target is None:
+                print(
+                    f"[TRAVEL FAIL] Agent {agent.idx} | no valid target near {(desired_r, desired_c)}"
+                )
+                continue
 
-            # Attempt move
+            target_r, target_c = target
+
+            print(
+                f"[TRAVEL DEBUG] desired={(desired_r, desired_c)} chosen={(target_r, target_c)} "
+                f"accessible={world.maps.accessibility[agent.idx, target_r, target_c]} "
+                f"unoccupied={world.maps.unoccupied[target_r, target_c]}"
+            )
+
             new_r, new_c = world.set_agent_loc(agent, target_r, target_c)
 
-            # Check whether teleport succeeded
             if (new_r, new_c) == (target_r, target_c):
+                # Charge cost exactly once, only after successful move
+                agent.inventory["Coin"] -= self.travel_cost_coin
+                agent.state["endogenous"]["Labor"] += self.travel_cost_labor
                 agent.state["travel_cooldown"] = self.cooldown
+
+                assert agent.inventory["Coin"] >= 0, (
+                    f"Negative coin after travel for agent {agent.idx}: "
+                    f"{agent.inventory['Coin']}"
+                )
+
                 print(
                     f"[TRAVEL OK] Agent {agent.idx} | from {(old_r, old_c)} -> {(new_r, new_c)} | "
                     f"coin={agent.inventory['Coin']:.2f} | cooldown={agent.state['travel_cooldown']}"
@@ -119,26 +153,49 @@ class CrossWaterTravel(BaseComponent):
                 agent.state["travel_cooldown"] -= 1
 
     # --------------------------------------------------
+    # TRAVEL TARGET 
+    # --------------------------------------------------    
+
+    def _find_valid_target(self, agent, center_r, center_c, max_radius=6):
+        world = self.world
+
+        for radius in range(max_radius + 1):
+            for dr in range(-radius, radius + 1):
+                for dc in range(-radius, radius + 1):
+                    r = center_r + dr
+                    c = center_c + dc
+
+                    if r < 0 or r >= world.world_size[0]:
+                        continue
+                    if c < 0 or c >= world.world_size[1]:
+                        continue
+
+                    if world.maps.accessibility[agent.idx, r, c] and world.maps.unoccupied[r, c]:
+                        return r, c
+
+        return None
+
+    # --------------------------------------------------
     # MASKS
     # --------------------------------------------------
 
     def generate_masks(self, completions=0):
+        if not self.enabled:
+            allow = 0.0
 
         masks = {}
 
         for agent in self.world.agents:
-
             allow = 1.0
 
-            if agent.state["travel_cooldown"] > 0:
+            if not self.enabled:
                 allow = 0.0
-
-            if agent.inventory["Coin"] < self.travel_cost_coin:
+            elif agent.state["travel_cooldown"] > 0:
                 allow = 0.0
-
-            if self.allow_only_agent is not None:
-                if agent.idx != self.allow_only_agent:
-                    allow = 0.0
+            elif agent.inventory["Coin"] < self.travel_cost_coin:
+                allow = 0.0
+            elif self.allow_only_agent is not None and agent.idx != self.allow_only_agent:
+                allow = 0.0
 
             masks[agent.idx] = [allow]
 
