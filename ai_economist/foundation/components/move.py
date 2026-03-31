@@ -44,11 +44,12 @@ class Gather(BaseComponent):
         move_labor=1.0,
         collect_labor=1.0,
         skill_dist="none",
+        custom_gather_multipliers=None,
         **base_component_kwargs
     ):
         super().__init__(*base_component_args, **base_component_kwargs)
 
-        custom_gather_multipliers=None,
+        
 
         self.move_labor = float(move_labor)
         assert self.move_labor >= 0
