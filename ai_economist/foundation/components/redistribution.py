@@ -1224,6 +1224,8 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
         self._region = str(region) if region is not None else None      # "top" / "bottom"
         self._planner_id = str(planner_id) if planner_id is not None else None
 
+
+
         # Call original init without extra kwargs
         super().__init__(*args, **kwargs)
             
@@ -1440,24 +1442,46 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
             curr_rates=self._curr_rates_obs,
         )
 
-        # Agents (these can be shared)
+        waterline = self.world.world_size[0] // 2
+
+        # Agents
         for agent in self.world.agents:
             idx = str(agent.idx)
+
+            agent_region = "top" if agent.loc[0] < waterline else "bottom"
 
             curr_marginal_rate = self.marginal_rate(
                 agent.total_endowment("Coin") - self.last_coin[agent.idx]
             )
 
-            obs[idx] = dict(
-                is_tax_day=is_tax_day,
-                is_first_day=is_first_day,
-                tax_phase=tax_phase,
-                last_incomes=self._last_income_obs_sorted,
-                curr_rates=self._curr_rates_obs,
-                marginal_rate=curr_marginal_rate,
-            )
+            # Add region_id only once to avoid duplicate writing by both tax components.
+            # Here we do it only in the "top" tax component.
+            agent_obs = dict()
+            if self._region == "top":
+                agent_obs["region_id"] = 0.0 if agent_region == "top" else 1.0
 
-            # Planner-per-agent info:
+            if agent_region == self._region:
+                agent_obs.update(
+                    dict(
+                        is_tax_day=is_tax_day,
+                        is_first_day=is_first_day,
+                        tax_phase=tax_phase,
+                        last_incomes=self._last_income_obs_sorted,
+                        my_region_curr_rates=self._curr_rates_obs,
+                        my_region_marginal_rate=curr_marginal_rate,
+                    )
+                )
+            else:
+                agent_obs.update(
+                    dict(
+                        other_region_curr_rates=self._curr_rates_obs,
+                        other_region_marginal_rate=curr_marginal_rate,
+                    )
+                )
+
+            obs[idx] = agent_obs
+
+            # Planner-per-agent info
             obs["p" + idx] = dict(
                 last_income=self._last_income_obs[agent.idx],
                 last_marginal_rate=self.last_marginal_rate[agent.idx],
