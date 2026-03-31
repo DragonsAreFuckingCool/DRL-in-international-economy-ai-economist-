@@ -48,6 +48,8 @@ class Gather(BaseComponent):
     ):
         super().__init__(*base_component_args, **base_component_kwargs)
 
+        custom_gather_multipliers=None,
+
         self.move_labor = float(move_labor)
         assert self.move_labor >= 0
 
@@ -57,11 +59,19 @@ class Gather(BaseComponent):
         self.skill_dist = skill_dist.lower()
         assert self.skill_dist in ["none", "pareto", "lognormal"]
 
+        self.custom_gather_multipliers = custom_gather_multipliers
+        if self.custom_gather_multipliers is not None:
+            assert len(self.custom_gather_multipliers) == self.n_agents
+            for x in self.custom_gather_multipliers:
+                assert x >= 1.0 and x <= 2.0, "Gather multipliers must be in [1.0, 2.0]"
+
         self.gathers = []
 
         self._aidx = np.arange(self.n_agents)[:, None].repeat(4, axis=1)
         self._roff = np.array([[0, 0, -1, 1]])
         self._coff = np.array([[-1, 1, 0, 0]])
+
+        
 
     # Required methods for implementing components
     # --------------------------------------------
@@ -194,18 +204,29 @@ class Gather(BaseComponent):
         """
         See base_component.py for detailed description.
 
-        Re-sample agents' collection skills.
+        Re-sample agents' collection skills, unless custom gather multipliers
+        are provided.
         """
+        self.sampled_skills = {}
+
         for agent in self.world.agents:
-            if self.skill_dist == "none":
-                bonus_rate = 0.0
-            elif self.skill_dist == "pareto":
-                bonus_rate = np.minimum(2, np.random.pareto(3)) / 2
-            elif self.skill_dist == "lognormal":
-                bonus_rate = np.minimum(2, np.random.lognormal(-2.022, 0.938)) / 2
+            if self.custom_gather_multipliers is not None:
+                # Convert multiplier in [1, 2] to bonus probability in [0, 1]
+                mult = float(self.custom_gather_multipliers[agent.idx])
+                bonus_rate = mult - 1.0
+
             else:
-                raise NotImplementedError
+                if self.skill_dist == "none":
+                    bonus_rate = 0.0
+                elif self.skill_dist == "pareto":
+                    bonus_rate = np.minimum(2, np.random.pareto(3)) / 2
+                elif self.skill_dist == "lognormal":
+                    bonus_rate = np.minimum(2, np.random.lognormal(-2.022, 0.938)) / 2
+                else:
+                    raise NotImplementedError
+
             agent.state["bonus_gather_prob"] = float(bonus_rate)
+            self.sampled_skills[agent.idx] = float(bonus_rate)
 
         self.gathers = []
 
