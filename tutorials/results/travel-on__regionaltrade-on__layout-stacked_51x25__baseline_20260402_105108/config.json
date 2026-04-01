@@ -1,0 +1,622 @@
+{
+  "FRAMEWORK": "tf",
+  "PHASE1_ITERS": 50,
+  "PHASE2_ITERS": 125,
+  "PHASE3A_ITERS": 50,
+  "PHASE3B_ITERS": 50,
+  "MIN_BAND": 4,
+  "PERIOD": 100,
+  "EPISODE_LENGTH": 1000,
+  "WORLD_SIZE": [
+    51,
+    25
+  ],
+  "LAYOUT_FILE": "stacked_51x25.txt",
+  "EXPERIMENT_NAME": "travel-on__regionaltrade-on__layout-stacked_51x25__baseline",
+  "env_config_dict_phase1": {
+    "scenario_name": "custom/splitworld_overlay_regional",
+    "components": [
+      [
+        "Build",
+        {
+          "skill_dist": "pareto",
+          "payment_max_skill_multiplier": 3,
+          "build_labor": 2.1,
+          "payment": 10
+        }
+      ],
+      [
+        "ContinuousDoubleAuction",
+        {
+          "max_bid_ask": 10,
+          "order_labor": 0.05,
+          "max_num_orders": 5,
+          "order_duration": 50,
+          "restrict_trade_to_region": true
+        }
+      ],
+      [
+        "Gather",
+        {
+          "move_labor": 0.21,
+          "collect_labor": 0.21,
+          "skill_dist": "pareto",
+          "custom_gather_multipliers": [
+            1.8,
+            1.4,
+            1.2,
+            1.0,
+            1.0,
+            1.2,
+            1.4,
+            1.8
+          ]
+        }
+      ],
+      [
+        "RegionalPeriodicBracketTax",
+        {
+          "region": "top",
+          "planner_id": "p_top",
+          "period": 100,
+          "bracket_spacing": "us-federal",
+          "usd_scaling": 1000,
+          "disable_taxes": true
+        }
+      ],
+      [
+        "RegionalPeriodicBracketTax",
+        {
+          "region": "bottom",
+          "planner_id": "p_bottom",
+          "period": 100,
+          "bracket_spacing": "us-federal",
+          "usd_scaling": 1000,
+          "disable_taxes": true
+        }
+      ],
+      [
+        "CrossWaterTravel",
+        {
+          "enabled": false,
+          "travel_cost_coin": 2,
+          "travel_cost_labor": 2,
+          "cooldown": 20,
+          "target_top": [
+            7,
+            12
+          ],
+          "target_bottom": [
+            43,
+            12
+          ],
+          "allow_only_agent": null
+        }
+      ]
+    ],
+    "env_layout_file": "stacked_51x25.txt",
+    "world_size": [
+      51,
+      25
+    ],
+    "episode_length": 1000,
+    "starting_agent_coin": 0,
+    "fixed_four_skill_and_loc": false,
+    "n_agents": 8,
+    "planner_subclasses": [
+      "TopPlanner",
+      "BottomPlanner"
+    ],
+    "multi_action_mode_planner": true,
+    "multi_action_mode_agents": true,
+    "flatten_observations": true,
+    "flatten_masks": true,
+    "dense_log_frequency": 1,
+    "agent_start_locs": [
+      [
+        5,
+        5
+      ],
+      [
+        20,
+        5
+      ],
+      [
+        5,
+        20
+      ],
+      [
+        20,
+        20
+      ],
+      [
+        30,
+        5
+      ],
+      [
+        45,
+        5
+      ],
+      [
+        30,
+        20
+      ],
+      [
+        45,
+        20
+      ]
+    ],
+    "agent_start_build_payment_multipliers": [
+      1.1,
+      1.3,
+      1.6,
+      2.2,
+      1.1,
+      1.3,
+      1.6,
+      2.2
+    ]
+  },
+  "env_config_dict_phase2": {
+    "scenario_name": "custom/splitworld_overlay_regional",
+    "components": [
+      [
+        "Build",
+        {
+          "skill_dist": "pareto",
+          "payment_max_skill_multiplier": 3,
+          "build_labor": 2.1,
+          "payment": 10
+        }
+      ],
+      [
+        "ContinuousDoubleAuction",
+        {
+          "max_bid_ask": 10,
+          "order_labor": 0.05,
+          "max_num_orders": 5,
+          "order_duration": 50,
+          "restrict_trade_to_region": true
+        }
+      ],
+      [
+        "Gather",
+        {
+          "move_labor": 0.21,
+          "collect_labor": 0.21,
+          "skill_dist": "pareto",
+          "custom_gather_multipliers": [
+            1.8,
+            1.4,
+            1.2,
+            1.0,
+            1.0,
+            1.2,
+            1.4,
+            1.8
+          ]
+        }
+      ],
+      [
+        "RegionalPeriodicBracketTax",
+        {
+          "region": "top",
+          "planner_id": "p_top",
+          "period": 100,
+          "bracket_spacing": "us-federal",
+          "usd_scaling": 1000,
+          "disable_taxes": false,
+          "tax_model": "model_wrapper",
+          "tax_annealing_schedule": [
+            -100,
+            0.001
+          ]
+        }
+      ],
+      [
+        "RegionalPeriodicBracketTax",
+        {
+          "region": "bottom",
+          "planner_id": "p_bottom",
+          "period": 100,
+          "bracket_spacing": "us-federal",
+          "usd_scaling": 1000,
+          "disable_taxes": false,
+          "tax_model": "model_wrapper",
+          "tax_annealing_schedule": [
+            -100,
+            0.001
+          ]
+        }
+      ],
+      [
+        "CrossWaterTravel",
+        {
+          "enabled": false,
+          "travel_cost_coin": 2,
+          "travel_cost_labor": 2,
+          "cooldown": 20,
+          "target_top": [
+            7,
+            12
+          ],
+          "target_bottom": [
+            43,
+            12
+          ],
+          "allow_only_agent": null
+        }
+      ]
+    ],
+    "env_layout_file": "stacked_51x25.txt",
+    "world_size": [
+      51,
+      25
+    ],
+    "episode_length": 1000,
+    "starting_agent_coin": 0,
+    "fixed_four_skill_and_loc": false,
+    "n_agents": 8,
+    "planner_subclasses": [
+      "TopPlanner",
+      "BottomPlanner"
+    ],
+    "multi_action_mode_planner": true,
+    "multi_action_mode_agents": true,
+    "flatten_observations": true,
+    "flatten_masks": true,
+    "dense_log_frequency": 1,
+    "agent_start_locs": [
+      [
+        5,
+        5
+      ],
+      [
+        20,
+        5
+      ],
+      [
+        5,
+        20
+      ],
+      [
+        20,
+        20
+      ],
+      [
+        30,
+        5
+      ],
+      [
+        45,
+        5
+      ],
+      [
+        30,
+        20
+      ],
+      [
+        45,
+        20
+      ]
+    ],
+    "agent_start_build_payment_multipliers": [
+      1.1,
+      1.3,
+      1.6,
+      2.2,
+      1.1,
+      1.3,
+      1.6,
+      2.2
+    ]
+  },
+  "env_config_dict_phase3a": {
+    "scenario_name": "custom/splitworld_overlay_regional",
+    "components": [
+      [
+        "Build",
+        {
+          "skill_dist": "pareto",
+          "payment_max_skill_multiplier": 3,
+          "build_labor": 2.1,
+          "payment": 10
+        }
+      ],
+      [
+        "ContinuousDoubleAuction",
+        {
+          "max_bid_ask": 10,
+          "order_labor": 0.05,
+          "max_num_orders": 5,
+          "order_duration": 50,
+          "restrict_trade_to_region": true
+        }
+      ],
+      [
+        "Gather",
+        {
+          "move_labor": 0.21,
+          "collect_labor": 0.21,
+          "skill_dist": "pareto",
+          "custom_gather_multipliers": [
+            1.8,
+            1.4,
+            1.2,
+            1.0,
+            1.0,
+            1.2,
+            1.4,
+            1.8
+          ]
+        }
+      ],
+      [
+        "RegionalPeriodicBracketTax",
+        {
+          "region": "top",
+          "planner_id": "p_top",
+          "period": 100,
+          "bracket_spacing": "us-federal",
+          "usd_scaling": 1000,
+          "disable_taxes": false,
+          "tax_model": "model_wrapper",
+          "tax_annealing_schedule": [
+            -100,
+            0.001
+          ]
+        }
+      ],
+      [
+        "RegionalPeriodicBracketTax",
+        {
+          "region": "bottom",
+          "planner_id": "p_bottom",
+          "period": 100,
+          "bracket_spacing": "us-federal",
+          "usd_scaling": 1000,
+          "disable_taxes": false,
+          "tax_model": "model_wrapper",
+          "tax_annealing_schedule": [
+            -100,
+            0.001
+          ]
+        }
+      ],
+      [
+        "CrossWaterTravel",
+        {
+          "enabled": true,
+          "travel_cost_coin": 2,
+          "travel_cost_labor": 0,
+          "cooldown": 20,
+          "target_top": [
+            7,
+            12
+          ],
+          "target_bottom": [
+            43,
+            12
+          ],
+          "allow_only_agent": null
+        }
+      ]
+    ],
+    "env_layout_file": "stacked_51x25.txt",
+    "world_size": [
+      51,
+      25
+    ],
+    "episode_length": 1000,
+    "starting_agent_coin": 0,
+    "fixed_four_skill_and_loc": false,
+    "n_agents": 8,
+    "planner_subclasses": [
+      "TopPlanner",
+      "BottomPlanner"
+    ],
+    "multi_action_mode_planner": true,
+    "multi_action_mode_agents": true,
+    "flatten_observations": true,
+    "flatten_masks": true,
+    "dense_log_frequency": 1,
+    "agent_start_locs": [
+      [
+        5,
+        5
+      ],
+      [
+        20,
+        5
+      ],
+      [
+        5,
+        20
+      ],
+      [
+        20,
+        20
+      ],
+      [
+        30,
+        5
+      ],
+      [
+        45,
+        5
+      ],
+      [
+        30,
+        20
+      ],
+      [
+        45,
+        20
+      ]
+    ],
+    "agent_start_build_payment_multipliers": [
+      1.1,
+      1.3,
+      1.6,
+      2.2,
+      1.1,
+      1.3,
+      1.6,
+      2.2
+    ]
+  },
+  "env_config_dict_phase3b": {
+    "scenario_name": "custom/splitworld_overlay_regional",
+    "components": [
+      [
+        "Build",
+        {
+          "skill_dist": "pareto",
+          "payment_max_skill_multiplier": 3,
+          "build_labor": 2.1,
+          "payment": 10
+        }
+      ],
+      [
+        "ContinuousDoubleAuction",
+        {
+          "max_bid_ask": 10,
+          "order_labor": 0.05,
+          "max_num_orders": 5,
+          "order_duration": 50,
+          "restrict_trade_to_region": true
+        }
+      ],
+      [
+        "Gather",
+        {
+          "move_labor": 0.21,
+          "collect_labor": 0.21,
+          "skill_dist": "pareto",
+          "custom_gather_multipliers": [
+            1.8,
+            1.4,
+            1.2,
+            1.0,
+            1.0,
+            1.2,
+            1.4,
+            1.8
+          ]
+        }
+      ],
+      [
+        "RegionalPeriodicBracketTax",
+        {
+          "region": "top",
+          "planner_id": "p_top",
+          "period": 100,
+          "bracket_spacing": "us-federal",
+          "usd_scaling": 1000,
+          "disable_taxes": false,
+          "tax_model": "model_wrapper",
+          "tax_annealing_schedule": [
+            -100,
+            0.001
+          ]
+        }
+      ],
+      [
+        "RegionalPeriodicBracketTax",
+        {
+          "region": "bottom",
+          "planner_id": "p_bottom",
+          "period": 100,
+          "bracket_spacing": "us-federal",
+          "usd_scaling": 1000,
+          "disable_taxes": false,
+          "tax_model": "model_wrapper",
+          "tax_annealing_schedule": [
+            -100,
+            0.001
+          ]
+        }
+      ],
+      [
+        "CrossWaterTravel",
+        {
+          "enabled": true,
+          "travel_cost_coin": 2,
+          "travel_cost_labor": 0,
+          "cooldown": 20,
+          "target_top": [
+            7,
+            12
+          ],
+          "target_bottom": [
+            43,
+            12
+          ],
+          "allow_only_agent": null
+        }
+      ]
+    ],
+    "env_layout_file": "stacked_51x25.txt",
+    "world_size": [
+      51,
+      25
+    ],
+    "episode_length": 1000,
+    "starting_agent_coin": 0,
+    "fixed_four_skill_and_loc": false,
+    "n_agents": 8,
+    "planner_subclasses": [
+      "TopPlanner",
+      "BottomPlanner"
+    ],
+    "multi_action_mode_planner": true,
+    "multi_action_mode_agents": true,
+    "flatten_observations": true,
+    "flatten_masks": true,
+    "dense_log_frequency": 1,
+    "agent_start_locs": [
+      [
+        5,
+        5
+      ],
+      [
+        20,
+        5
+      ],
+      [
+        5,
+        20
+      ],
+      [
+        20,
+        20
+      ],
+      [
+        30,
+        5
+      ],
+      [
+        45,
+        5
+      ],
+      [
+        30,
+        20
+      ],
+      [
+        45,
+        20
+      ]
+    ],
+    "agent_start_build_payment_multipliers": [
+      1.1,
+      1.3,
+      1.6,
+      2.2,
+      1.1,
+      1.3,
+      1.6,
+      2.2
+    ]
+  }
+}

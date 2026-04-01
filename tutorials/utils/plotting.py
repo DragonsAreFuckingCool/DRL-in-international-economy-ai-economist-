@@ -6,6 +6,10 @@
 
 import matplotlib.pyplot as plt
 import numpy as np
+import os
+import json
+import pickle
+import pandas as pd
 
 from ai_economist.foundation import landmarks, resources
 
@@ -521,6 +525,27 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
     n = len(agent_ids)
     trading_active = "Trade" in log
 
+    # --- Collect travel events if present ---
+    travel_events_by_agent = {aid: [] for aid in agent_ids}
+    if "CrossWaterTravel" in log:
+        travel_events = log["CrossWaterTravel"]
+
+        # travel log is expected to be a list of dicts with keys:
+        # "t", "agent", "from", "to"
+        for evt in travel_events:
+            if not isinstance(evt, dict):
+                continue
+            aid = evt.get("agent", None)
+            if aid in travel_events_by_agent:
+                travel_events_by_agent[aid].append(evt)
+
+        # sort each agent's events by time
+        for aid in travel_events_by_agent:
+            travel_events_by_agent[aid] = sorted(
+                travel_events_by_agent[aid],
+                key=lambda x: x.get("t", -1)
+            )
+
     # Agent ordering
     if remap_key is None:
         aidx = agent_ids[:]
@@ -531,13 +556,32 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
 
     # Labels with skill-rank annotation
     rank_labels = []
+    # --- Extract skills from first state ---
+    build_payment = {}
+    gather_mults = {}
+
+    for aid in aidx:
+        s = log["states"][0][str(aid)]
+
+        build_payment[aid] = s.get("build_payment", np.nan)
+
+        p = s.get("bonus_gather_prob", np.nan)
+        gather_mults[aid] = 1.0 + p if np.isfinite(p) else np.nan
+
     for i, aid in enumerate(aidx):
+        base = f"Agent {aid}"
+        
         if i == 0:
-            rank_labels.append(f"Agent {aid} (Lowest Skill)")
+            base += " (Lowest Skill)"
         elif i == len(aidx) - 1:
-            rank_labels.append(f"Agent {aid} (Highest Skill)")
-        else:
-            rank_labels.append(f"Agent {aid}")
+            base += " (Highest Skill)"
+        
+        build = build_payment.get(aid, np.nan)
+        gather = gather_mults.get(aid, np.nan)
+
+        skill_line = f"\nBuild: {build:.2f} | Gather: {gather:.2f}"
+
+        rank_labels.append(base + skill_line)
 
     # --- Collect builds over time ---
     all_builds = []
@@ -607,6 +651,12 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
 
     # --- Time series plots: resources + labor + utility ---
     cmap = plt.get_cmap("jet", n)
+    # skills_array = np.array([build_skills[aid] for aid in aidx])
+    # norm = (skills_array - skills_array.min()) / (skills_array.max() - skills_array.min() + 1e-8)
+    # cmap = plt.cm.viridis
+
+    # colors = [cmap(x) for x in norm]
+
     rs = ["Wood", "Stone", "Coin"]
 
     fig1, axes = plt.subplots(1, len(rs) + 2, figsize=(22, 4), sharey=False)
@@ -620,6 +670,7 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
                 ],
                 label=rank_labels[i],
                 color=cmap(i),
+                #color=colors[i],
             )
         ax.set_title(r)
         ax.grid(True)
@@ -665,6 +716,32 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
         ax.set_title("Coin (duplicate)")
     ax.grid(True)
 
+
+    # --- Separate planner reward figure ---
+    fig1_planner, ax_planner = plt.subplots(1, 1, figsize=(8, 4))
+
+    try:
+        p_top = log.get("planner_rewards", {}).get("p_top", [])
+        p_bot = log.get("planner_rewards", {}).get("p_bottom", [])
+
+        if len(p_top) > 0:
+           p_top = np.array(p_top, dtype=float)
+           mask_top = np.isfinite(p_top)
+           ax_planner.plot(np.where(mask_top)[0], p_top[mask_top], label="Planner Top", linestyle="--")
+        if len(p_bot) > 0:
+           p_bot = np.array(p_bot, dtype=float)
+           mask_bot = np.isfinite(p_bot)
+           ax_planner.plot(np.where(mask_bot)[0], p_bot[mask_bot], label="Planner Bottom", linestyle="--")
+
+        ax_planner.set_title("Planner Rewards")
+        ax_planner.set_xlabel("Timestep")
+        ax_planner.set_ylabel("Reward")
+        ax_planner.grid(True)
+        ax_planner.legend()
+    except Exception:
+        ax_planner.set_title("Planner Rewards (missing)")
+        ax_planner.grid(True)
+
     # Put legend on rightmost time-series axis
     axes[-1].legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
 
@@ -682,6 +759,7 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
         sharey=False,
         squeeze=False,
     )
+    fig2.subplots_adjust(hspace=0.6)
 
     # Turn off unused axes
     for rr in range(total_rows):
@@ -695,22 +773,60 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
                 if trade_idx >= n:
                     axes[rr, cc].axis("off")
 
-    # Trajectories
+    # Trajectories (clean version: ONLY true travel is dashed)
     for i in range(n):
         rr = i // n_cols
         cc = i % n_cols
         ax = axes[rr, cc]
 
-        rows = np.array([x[str(aidx[i])]["loc"][0] for x in log["states"]]) * -1
-        cols = np.array([x[str(aidx[i])]["loc"][1] for x in log["states"]])
+        aid = aidx[i]
 
-        ax.plot(cols[::20], rows[::20], color=cmap(i))
-        ax.plot(cols[0], rows[0], "r*", markersize=12)
-        ax.plot(cols[-1], rows[-1], "g*", markersize=12)
-        ax.set_title(rank_labels[i])
+        # Extract trajectory
+        locs = np.array([x[str(aid)]["loc"] for x in log["states"]], dtype=int)
+        rs = locs[:, 0]
+        cs = locs[:, 1]
+
+        # ---- Plot NORMAL movement (solid) ----
+        # Subsample for clarity
+        stride = 5
+        ax.plot(
+            cs[::stride],
+            -rs[::stride],
+            color=cmap(i),
+            linewidth=1.2,
+            linestyle="-",
+            alpha=0.9,
+        )
+
+        # ---- Plot TRUE travel (dashed) ----
+        for evt in travel_events_by_agent.get(aid, []):
+            (r0, c0) = evt["from"]
+            (r1, c1) = evt["to"]
+
+            ax.plot(
+                [c0, c1],
+                [-r0, -r1],
+                color=cmap(i),
+                linewidth=2.5,
+                linestyle="--",
+                alpha=1.0,
+            )
+
+        # Start / end markers
+        ax.plot(cs[0], -rs[0], "r*", markersize=12)
+        ax.plot(cs[-1], -rs[-1], "g*", markersize=12)
+
+        ax.set_title(rank_labels[i], fontsize=10)
         ax.set_xlim([-1, 1 + tmp_map.shape[1]])
         ax.set_ylim([-(1 + tmp_map.shape[0]), 1])
         ax.grid(True)
+
+    from matplotlib.lines import Line2D
+    movement_legend = [
+        Line2D([0], [0], color="black", lw=1.2, linestyle="-", label="Movement"),
+        Line2D([0], [0], color="black", lw=2.0, linestyle="--", label="Travel"),
+    ]
+    axes[0, 0].legend(handles=movement_legend, loc="upper right", fontsize=8)
 
     # Trade timelines
     if trading_active:
@@ -746,4 +862,230 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
             ax.set_facecolor([0.3, 0.3, 0.3])
             ax.set_title(rank_labels[i])
 
-    return (fig0, fig1, fig2), incomes, endows, c_trades, all_builds
+            fig2.tight_layout(pad=2.0)
+
+    return (fig0, fig1, fig1_planner, fig2), incomes, endows, c_trades, all_builds
+
+
+def load_experiment_run(run_dir):
+    with open(os.path.join(run_dir, "summary.json"), "r") as f:
+        summary = json.load(f)
+
+        
+
+    metrics = pd.read_csv(os.path.join(run_dir, "training_metrics.csv"))
+
+    with open(os.path.join(run_dir, "dense_logs_final.pkl"), "rb") as f:
+        dense_log = pickle.load(f)
+
+
+        
+    dense_log = dense_log[0] #maybe change
+    return {
+        "run_dir": run_dir,
+        "name": summary.get("experiment_name", os.path.basename(run_dir)),
+        "summary": summary,
+        "metrics": metrics,
+        "dense_log": dense_log,
+    }
+
+def load_experiment_runs(run_dirs):
+    return [load_experiment_run(rd) for rd in run_dirs]
+
+def compare_training_curves(runs, metric="episode_reward_mean", by_phase=False, show_phase_boundaries=True):
+    fig, ax = plt.subplots(figsize=(10, 5))
+    phase_order = ["PHASE 1", "PHASE 2", "PHASE 3A", "PHASE 3B"]
+
+    max_boundary = 0
+
+    for run in runs:
+        df = run["metrics"].copy()
+        df["phase"] = pd.Categorical(df["phase"], categories=phase_order, ordered=True)
+        df = df.sort_values(["phase", "iter"]).reset_index(drop=True)
+
+        cumulative_offset = 0
+        x_all = []
+        y_all = []
+        boundaries = []
+
+        for phase in phase_order:
+            sdf = df[df["phase"] == phase].copy()
+            if sdf.empty:
+                continue
+
+            x_phase = np.arange(len(sdf)) + cumulative_offset
+            y_phase = sdf[metric].values
+
+            if by_phase:
+                ax.plot(x_phase, y_phase, label=f"{run['name']} | {phase}")
+            else:
+                x_all.extend(x_phase.tolist())
+                y_all.extend(y_phase.tolist())
+
+            cumulative_offset = x_phase[-1] + 1
+            boundaries.append(cumulative_offset)
+
+        max_boundary = max(max_boundary, cumulative_offset)
+
+        if not by_phase and len(x_all) > 0:
+            ax.plot(x_all, y_all, label=run["name"])
+
+    if show_phase_boundaries and not by_phase:
+        for b in boundaries[:-1]:
+            ax.axvline(b, linestyle="--", alpha=0.4)
+
+    ax.set_title(metric)
+    ax.set_xlabel("Training iteration (cumulative across phases)")
+    ax.set_ylabel(metric)
+    ax.grid(True)
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
+    fig.tight_layout()
+    return fig
+
+def compare_summary_bars(
+    runs,
+    metrics=None,
+    short_labels=None,
+    show_legend=True,
+):
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+
+    if metrics is None:
+        metrics = [
+            "mean_final_coin",
+            "std_final_coin",
+            "mean_final_labor",
+            "n_trades",
+            "n_builds",
+        ]
+
+    # Build dataframe
+    summary_df = pd.DataFrame(
+        [{"name": r["name"], **r["summary"]} for r in runs]
+    ).set_index("name")
+
+    # Keep only requested metrics that actually exist
+    metrics = [m for m in metrics if m in summary_df.columns]
+
+    n_runs = len(summary_df)
+
+    # Short labels like E1, E2, ...
+    if short_labels is None:
+        short_labels = {name: f"E{i+1}" for i, name in enumerate(summary_df.index)}
+    else:
+        # if passed as list, convert to dict
+        if isinstance(short_labels, list):
+            short_labels = {name: short_labels[i] for i, name in enumerate(summary_df.index)}
+
+    # Fixed colors per run
+    cmap = plt.get_cmap("tab10", max(n_runs, 1))
+    colors = {name: cmap(i) for i, name in enumerate(summary_df.index)}
+
+    fig, axes = plt.subplots(len(metrics), 1, figsize=(9, 3 * len(metrics)), squeeze=False)
+
+    for i, metric in enumerate(metrics):
+        ax = axes[i, 0]
+
+        vals = summary_df[metric]
+        x = np.arange(len(vals))
+
+        ax.bar(
+            x,
+            vals.values,
+            color=[colors[name] for name in vals.index],
+            width=0.6,
+        )
+
+        ax.set_title(metric)
+        ax.set_xticks(x)
+        ax.set_xticklabels([short_labels[name] for name in vals.index], rotation=0)
+        ax.grid(True, axis="y")
+
+    if show_legend:
+        legend_handles = [
+            Patch(facecolor=colors[name], label=f"{short_labels[name]}: {name}")
+            for name in summary_df.index
+        ]
+        fig.legend(
+            handles=legend_handles,
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            frameon=True,
+        )
+
+    fig.tight_layout(rect=[0, 0, 0.82, 1] if show_legend else [0, 0, 1, 1])
+
+    # Add short-label index as a column for easy reading
+    out_df = summary_df.copy()
+    out_df.insert(0, "label", [short_labels[name] for name in out_df.index])
+
+    return fig, out_df
+
+def extract_region_counts_over_time(log):
+    top_counts = []
+    bottom_counts = []
+
+    for state in log["states"]:
+        top = 0
+        bottom = 0
+
+        for k, s in state.items():
+            if not str(k).isdigit():
+                continue
+            region = s.get("region", None)
+            if region == "top":
+                top += 1
+            elif region == "bottom":
+                bottom += 1
+
+        top_counts.append(top)
+        bottom_counts.append(bottom)
+
+    return top_counts, bottom_counts
+
+def compare_region_dynamics(runs):
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+
+    for run in runs:
+        top, bottom = extract_region_counts_over_time(run["dense_log"])
+        axes[0].plot(top, label=run["name"])
+        axes[1].plot(bottom, label=run["name"])
+
+    axes[0].set_title("Top-region population over time")
+    axes[1].set_title("Bottom-region population over time")
+    axes[1].set_xlabel("Timestep")
+
+    for ax in axes:
+        ax.grid(True)
+        ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
+
+    fig.tight_layout()
+    return fig
+
+def extract_trade_count_over_time(log):
+    if "Trade" not in log:
+        return []
+
+    counts = []
+    for t in log["Trade"]:
+        trades = t.get("trades", []) if isinstance(t, dict) else t
+        counts.append(len(trades))
+    return counts
+
+def compare_trade_dynamics(runs):
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    for run in runs:
+        counts = extract_trade_count_over_time(run["dense_log"])
+        ax.plot(counts, label=run["name"])
+
+    ax.set_title("Trade count per timestep")
+    ax.set_xlabel("Timestep")
+    ax.set_ylabel("Number of trades")
+    ax.grid(True)
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
+    fig.tight_layout()
+    return fig

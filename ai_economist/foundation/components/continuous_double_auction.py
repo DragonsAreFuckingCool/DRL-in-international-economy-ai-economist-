@@ -46,6 +46,7 @@ class ContinuousDoubleAuction(BaseComponent):
         order_labor=0.25,
         order_duration=50,
         max_num_orders=None,
+        restrict_trade_to_region=False,
         **kwargs
     ):
         super().__init__(*args, **kwargs)
@@ -70,6 +71,8 @@ class ContinuousDoubleAuction(BaseComponent):
 
         self.order_labor = float(order_labor)
         self.order_labor = max(self.order_labor, 0.0)
+
+        self.restrict_trade_to_region = bool(restrict_trade_to_region)
 
         # Each collectible resource in the world can be traded via this component
         self.commodities = [
@@ -96,6 +99,16 @@ class ContinuousDoubleAuction(BaseComponent):
             for c in self.commodities
         }
 
+    # Region Helper
+    def get_agent_region(self, agent):
+        if "region" in agent.state:
+            return agent.state["region"]
+
+        # Fallback from location
+        row = int(agent.loc[0])
+        waterline = self.world.world_size[0] // 2
+        return "top" if row < waterline else "bottom"
+    
     # Convenience methods
     # -------------------
 
@@ -119,13 +132,19 @@ class ContinuousDoubleAuction(BaseComponent):
                 available asks.
         """
         if agent is None:
-            a_idx = -1
-        else:
-            a_idx = agent.idx
-        ask_hist = self._price_zeros()
-        for i, h in self.ask_hists[resource].items():
-            if a_idx != i:
+            ask_hist = self._price_zeros()
+            for i, h in self.ask_hists[resource].items():
                 ask_hist += h
+            return ask_hist
+
+        a_idx = agent.idx
+        a_region = self.get_agent_region(agent)
+        ask_hist = self._price_zeros()
+
+        for ask in self.asks[resource]:
+            if ask["seller"] != a_idx and ask["region"] == a_region:
+                ask_hist[ask["ask"] - self.price_floor] += 1
+
         return ask_hist
 
     def available_bids(self, resource, agent):
@@ -142,13 +161,19 @@ class ContinuousDoubleAuction(BaseComponent):
                 available bids.
         """
         if agent is None:
-            a_idx = -1
-        else:
-            a_idx = agent.idx
-        bid_hist = self._price_zeros()
-        for i, h in self.bid_hists[resource].items():
-            if a_idx != i:
+            bid_hist = self._price_zeros()
+            for i, h in self.bid_hists[resource].items():
                 bid_hist += h
+            return bid_hist
+
+        a_idx = agent.idx
+        a_region = self.get_agent_region(agent)
+        bid_hist = self._price_zeros()
+
+        for bid in self.bids[resource]:
+            if bid["buyer"] != a_idx and bid["region"] == a_region:
+                bid_hist[bid["bid"] - self.price_floor] += 1
+
         return bid_hist
 
     def can_bid(self, resource, agent):
@@ -161,6 +186,28 @@ class ContinuousDoubleAuction(BaseComponent):
             self.n_orders[resource][agent.idx] < self.max_num_orders
             and agent.state["inventory"][resource] > 0
         )
+    
+
+    # Region Spesific Asks and Bids
+    def available_asks_for_region(self, resource, region, exclude_agent_idx=None):
+        ask_hist = self._price_zeros()
+        for ask in self.asks[resource]:
+            if ask["region"] != region:
+                continue
+            if exclude_agent_idx is not None and ask["seller"] == exclude_agent_idx:
+                continue
+            ask_hist[ask["ask"] - self.price_floor] += 1
+        return ask_hist
+
+    def available_bids_for_region(self, resource, region, exclude_agent_idx=None):
+        bid_hist = self._price_zeros()
+        for bid in self.bids[resource]:
+            if bid["region"] != region:
+                continue
+            if exclude_agent_idx is not None and bid["buyer"] == exclude_agent_idx:
+                continue
+            bid_hist[bid["bid"] - self.price_floor] += 1
+        return bid_hist
 
     # Core components for this market
     # -------------------------------
@@ -183,7 +230,13 @@ class ContinuousDoubleAuction(BaseComponent):
 
         assert self.price_floor <= max_payment <= self.price_ceiling
 
-        bid = {"buyer": agent.idx, "bid": int(max_payment), "bid_lifetime": 0}
+        #bid = {"buyer": agent.idx, "bid": int(max_payment), "bid_lifetime": 0}
+        bid = {
+            "buyer": agent.idx,
+            "bid": int(max_payment),
+            "bid_lifetime": 0,
+            "region": self.get_agent_region(agent),
+        }
 
         # Add this to the bid book
         self.bids[resource].append(bid)
@@ -214,7 +267,13 @@ class ContinuousDoubleAuction(BaseComponent):
         # is there an upper limit?
         assert self.price_floor <= min_income <= self.price_ceiling
 
-        ask = {"seller": agent.idx, "ask": int(min_income), "ask_lifetime": 0}
+        #ask = {"seller": agent.idx, "ask": int(min_income), "ask_lifetime": 0}
+        ask = {
+            "seller": agent.idx,
+            "ask": int(min_income),
+            "ask_lifetime": 0,
+            "region": self.get_agent_region(agent),
+        }
 
         # Add this to the ask book
         self.asks[resource].append(ask)
@@ -276,8 +335,13 @@ class ContinuousDoubleAuction(BaseComponent):
 
                     # Skip to next ask if this ask comes from the buyer
                     # of the current bid.
-                    elif asks[idx_ask]["seller"] == bids[idx_bid]["buyer"]:
+                    # elif asks[idx_ask]["seller"] == bids[idx_bid]["buyer"]:
+                    #     idx_ask += 1
+                    elif self.restrict_trade_to_region and bids[idx_bid]["region"] != asks[idx_ask]["region"]:
                         idx_ask += 1
+
+                    elif bids[idx_bid]["region"] != asks[idx_ask]["region"]:
+                        idx_ask += 1    
 
                     # If this bid/ask pair can't be matched, this buyer
                     # can't be matched. (maybe) Restart inner loop.
@@ -498,10 +562,10 @@ class ContinuousDoubleAuction(BaseComponent):
         submit). Agents also see their own outstanding bids/asks.
         """
         world = self.world
-
         obs = {a.idx: {} for a in world.agents + [world.planner]}
 
         prices = np.arange(self.price_floor, self.price_ceiling + 1)
+
         for c in self.commodities:
             net_price_history = np.sum(
                 np.stack([self.price_history[c][i] for i in range(self.n_agents)]),
@@ -512,32 +576,72 @@ class ContinuousDoubleAuction(BaseComponent):
             )
             scaled_price_history = net_price_history * self.inv_scale
 
-            full_asks = self.available_asks(c, agent=None)
-            full_bids = self.available_bids(c, agent=None)
+            if not self.restrict_trade_to_region:
+                full_asks = self.available_asks(c, agent=None)
+                full_bids = self.available_bids(c, agent=None)
 
-            obs[world.planner.idx].update(
-                {
-                    "market_rate-{}".format(c): market_rate,
-                    "price_history-{}".format(c): scaled_price_history,
-                    "full_asks-{}".format(c): full_asks,
-                    "full_bids-{}".format(c): full_bids,
-                }
-            )
-
-            for _, agent in enumerate(world.agents):
-                # Private to the agent
-                obs[agent.idx].update(
+                obs[world.planner.idx].update(
                     {
-                        "market_rate-{}".format(c): market_rate,
-                        "price_history-{}".format(c): scaled_price_history,
-                        "available_asks-{}".format(c): full_asks
-                        - self.ask_hists[c][agent.idx],
-                        "available_bids-{}".format(c): full_bids
-                        - self.bid_hists[c][agent.idx],
-                        "my_asks-{}".format(c): self.ask_hists[c][agent.idx],
-                        "my_bids-{}".format(c): self.bid_hists[c][agent.idx],
+                        f"market_rate-{c}": market_rate,
+                        f"price_history-{c}": scaled_price_history,
+                        f"full_asks-{c}": full_asks,
+                        f"full_bids-{c}": full_bids,
                     }
                 )
+
+                for agent in world.agents:
+                    obs[agent.idx].update(
+                        {
+                            f"market_rate-{c}": market_rate,
+                            f"price_history-{c}": scaled_price_history,
+                            f"available_asks-{c}": full_asks - self.ask_hists[c][agent.idx],
+                            f"available_bids-{c}": full_bids - self.bid_hists[c][agent.idx],
+                            f"my_asks-{c}": self.ask_hists[c][agent.idx],
+                            f"my_bids-{c}": self.bid_hists[c][agent.idx],
+                        }
+                    )
+
+            else:
+                top_asks = self.available_asks_for_region(c, "top")
+                bottom_asks = self.available_asks_for_region(c, "bottom")
+                top_bids = self.available_bids_for_region(c, "top")
+                bottom_bids = self.available_bids_for_region(c, "bottom")
+
+                obs[world.planner.idx].update(
+                    {
+                        f"market_rate-{c}": market_rate,
+                        f"price_history-{c}": scaled_price_history,
+                        f"top_asks-{c}": top_asks,
+                        f"bottom_asks-{c}": bottom_asks,
+                        f"top_bids-{c}": top_bids,
+                        f"bottom_bids-{c}": bottom_bids,
+                    }
+                )
+
+                for agent in world.agents:
+                    my_region = self.get_agent_region(agent)
+                    other_region = "bottom" if my_region == "top" else "top"
+
+                    obs[agent.idx].update(
+                        {
+                            f"market_rate-{c}": market_rate,
+                            f"price_history-{c}": scaled_price_history,
+                            f"my_region_asks-{c}": self.available_asks_for_region(
+                                c, my_region, exclude_agent_idx=agent.idx
+                            ),
+                            f"my_region_bids-{c}": self.available_bids_for_region(
+                                c, my_region, exclude_agent_idx=agent.idx
+                            ),
+                            f"other_region_asks-{c}": self.available_asks_for_region(
+                                c, other_region
+                            ),
+                            f"other_region_bids-{c}": self.available_bids_for_region(
+                                c, other_region
+                            ),
+                            f"my_asks-{c}": self.ask_hists[c][agent.idx],
+                            f"my_bids-{c}": self.bid_hists[c][agent.idx],
+                        }
+                    )
 
         return obs
 
