@@ -290,15 +290,6 @@ class SplitLayoutTwoPlanner(SplitLayout):
 
 
 
-        # ===== TEMP DEBUG START =====
-        assigned_top = self.planner_to_agents["p_top"]
-        assigned_bottom = self.planner_to_agents["p_bottom"]
-        top_coins, _ = self._get_region_arrays(assigned_top)
-        bottom_coins, _ = self._get_region_arrays(assigned_bottom)
-        print("[DBG] top ids:", assigned_top, "sum_coin:", float(np.sum(top_coins)))
-        print("[DBG] bottom ids:", assigned_bottom, "sum_coin:", float(np.sum(bottom_coins)))
-        print("[DBG] rew:", rew)
-        # ===== TEMP DEBUG END =====
 
         return rew
 
