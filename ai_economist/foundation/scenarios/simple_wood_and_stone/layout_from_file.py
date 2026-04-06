@@ -461,14 +461,6 @@ class LayoutFromFile(BaseEnvironment):
             for agent in self.world.agents
         }
 
-        # obs[self.world.planner.idx] = {
-        #     "inventory-" + k: v * self.inv_scale
-        #     for k, v in self.world.planner.inventory.items()
-        # }
-        # if self._planner_gets_spatial_info:
-        #     obs[self.world.planner.idx].update(
-        #         dict(map=curr_map, idx_map=agent_idx_maps)
-        #     )
         # Keep component-generated planner obs instead of overwriting it
         planner_obs = obs.get(self.world.planner.idx, {})
 
@@ -1435,6 +1427,8 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
 
         self.world.scenario = self
 
+        self.travel_revenue = {"top": 0.0, "bottom": 0.0}
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -1623,47 +1617,10 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
         2) fixed_four_skill_and_loc with deterministic split-region ranking
         3) parent behavior
         """
-        # ------------------------------------------------------------
-        # 1) Explicit custom starts
-        # ------------------------------------------------------------
-        # if getattr(self, "agent_start_locs", None) is not None:
-        #     if len(self.agent_start_locs) != self.n_agents:
-        #         raise ValueError(
-        #             f"agent_start_locs must contain {self.n_agents} coordinates"
-        #         )
 
-        #     H, W = self.world_size
-        #     self.world.clear_agent_locs()
+        # regional money from travel
+        self.travel_revenue = {"top": 0.0, "bottom": 0.0}
 
-        #     for agent, (r, c) in zip(self.world.agents, self.agent_start_locs):
-        #         r = int(r)
-        #         c = int(c)
-
-        #         if not (0 <= r < H and 0 <= c < W):
-        #             raise ValueError(f"Invalid start {(r, c)} for world size {self.world_size}")
-
-        #         if self.world.can_agent_occupy(r, c, agent):
-        #             self.world.set_agent_loc(agent, r, c)
-        #         else:
-        #             placed = False
-        #             for dr in range(-2, 3):
-        #                 for dc in range(-2, 3):
-        #                     rr = int(np.clip(r + dr, 0, H - 1))
-        #                     cc = int(np.clip(c + dc, 0, W - 1))
-        #                     if self.world.can_agent_occupy(rr, cc, agent):
-        #                         self.world.set_agent_loc(agent, rr, cc)
-        #                         placed = True
-        #                         break
-        #                 if placed:
-        #                     break
-        #             if not placed:
-        #                 raise ValueError(f"Cannot place agent at or near {(r, c)}")
-
-        #     curr = self.get_current_optimization_metrics()
-        #     self.curr_optimization_metric = deepcopy(curr)
-        #     self.init_optimization_metric = deepcopy(curr)
-        #     self.prev_optimization_metric = deepcopy(curr)
-        #     return
         # --- CUSTOM STARTING LOCATIONS / SKILL MULTIPLIERS ---
         if hasattr(self, "agent_start_locs") and self.agent_start_locs is not None:
             if len(self.agent_start_locs) != self.n_agents:
@@ -1813,6 +1770,14 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
         return super().additional_reset_steps()
 
     # ------------------------------------------------------------------
+    # Travel revenue
+    # ------------------------------------------------------------------
+    def add_travel_revenue(self, region, amount):
+        if region not in self.travel_revenue:
+            return
+        self.travel_revenue[region] += float(amount)
+        
+    # ------------------------------------------------------------------
     # Multi-planner optimization metrics
     # ------------------------------------------------------------------
     def get_current_optimization_metrics(self):
@@ -1927,17 +1892,45 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
 
         split = self._split_row()
 
+        # Build region membership from CURRENT agent locations
+        top_agent_ids = set()
+        bottom_agent_ids = set()
+        for agent in self.world.agents:
+            if self._is_top_agent(agent):
+                top_agent_ids.add(str(agent.idx))
+            else:
+                bottom_agent_ids.add(str(agent.idx))
+
         for planner in self.world.planners:
             pid = str(planner.idx)
 
             if pid not in obs:
                 obs[pid] = {}
 
-            obs[pid].update({
-                "inventory-" + k: v * self.inv_scale
-                for k, v in planner.inventory.items()
-            })
+            # Keep only region-relevant per-agent planner entries ("p0", "p1", ...)
+            # Remove entries for agents outside this planner's region.
+            keys_to_delete = []
+            for k in list(obs[pid].keys()):
+                if not isinstance(k, str):
+                    continue
+                if not k.startswith("p"):
+                    continue
 
+                agent_id = k[1:]   # "p3" -> "3"
+                if not agent_id.isdigit():
+                    continue
+
+                if "top" in pid:
+                    if agent_id not in top_agent_ids:
+                        keys_to_delete.append(k)
+                else:
+                    if agent_id not in bottom_agent_ids:
+                        keys_to_delete.append(k)
+
+            for k in keys_to_delete:
+                del obs[pid][k]
+
+            # Give each planner only its own region's spatial view
             if "top" in pid:
                 obs[pid]["map"] = curr_map[:, :split, :]
                 obs[pid]["idx_map"] = idx_map[:, :split, :]
