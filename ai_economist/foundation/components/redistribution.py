@@ -1396,7 +1396,21 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
 
         # ----- Redistribute lump sum to agents IN THIS REGION only -----
         # (Option C typically redistributes within region)
-        lump_sum = net_tax_revenue / max(1, self.n_agents)
+        # Add travel revenue from scenario
+        travel_rev = 0.0
+        if hasattr(self.world, "scenario"):
+            travel_rev = self.world.scenario.travel_revenue.get(self._region, 0.0)
+
+        total_revenue = net_tax_revenue + travel_rev
+
+        region_agents = [
+            agent for agent in self.world.agents
+            if self._in_region(agent, split)
+        ]
+
+        lump_sum = total_revenue / max(1, len(region_agents))
+
+        #lump_sum = net_tax_revenue / max(1, self.n_agents)
         for agent in self.world.agents:
             if self._in_region(agent, split):
                 agent.state["inventory"]["Coin"] += lump_sum
@@ -1408,6 +1422,9 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
             self.last_coin[agent.idx] = float(agent.total_endowment("Coin"))
 
         self.taxes.append(tax_dict)
+
+        if hasattr(self.world, "scenario"):
+            self.world.scenario.travel_revenue[self._region] = 0.0
 
         # Update period logs
         self._last_income_obs = np.array(self.last_income) / self.period
