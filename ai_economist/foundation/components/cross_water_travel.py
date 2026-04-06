@@ -54,8 +54,15 @@ class CrossWaterTravel(BaseComponent):
 
     def get_additional_state_fields(self, agent_cls_name):
         if agent_cls_name == "BasicMobileAgent":
-            return {"travel_cooldown": 0}
+            return {
+                "travel_cooldown": 0,
+                "region": "top", 
+            }
         return {}
+    
+    def _region_from_row(self, row):
+        waterline = self.world.world_size[0] // 2
+        return "top" if int(row) < waterline else "bottom"
 
     def component_step(self):
 
@@ -70,6 +77,8 @@ class CrossWaterTravel(BaseComponent):
         for agent in world.get_random_order_agents():
 
             action = agent.get_component_action(self.name)
+
+            
 
             if action == 0:
                 continue
@@ -111,9 +120,15 @@ class CrossWaterTravel(BaseComponent):
             new_r, new_c = world.set_agent_loc(agent, target_r, target_c)
 
             if (new_r, new_c) == (target_r, target_c):
+                origin_region = agent.state["region"]
                 agent.inventory["Coin"] -= self.travel_cost_coin
                 agent.state["endogenous"]["Labor"] += self.travel_cost_labor
                 agent.state["travel_cooldown"] = self.cooldown
+                agent.state["region"] = self._region_from_row(new_r)
+
+                # Send travel payment to scenario (regional pool)
+                if hasattr(self.world, "scenario"):
+                    self.world.scenario.add_travel_revenue(origin_region, self.travel_cost_coin)
 
                 assert agent.inventory["Coin"] >= 0, (
                     f"Negative coin after travel for agent {agent.idx}: "
@@ -185,13 +200,6 @@ class CrossWaterTravel(BaseComponent):
 
         return masks
 
-    # def generate_observations(self):
-    #     return {
-    #         str(agent.idx): {
-    #             "travel_cooldown": agent.state["travel_cooldown"]
-    #         }
-    #         for agent in self.world.agents
-    #     }
     
     def generate_observations(self):
         obs = {}
@@ -199,15 +207,21 @@ class CrossWaterTravel(BaseComponent):
             eligible = 1.0
             if self.allow_only_agent is not None and agent.idx != self.allow_only_agent:
                 eligible = 0.0
-            obs[str(agent.idx)] = {
+            obs[agent.idx] = {
                 "travel_cooldown": agent.state["travel_cooldown"],
                 "travel_enabled_for_me": eligible if self.enabled else 0.0,
+                "my_region_top": 1.0 if agent.state["region"] == "top" else 0.0,
+                "my_region_bottom": 1.0 if agent.state["region"] == "bottom" else 0.0,
             }
         return obs
 
     def additional_reset_steps(self):
         self.successful_travelers = set()
         self.travel_log = []
+        for agent in self.world.agents:
+            row = int(agent.loc[0])
+            agent.state["region"] = self._region_from_row(row)
+            agent.state["travel_cooldown"] = 0
 
     def get_dense_log(self):
         return self.travel_log
