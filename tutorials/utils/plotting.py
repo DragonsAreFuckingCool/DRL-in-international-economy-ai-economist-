@@ -506,16 +506,85 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
     """
     Like breakdown(...), but:
       - shows ALL mobile agents
-      - uses up to n_cols columns (8 agents -> 2 rows of 4)
+      - uses up to n_cols columns
       - labels legend so highest/lowest skill agents are explicit
-      - does NOT overwrite breakdown()
+      - fixes trajectory plotting so:
+          * map aspect follows actual world dimensions
+          * travel steps are dashed only
+          * no solid "shadow" line is drawn across travel jumps
 
     Returns:
-        (fig0, fig1, fig2), incomes, endows, c_trades, all_builds
+        (fig0, fig1, fig1_planner, fig2), incomes, endows, c_trades, all_builds
     """
     import math
     import numpy as np
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    # -----------------------------
+    # Helpers
+    # -----------------------------
+    def _to_tuple(x):
+        if x is None:
+            return None
+        return tuple(int(v) for v in x)
+
+    def _crosses_middle_barrier(loc0, loc1, middle_col=25):
+        """
+        Treat a step as travel if it crosses the vertical middle divider.
+        Assumes cols are x-axis positions (0-indexed).
+        """
+        if loc0 is None or loc1 is None:
+            return False
+        r0, c0 = loc0
+        r1, c1 = loc1
+
+        # Same location -> not travel
+        if (r0, c0) == (r1, c1):
+            return False
+
+        # Crossing from one side of the divider to the other
+        left0 = c0 < middle_col
+        left1 = c1 < middle_col
+        right0 = c0 > middle_col
+        right1 = c1 > middle_col
+
+        return (left0 and right1) or (right0 and left1)
+
+    def _build_travel_step_set(events, n_states, middle_col=25):
+        """
+        Returns a set of timestep indices t such that the transition
+        state[t] -> state[t+1] should be plotted as travel.
+
+        Uses:
+          1) explicit CrossWaterTravel events when present
+          2) fallback detection from crossing the middle divider
+        """
+        travel_steps = set()
+
+        # Explicit travel events
+        for evt in events:
+            if not isinstance(evt, dict):
+                continue
+            t = evt.get("t", None)
+            if t is None:
+                continue
+            try:
+                t = int(t)
+            except Exception:
+                continue
+
+            # Common conventions differ: event at t may mean transition t->t+1
+            # We clamp into valid step indices [0, n_states-2].
+            if 0 <= t < n_states - 1:
+                travel_steps.add(t)
+            elif 1 <= t - 1 < n_states - 1:
+                travel_steps.add(t - 1)
+
+        return travel_steps
+
+    def _extract_locs_for_agent(states, aid):
+        return np.array([s[str(aid)]["loc"] for s in states], dtype=int)
 
     # Snapshot montage figure
     fig0 = vis_world_range(log, remap_key=remap_key)
@@ -525,13 +594,18 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
     n = len(agent_ids)
     trading_active = "Trade" in log
 
+    # --- World shape ---
+    tmp_map = np.array(log["world"][0]["Stone"])
+    n_rows, n_cols_world = tmp_map.shape  # e.g. 25 rows x 51 cols
+
+    # middle divider for a 51-wide world is 25 (0-indexed)
+    middle_col = n_cols_world // 2
+
     # --- Collect travel events if present ---
     travel_events_by_agent = {aid: [] for aid in agent_ids}
     if "CrossWaterTravel" in log:
         travel_events = log["CrossWaterTravel"]
 
-        # travel log is expected to be a list of dicts with keys:
-        # "t", "agent", "from", "to"
         for evt in travel_events:
             if not isinstance(evt, dict):
                 continue
@@ -539,7 +613,6 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
             if aid in travel_events_by_agent:
                 travel_events_by_agent[aid].append(evt)
 
-        # sort each agent's events by time
         for aid in travel_events_by_agent:
             travel_events_by_agent[aid] = sorted(
                 travel_events_by_agent[aid],
@@ -556,31 +629,25 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
 
     # Labels with skill-rank annotation
     rank_labels = []
-    # --- Extract skills from first state ---
     build_payment = {}
     gather_mults = {}
 
     for aid in aidx:
         s = log["states"][0][str(aid)]
-
         build_payment[aid] = s.get("build_payment", np.nan)
-
         p = s.get("bonus_gather_prob", np.nan)
         gather_mults[aid] = 1.0 + p if np.isfinite(p) else np.nan
 
     for i, aid in enumerate(aidx):
         base = f"Agent {aid}"
-        
         if i == 0:
             base += " (Lowest Skill)"
         elif i == len(aidx) - 1:
             base += " (Highest Skill)"
-        
+
         build = build_payment.get(aid, np.nan)
         gather = gather_mults.get(aid, np.nan)
-
         skill_line = f"\nBuild: {build:.2f} | Gather: {gather:.2f}"
-
         rank_labels.append(base + skill_line)
 
     # --- Collect builds over time ---
@@ -608,23 +675,23 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
 
         incomes = {
             "Sell Stone": [
-                sum([tr["income"] for tr in c_trades["Stone"] if tr["seller"] == aidx[i]])
+                sum(tr["income"] for tr in c_trades["Stone"] if tr["seller"] == aidx[i])
                 for i in range(n)
             ],
             "Buy Stone": [
-                sum([-tr["price"] for tr in c_trades["Stone"] if tr["buyer"] == aidx[i]])
+                sum(-tr["price"] for tr in c_trades["Stone"] if tr["buyer"] == aidx[i])
                 for i in range(n)
             ],
             "Sell Wood": [
-                sum([tr["income"] for tr in c_trades["Wood"] if tr["seller"] == aidx[i]])
+                sum(tr["income"] for tr in c_trades["Wood"] if tr["seller"] == aidx[i])
                 for i in range(n)
             ],
             "Buy Wood": [
-                sum([-tr["price"] for tr in c_trades["Wood"] if tr["buyer"] == aidx[i]])
+                sum(-tr["price"] for tr in c_trades["Wood"] if tr["buyer"] == aidx[i])
                 for i in range(n)
             ],
             "Build": [
-                sum([b["income"] for b in all_builds if b["builder"] == aidx[i]])
+                sum(b["income"] for b in all_builds if b["builder"] == aidx[i])
                 for i in range(n)
             ],
         }
@@ -632,7 +699,7 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
         c_trades = None
         incomes = {
             "Build": [
-                sum([b["income"] for b in all_builds if b["builder"] == aidx[i]])
+                sum(b["income"] for b in all_builds if b["builder"] == aidx[i])
                 for i in range(n)
             ],
         }
@@ -649,14 +716,10 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
 
     report(c_trades, all_builds, n, aidx)
 
-    # --- Time series plots: resources + labor + utility ---
+    # -----------------------------
+    # Time-series plots
+    # -----------------------------
     cmap = plt.get_cmap("jet", n)
-    # skills_array = np.array([build_skills[aid] for aid in aidx])
-    # norm = (skills_array - skills_array.min()) / (skills_array.max() - skills_array.min() + 1e-8)
-    # cmap = plt.cm.viridis
-
-    # colors = [cmap(x) for x in norm]
-
     rs = ["Wood", "Stone", "Coin"]
 
     fig1, axes = plt.subplots(1, len(rs) + 2, figsize=(22, 4), sharey=False)
@@ -670,7 +733,6 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
                 ],
                 label=rank_labels[i],
                 color=cmap(i),
-                #color=colors[i],
             )
         ax.set_title(r)
         ax.grid(True)
@@ -686,7 +748,7 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
     ax.set_title("Labor")
     ax.grid(True)
 
-    # Utility (if remap_key exists and you want final curves from state)
+    # Utility
     ax = axes[4]
     utility_ok = False
     try:
@@ -698,7 +760,6 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
         if utility_ok:
             ax.set_title("Utility")
         else:
-            # fallback: plot coin again if utility not stored in state
             for i in range(n):
                 vals = [
                     x[str(aidx[i])]["inventory"]["Coin"] + x[str(aidx[i])]["escrow"]["Coin"]
@@ -716,22 +777,20 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
         ax.set_title("Coin (duplicate)")
     ax.grid(True)
 
-
-    # --- Separate planner reward figure ---
+    # Planner rewards
     fig1_planner, ax_planner = plt.subplots(1, 1, figsize=(8, 4))
-
     try:
         p_top = log.get("planner_rewards", {}).get("p_top", [])
         p_bot = log.get("planner_rewards", {}).get("p_bottom", [])
 
         if len(p_top) > 0:
-           p_top = np.array(p_top, dtype=float)
-           mask_top = np.isfinite(p_top)
-           ax_planner.plot(np.where(mask_top)[0], p_top[mask_top], label="Planner Top", linestyle="--")
+            p_top = np.array(p_top, dtype=float)
+            mask_top = np.isfinite(p_top)
+            ax_planner.plot(np.where(mask_top)[0], p_top[mask_top], label="Planner Top", linestyle="--")
         if len(p_bot) > 0:
-           p_bot = np.array(p_bot, dtype=float)
-           mask_bot = np.isfinite(p_bot)
-           ax_planner.plot(np.where(mask_bot)[0], p_bot[mask_bot], label="Planner Bottom", linestyle="--")
+            p_bot = np.array(p_bot, dtype=float)
+            mask_bot = np.isfinite(p_bot)
+            ax_planner.plot(np.where(mask_bot)[0], p_bot[mask_bot], label="Planner Bottom", linestyle="--")
 
         ax_planner.set_title("Planner Rewards")
         ax_planner.set_xlabel("Timestep")
@@ -742,97 +801,161 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
         ax_planner.set_title("Planner Rewards (missing)")
         ax_planner.grid(True)
 
-    # Put legend on rightmost time-series axis
     axes[-1].legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
 
-    # --- Movement tracks / trade timelines for ALL agents ---
-    tmp_map = np.array(log["world"][0]["Stone"])
-    n_cols = min(n_cols, n)
-    n_agent_rows = int(math.ceil(n / n_cols))
-
+    # -----------------------------
+    # Movement tracks / trade timelines
+    # -----------------------------
+    plot_cols = min(n_cols, n)
+    n_agent_rows = int(math.ceil(n / plot_cols))
     total_rows = n_agent_rows + (n_agent_rows if trading_active else 0)
+
+    # Give MORE height to map rows, LESS height to trade rows
+    if trading_active:
+        height_ratios = [1.8] * n_agent_rows + [0.9] * n_agent_rows
+    else:
+        height_ratios = [1.8] * n_agent_rows
+
     fig2, axes = plt.subplots(
         total_rows,
-        n_cols,
-        figsize=(4 * n_cols, 4 * total_rows),
+        plot_cols,
+        figsize=(4.8 * plot_cols, 4.8 * n_agent_rows + (2.4 * n_agent_rows if trading_active else 0)),
         sharex=False,
         sharey=False,
         squeeze=False,
+        gridspec_kw={"height_ratios": height_ratios},
     )
-    fig2.subplots_adjust(hspace=0.6)
+    fig2.subplots_adjust(hspace=0.7)
 
     # Turn off unused axes
     for rr in range(total_rows):
-        for cc in range(n_cols):
-            idx = rr * n_cols + cc
+        for cc in range(plot_cols):
+            idx = rr * plot_cols + cc
             if rr < n_agent_rows:
                 if idx >= n:
                     axes[rr, cc].axis("off")
             else:
-                trade_idx = (rr - n_agent_rows) * n_cols + cc
+                trade_idx = (rr - n_agent_rows) * plot_cols + cc
                 if trade_idx >= n:
                     axes[rr, cc].axis("off")
 
-    # Trajectories (clean version: ONLY true travel is dashed)
+    # --- Trajectories ---
     for i in range(n):
-        rr = i // n_cols
-        cc = i % n_cols
+        rr = i // plot_cols
+        cc = i % plot_cols
         ax = axes[rr, cc]
-
         aid = aidx[i]
 
-        # Extract trajectory
-        locs = np.array([x[str(aid)]["loc"] for x in log["states"]], dtype=int)
-        rs = locs[:, 0]
-        cs = locs[:, 1]
+        locs = _extract_locs_for_agent(log["states"], aid)
+        rows = locs[:, 0]
+        cols = locs[:, 1]
+        n_states = len(locs)
 
-        # ---- Plot NORMAL movement (solid) ----
-        # Subsample for clarity
-        stride = 5
-        ax.plot(
-            cs[::stride],
-            -rs[::stride],
-            color=cmap(i),
-            linewidth=1.2,
-            linestyle="-",
-            alpha=0.9,
+        # Travel steps from explicit log
+        explicit_travel_steps = _build_travel_step_set(
+            travel_events_by_agent.get(aid, []),
+            n_states=n_states,
+            middle_col=middle_col,
         )
 
-        # ---- Plot TRUE travel (dashed) ----
-        for evt in travel_events_by_agent.get(aid, []):
-            (r0, c0) = evt["from"]
-            (r1, c1) = evt["to"]
+        # Build final travel step set:
+        # mark step t as travel if either:
+        #   - explicit travel event says so
+        #   - the move crosses the middle barrier
+        travel_steps = set(explicit_travel_steps)
+        for t in range(n_states - 1):
+            loc0 = tuple(locs[t])
+            loc1 = tuple(locs[t + 1])
+            if _crosses_middle_barrier(loc0, loc1, middle_col=middle_col):
+                travel_steps.add(t)
+
+        # Plot normal movement ONLY for non-travel transitions
+        for t in range(n_states - 1):
+            if t in travel_steps:
+                continue
+
+            r0, c0 = locs[t]
+            r1, c1 = locs[t + 1]
+
+            # Skip zero-length stays
+            if (r0, c0) == (r1, c1):
+                continue
 
             ax.plot(
                 [c0, c1],
-                [-r0, -r1],
+                [r0, r1],
                 color=cmap(i),
-                linewidth=2.5,
-                linestyle="--",
-                alpha=1.0,
+                linewidth=1.2,
+                linestyle="-",
+                alpha=0.9,
+                zorder=2,
             )
 
+        # Plot travel ONLY for travel transitions
+        for t in sorted(travel_steps):
+            if not (0 <= t < n_states - 1):
+                continue
+
+            r0, c0 = locs[t]
+            r1, c1 = locs[t + 1]
+
+            if (r0, c0) == (r1, c1):
+                continue
+
+            ax.plot(
+                [c0, c1],
+                [r0, r1],
+                color=cmap(i),
+                linewidth=2.4,
+                linestyle="--",
+                alpha=1.0,
+                zorder=3,
+            )
+
+        # Optional: mark sampled visited points lightly for readability
+        stride = max(1, n_states // 150)
+        ax.plot(
+            cols[::stride],
+            rows[::stride],
+            marker="o",
+            linestyle="None",
+            markersize=1.8,
+            alpha=0.25,
+            color=cmap(i),
+            zorder=1,
+        )
+
         # Start / end markers
-        ax.plot(cs[0], -rs[0], "r*", markersize=12)
-        ax.plot(cs[-1], -rs[-1], "g*", markersize=12)
+        ax.plot(cols[0], rows[0], marker="*", color="red", markersize=11, zorder=4)
+        ax.plot(cols[-1], rows[-1], marker="*", color="limegreen", markersize=11, zorder=4)
+
+        # Draw the middle divider
+        ax.axvline(middle_col, color="k", linestyle=":", linewidth=1.0, alpha=0.7)
+
+        # Make axes follow world dimensions
+        ax.set_xlim(-0.5, n_cols_world - 0.5)
+        ax.set_ylim(n_rows - 0.5, -0.5)  # invert y so row 0 is top
+        ax.set_aspect(n_cols_world / n_rows)
+        ax.grid(True, alpha=0.3)
 
         ax.set_title(rank_labels[i], fontsize=10)
-        ax.set_xlim([-1, 1 + tmp_map.shape[1]])
-        ax.set_ylim([-(1 + tmp_map.shape[0]), 1])
-        ax.grid(True)
+        ax.set_xlabel("col")
+        ax.set_ylabel("row")
 
-    from matplotlib.lines import Line2D
     movement_legend = [
         Line2D([0], [0], color="black", lw=1.2, linestyle="-", label="Movement"),
-        Line2D([0], [0], color="black", lw=2.0, linestyle="--", label="Travel"),
+        Line2D([0], [0], color="black", lw=2.4, linestyle="--", label="Travel"),
+        Line2D([0], [0], color="black", lw=1.0, linestyle=":", label="Middle divider"),
     ]
     axes[0, 0].legend(handles=movement_legend, loc="upper right", fontsize=8)
 
+    # -----------------------------
     # Trade timelines
+    # -----------------------------
     if trading_active:
         for i in range(n):
-            rr = n_agent_rows + (i // n_cols)
-            cc = i % n_cols
+            rr = n_agent_rows + (i // plot_cols)
+            cc = i % plot_cols
             ax = axes[rr, cc]
 
             for r in ["Wood", "Stone"]:
@@ -856,13 +979,13 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
                     )
                     ax.plot(ts, prices, ".", color=resources.get(r).color, markersize=10)
 
-            ax.plot([-20, len(log["states"]) + 19], [0, 0], "w-")
-            ax.set_xlim([-20, len(log["states"]) + 19])
+            ax.axhline(0, color="white", linewidth=1)
+            ax.set_xlim([-1, len(log["states"])])
             ax.grid(True)
             ax.set_facecolor([0.3, 0.3, 0.3])
             ax.set_title(rank_labels[i])
 
-            fig2.tight_layout(pad=2.0)
+    fig2.tight_layout(pad=2.0)
 
     return (fig0, fig1, fig1_planner, fig2), incomes, endows, c_trades, all_builds
 
