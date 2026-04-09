@@ -3,7 +3,7 @@ from ai_economist.foundation.base.base_component import (
     component_registry,
 )
 
-
+import random
 @component_registry.add
 class CrossWaterTravel(BaseComponent):
 
@@ -17,14 +17,20 @@ class CrossWaterTravel(BaseComponent):
         travel_cost_coin=5.0,
         travel_cost_labor=0.0,
         cooldown=10,
-        target_top=(7, 12),
-        target_bottom=(43, 12),
+        target_top= None,
+        target_bottom=None,
         allow_only_agent=None,
         enabled=True,
         debug=False,
         **kwargs
     ):
         super().__init__(*args, **kwargs)
+
+        if target_top is None:
+            target_top = random.choice([(0, 0), (24, 0), (0, 24), (24, 24)])
+
+        if target_bottom is None:
+            target_bottom = random.choice([(26, 0), (50, 0), (26, 24), (50, 24)])
 
         self.travel_cost_coin = float(travel_cost_coin)
         self.travel_cost_labor = float(travel_cost_labor)
