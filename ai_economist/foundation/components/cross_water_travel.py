@@ -17,8 +17,6 @@ class CrossWaterTravel(BaseComponent):
         travel_cost_coin=5.0,
         travel_cost_labor=0.0,
         cooldown=10,
-        target_top= None,
-        target_bottom=None,
         allow_only_agent=None,
         enabled=True,
         debug=False,
@@ -26,17 +24,9 @@ class CrossWaterTravel(BaseComponent):
     ):
         super().__init__(*args, **kwargs)
 
-        if target_top is None:
-            target_top = random.choice([(0, 0), (24, 0), (0, 24), (24, 24)])
-
-        if target_bottom is None:
-            target_bottom = random.choice([(26, 0), (50, 0), (26, 24), (50, 24)])
-
         self.travel_cost_coin = float(travel_cost_coin)
         self.travel_cost_labor = float(travel_cost_labor)
         self.cooldown = int(cooldown)
-        self.target_top = target_top
-        self.target_bottom = target_bottom
         self.allow_only_agent = allow_only_agent
         self.enabled = bool(enabled)
         self.debug = bool(debug)
@@ -44,14 +34,56 @@ class CrossWaterTravel(BaseComponent):
         self.successful_travelers = set()
         self.travel_log = []
 
+        self.agent_home_by_id = {
+            0: {"top": (0, 0),   "bottom": (26, 0)},
+            1: {"top": (24, 0),  "bottom": (50, 0)},
+            2: {"top": (0, 24),  "bottom": (26, 24)},
+            3: {"top": (24, 24), "bottom": (50, 24)},
+            4: {"top": (0, 0),   "bottom": (26, 0)},
+            5: {"top": (24, 0),  "bottom": (50, 0)},
+            6: {"top": (0, 24),  "bottom": (26, 24)},
+            7: {"top": (24, 24), "bottom": (50, 24)},
+        }
+
+        # start-location <-> travel-target mapping
+        # self.travel_pairs = {
+        #     (0, 0): (26, 0),
+        #     (24, 0): (50, 0),
+        #     (0, 24): (26, 24),
+        #     (24, 24): (50, 24),
+
+        #     (26, 0): (0, 0),
+        #     (50, 0): (24, 0),
+        #     (26, 24): (0, 24),
+        #     (50, 24): (24, 24),
+        # }
+
+        # cache each agent's original start location
+        self.agent_start_locs = {}
+
         if self.debug:
             print(
                 f"[CrossWaterTravel INIT] enabled={self.enabled}, "
-                f"target_top={self.target_top}, target_bottom={self.target_bottom}, "
                 f"travel_cost_coin={self.travel_cost_coin}, "
                 f"travel_cost_labor={self.travel_cost_labor}, cooldown={self.cooldown}, "
                 f"allow_only_agent={self.allow_only_agent}"
             )
+
+    # TRAVEL LOCATION HELPERS         
+    def _get_travel_target_for_agent(self, agent):
+        aid = int(agent.idx)
+        homes = self.agent_home_by_id.get(aid, None)
+        if homes is None:
+            return None
+
+        current_region = agent.state["region"]
+
+        if current_region == "top":
+            return homes["bottom"]
+        elif current_region == "bottom":
+            return homes["top"]
+
+        return None
 
     def get_n_actions(self, agent_cls_name):
         if agent_cls_name == "BasicMobileAgent":
@@ -84,8 +116,6 @@ class CrossWaterTravel(BaseComponent):
 
             action = agent.get_component_action(self.name)
 
-            
-
             if action == 0:
                 continue
 
@@ -101,10 +131,20 @@ class CrossWaterTravel(BaseComponent):
 
             old_r, old_c = agent.loc
 
-            if old_r < waterline:
-                desired_r, desired_c = self.target_bottom
-            else:
-                desired_r, desired_c = self.target_top
+            target_pair = self._get_travel_target_for_agent(agent)
+            if self.debug:
+                print(
+                    f"[TARGET MAP] agent={int(agent.idx)} "
+                    f"cached_start={self.agent_start_locs.get(int(agent.idx), None)} "
+                    f"target_pair={target_pair}"
+                )
+
+            if target_pair is None:
+                if self.debug:
+                    print(f"[TRAVEL FAIL] Agent {agent.idx} | no mapped travel target")
+                continue
+
+            desired_r, desired_c = target_pair
 
             target = self._find_valid_target(agent, desired_r, desired_c, max_radius=6)
             if target is None:
@@ -131,6 +171,12 @@ class CrossWaterTravel(BaseComponent):
                 agent.state["endogenous"]["Labor"] += self.travel_cost_labor
                 agent.state["travel_cooldown"] = self.cooldown
                 agent.state["region"] = self._region_from_row(new_r)
+
+                # Remove any market listings/orders from old region when agent travels
+                if hasattr(self.world, "scenario") and hasattr(self.world.scenario, "get_component"):
+                    cda = self.world.scenario.get_component("ContinuousDoubleAuction")
+                    if cda is not None:
+                        cda.cancel_all_orders_for_agent(agent.idx)
 
                 # Send travel payment to scenario (regional pool)
                 if hasattr(self.world, "scenario"):
@@ -224,10 +270,19 @@ class CrossWaterTravel(BaseComponent):
     def additional_reset_steps(self):
         self.successful_travelers = set()
         self.travel_log = []
+        self.agent_start_locs = {}
+
         for agent in self.world.agents:
             row = int(agent.loc[0])
+            col = int(agent.loc[1])
+
             agent.state["region"] = self._region_from_row(row)
             agent.state["travel_cooldown"] = 0
+
+            self.agent_start_locs[int(agent.idx)] = (row, col)
+
+        if self.debug:
+            print("[RESET] agent_start_locs =", self.agent_start_locs)
 
     def get_dense_log(self):
         return self.travel_log
