@@ -1429,9 +1429,15 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
 
         self.travel_revenue = {"top": 0.0, "bottom": 0.0}
 
+        self.trade_revenue = {"top": 0.0, "bottom": 0.0}
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def add_trade_tariff_revenue(self, region, amount):
+        if region in self.trade_tariff_revenue:
+            self.trade_tariff_revenue[region] += float(amount)
+    
     def _split_row(self):
         return int(
             getattr(
