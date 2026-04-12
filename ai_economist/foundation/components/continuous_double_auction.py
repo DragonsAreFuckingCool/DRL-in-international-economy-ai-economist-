@@ -47,6 +47,10 @@ class ContinuousDoubleAuction(BaseComponent):
         order_duration=50,
         max_num_orders=None,
         restrict_trade_to_region=False,
+        cross_region_trade_tax_mode="none",   # "none", "flat", "percent"
+        cross_region_trade_tax_flat=0.0,
+        cross_region_trade_tax_rate=0.0,      # e.g. 0.10 for 10%
+        cross_region_trade_tax_sink=True,     # if False, can later redirect to scenario pool
         **kwargs
     ):
         super().__init__(*args, **kwargs)
@@ -71,6 +75,17 @@ class ContinuousDoubleAuction(BaseComponent):
 
         self.order_labor = float(order_labor)
         self.order_labor = max(self.order_labor, 0.0)
+
+        self.restrict_trade_to_region = bool(restrict_trade_to_region)
+
+        self.cross_region_trade_tax_mode = str(cross_region_trade_tax_mode)
+        self.cross_region_trade_tax_flat = float(cross_region_trade_tax_flat)
+        self.cross_region_trade_tax_rate = float(cross_region_trade_tax_rate)
+        self.cross_region_trade_tax_sink = bool(cross_region_trade_tax_sink)
+
+        assert self.cross_region_trade_tax_mode in ["none", "flat", "percent"]
+        assert self.cross_region_trade_tax_flat >= 0.0
+        assert self.cross_region_trade_tax_rate >= 0.0
 
         self.restrict_trade_to_region = bool(restrict_trade_to_region)
 
@@ -117,6 +132,64 @@ class ContinuousDoubleAuction(BaseComponent):
             print("ERROR!", self.price_ceiling, self.price_floor)
 
         return np.zeros(1 + self.price_ceiling - self.price_floor)
+    
+    def get_region(self, agent_or_idx):
+        """Return current region of agent as 'top' or 'bottom'."""
+        if hasattr(agent_or_idx, "idx"):
+            agent = agent_or_idx
+        else:
+            agent = self.world.agents[int(agent_or_idx)]
+
+        if "region" in agent.state:
+            return str(agent.state["region"])
+
+        split = self.world.world_size[0] // 2
+        return "top" if int(agent.loc[0]) < split else "bottom"
+
+
+    def _is_cross_region_trade(self, buyer_idx, seller_idx):
+        return self.get_region(buyer_idx) != self.get_region(seller_idx)
+
+
+    def _trade_tariff(self, price, buyer_idx, seller_idx):
+        """
+        Tariff charged only when:
+        - region restriction is OFF, and
+        - buyer/seller are in different regions.
+        """
+        if self.restrict_trade_to_region:
+            return 0.0
+
+        if not self._is_cross_region_trade(buyer_idx, seller_idx):
+            return 0.0
+
+        if self.cross_region_trade_tax_mode == "none":
+            return 0.0
+        elif self.cross_region_trade_tax_mode == "flat":
+            return float(self.cross_region_trade_tax_flat)
+        elif self.cross_region_trade_tax_mode == "percent":
+            return float(price) * self.cross_region_trade_tax_rate
+
+        return 0.0
+
+
+    def _max_possible_bid_escrow(self, bid_price):
+        """
+        Reserve enough coin at bid creation to cover worst-case tariff.
+        This keeps settlement safe even for cross-region matches.
+        """
+        bid_price = float(bid_price)
+
+        if self.restrict_trade_to_region or self.cross_region_trade_tax_mode == "none":
+            return bid_price
+
+        if self.cross_region_trade_tax_mode == "flat":
+            return bid_price + self.cross_region_trade_tax_flat
+
+        if self.cross_region_trade_tax_mode == "percent":
+            return bid_price * (1.0 + self.cross_region_trade_tax_rate)
+
+        return bid_price
 
     def available_asks(self, resource, agent):
         """
@@ -186,7 +259,7 @@ class ContinuousDoubleAuction(BaseComponent):
             self.n_orders[resource][agent.idx] < self.max_num_orders
             and agent.state["inventory"][resource] > 0
         )
-    
+
 
     # Region Spesific Asks and Bids
     def available_asks_for_region(self, resource, region, exclude_agent_idx=None):
@@ -202,7 +275,9 @@ class ContinuousDoubleAuction(BaseComponent):
     def available_bids_for_region(self, resource, region, exclude_agent_idx=None):
         bid_hist = self._price_zeros()
         for bid in self.bids[resource]:
-            if bid["region"] != region:
+            bid_region = bid.get("region", self.get_region(bid["buyer"]))
+            if bid_region != region:
+            #if bid["region"] != region:
                 continue
             if exclude_agent_idx is not None and bid["buyer"] == exclude_agent_idx:
                 continue
@@ -211,31 +286,24 @@ class ContinuousDoubleAuction(BaseComponent):
 
     # Core components for this market
     # -------------------------------
-
     def create_bid(self, resource, agent, max_payment):
-        """Create a new bid for resource, with agent offering max_payment.
+        """Create a new bid for resource, with agent offering max_payment."""
 
-        On a successful trade, payment will be at most max_payment, possibly less.
-
-        The agent places the bid coin into escrow so that it may not be spent on
-        something else while the order exists.
-        """
+        reserve_payment = int(np.ceil(self._max_possible_bid_escrow(max_payment)))
 
         # The agent is past the max number of orders
         # or doesn't have enough money, do nothing
-        if (not self.can_bid(resource, agent)) or agent.state["inventory"][
-            "Coin"
-        ] < max_payment:
+        if (not self.can_bid(resource, agent)) or agent.state["inventory"]["Coin"] < reserve_payment:
             return
 
         assert self.price_floor <= max_payment <= self.price_ceiling
 
-        #bid = {"buyer": agent.idx, "bid": int(max_payment), "bid_lifetime": 0}
         bid = {
             "buyer": agent.idx,
             "bid": int(max_payment),
             "bid_lifetime": 0,
-            "region": self.get_agent_region(agent),
+            "escrowed_coin": int(reserve_payment),
+            "region": self.get_region(agent),
         }
 
         # Add this to the bid book
@@ -243,9 +311,8 @@ class ContinuousDoubleAuction(BaseComponent):
         self.bid_hists[resource][bid["buyer"]][bid["bid"] - self.price_floor] += 1
         self.n_orders[resource][agent.idx] += 1
 
-        # Set aside whatever money the agent is willing to pay
-        # (will get excess back if price ends up being less)
-        _ = agent.inventory_to_escrow("Coin", int(max_payment))
+        # Reserve enough coin to cover worst-case tariff if needed
+        _ = agent.inventory_to_escrow("Coin", int(reserve_payment))
 
         # Incur the labor cost of creating an order
         agent.state["endogenous"]["Labor"] += self.order_labor
@@ -291,13 +358,6 @@ class ContinuousDoubleAuction(BaseComponent):
         """
         This implements the continuous double auction by identifying valid bid/ask
         pairs and executing trades accordingly.
-
-        Higher (lower) bids (asks) are given priority over lower (higher) bids (asks).
-        Trades are executed using the price of whichever bid/ask order was placed
-        first: bid price if bid was placed first, ask price otherwise.
-
-        Trading removes the payment and resource from bidder's and asker's escrow,
-        respectively, and puts them in the other's inventory.
         """
         self.executed_trades.append([])
 
@@ -311,7 +371,8 @@ class ContinuousDoubleAuction(BaseComponent):
                 reverse=True,
             )
             asks = sorted(
-                self.asks[resource], key=lambda a: (a["ask"], -a["ask_lifetime"])
+                self.asks[resource],
+                key=lambda a: (a["ask"], -a["ask_lifetime"])
             )
 
             while any(possible_match) and keep_checking:
@@ -323,33 +384,34 @@ class ContinuousDoubleAuction(BaseComponent):
                         break
 
                     # Already know this buyer is no good for this round.
-                    # Skip to next bid.
                     if not possible_match[bids[idx_bid]["buyer"]]:
                         idx_bid += 1
 
                     # Out of asks to check. This buyer won't find a match on this round.
-                    # (maybe) Restart inner loop.
                     elif idx_ask >= len(asks):
                         possible_match[bids[idx_bid]["buyer"]] = False
                         break
 
-                    # Skip to next ask if this ask comes from the buyer
-                    # of the current bid.
-                    # elif asks[idx_ask]["seller"] == bids[idx_bid]["buyer"]:
-                    #     idx_ask += 1
-                    elif self.restrict_trade_to_region and bids[idx_bid]["region"] != asks[idx_ask]["region"]:
+                    # Skip self-trade
+                    elif asks[idx_ask]["seller"] == bids[idx_bid]["buyer"]:
                         idx_ask += 1
 
-                    elif bids[idx_bid]["region"] != asks[idx_ask]["region"]:
-                        idx_ask += 1    
+                    # If regional restriction is on, skip cross-region matches
+                    elif (
+                        self.restrict_trade_to_region
+                        and self._is_cross_region_trade(
+                            bids[idx_bid]["buyer"],
+                            asks[idx_ask]["seller"]
+                        )
+                    ):
+                        idx_ask += 1
 
-                    # If this bid/ask pair can't be matched, this buyer
-                    # can't be matched. (maybe) Restart inner loop.
+                    # Price does not clear
                     elif bids[idx_bid]["bid"] < asks[idx_ask]["ask"]:
                         possible_match[bids[idx_bid]["buyer"]] = False
                         break
 
-                    # TRADE! (then restart inner loop)
+                    # TRADE
                     else:
                         bid = bids.pop(idx_bid)
                         ask = asks.pop(idx_ask)
@@ -358,18 +420,24 @@ class ContinuousDoubleAuction(BaseComponent):
                         trade.update(bid)
                         trade.update(ask)
 
-                        if (
-                            bid["bid_lifetime"] <= ask["ask_lifetime"]
-                        ):  # Ask came earlier. (in other words,
-                            # trade triggered by new bid)
+                        if bid["bid_lifetime"] <= ask["ask_lifetime"]:
                             trade["price"] = int(trade["ask"])
-                        else:  # Bid came earlier. (in other words,
-                            # trade triggered by new ask)
+                        else:
                             trade["price"] = int(trade["bid"])
-                        trade["cost"] = trade["price"]  # What the buyer pays in total
-                        trade["income"] = trade[
-                            "price"
-                        ]  # What the seller receives in total
+
+                        tariff = self._trade_tariff(
+                            trade["price"],
+                            trade["buyer"],
+                            trade["seller"],
+                        )
+
+                        trade["tariff"] = float(tariff)
+                        trade["cross_region"] = int(
+                            self._is_cross_region_trade(trade["buyer"], trade["seller"])
+                        )
+
+                        trade["cost"] = float(trade["price"] + tariff)
+                        trade["income"] = float(trade["price"])
 
                         buyer = self.world.agents[trade["buyer"]]
                         seller = self.world.agents[trade["seller"]]
@@ -384,34 +452,44 @@ class ContinuousDoubleAuction(BaseComponent):
                         self.n_orders[trade["commodity"]][seller.idx] -= 1
                         self.n_orders[trade["commodity"]][buyer.idx] -= 1
                         self.executed_trades[-1].append(trade)
-                        self.price_history[resource][trade["seller"]][
-                            trade["price"]
-                        ] += 1
+                        self.price_history[resource][trade["seller"]][trade["price"]] += 1
 
-                        # The resource goes from the seller's escrow
-                        # to the buyer's inventory
+                        # Resource transfer
                         seller.state["escrow"][resource] -= 1
                         buyer.state["inventory"][resource] += 1
 
-                        # Buyer's money (already set aside) leaves escrow
-                        pre_payment = int(trade["bid"])
+                        # Coin settlement
+                        pre_payment = int(bid.get("escrowed_coin", trade["bid"]))
                         buyer.state["escrow"]["Coin"] -= pre_payment
                         assert buyer.state["escrow"]["Coin"] >= 0
 
-                        # Payment is removed from the pre_payment
-                        # and given to the seller. Excess returned to buyer.
-                        payment_to_seller = int(trade["price"])
-                        excess_payment_from_buyer = pre_payment - payment_to_seller
-                        assert excess_payment_from_buyer >= 0
-                        seller.state["inventory"]["Coin"] += payment_to_seller
-                        buyer.state["inventory"]["Coin"] += excess_payment_from_buyer
+                        payment_to_seller = float(trade["price"])
+                        total_buyer_cost = float(trade["cost"])
+                        refund_to_buyer = float(pre_payment - total_buyer_cost)
 
-                        # Restart the inner loop
+                        assert refund_to_buyer >= -1e-6, (
+                            f"Negative refund: reserve={pre_payment}, total_cost={total_buyer_cost}"
+                        )
+
+                        seller.state["inventory"]["Coin"] += payment_to_seller
+                        buyer.state["inventory"]["Coin"] += max(0.0, refund_to_buyer)
+
+                        # Optional: redirect tariff to scenario instead of sinking it
+                        if trade["tariff"] > 0.0 and not self.cross_region_trade_tax_sink:
+                            if (
+                                hasattr(self.world, "scenario")
+                                and hasattr(self.world.scenario, "add_trade_tariff_revenue")
+                            ):
+                                buyer_region = self.get_region(buyer)
+                                self.world.scenario.add_trade_tariff_revenue(
+                                    buyer_region, trade["tariff"]
+                                )
+
                         break
 
-            # Keep the unfilled bids/asks
             self.bids[resource] = bids
             self.asks[resource] = asks
+        
 
     def remove_expired_orders(self):
         """
@@ -436,9 +514,9 @@ class ContinuousDoubleAuction(BaseComponent):
                 else:
                     # Return the set aside money to the buyer
                     amount = world.agents[bid["buyer"]].escrow_to_inventory(
-                        "Coin", bid["bid"]
+                        "Coin", bid.get("escrowed_coin", bid["bid"])
                     )
-                    assert amount == bid["bid"]
+                    assert amount == bid.get("escrowed_coin", bid["bid"])
                     # Adjust the bid histogram to reflect the removal of the bid
                     self.bid_hists[resource][bid["buyer"]][
                         bid["bid"] - self.price_floor
@@ -660,7 +738,10 @@ class ContinuousDoubleAuction(BaseComponent):
         for agent in world.agents:
             masks[agent.idx] = {}
 
-            can_pay = np.arange(self.max_bid_ask + 1) <= agent.inventory["Coin"]
+            required_coin = np.array(
+                [self._max_possible_bid_escrow(p) for p in range(self.max_bid_ask + 1)]
+            )
+            can_pay = required_coin <= agent.inventory["Coin"]
 
             for resource in self.commodities:
                 if not self.can_ask(resource, agent):  # asks_maxed:
@@ -682,6 +763,42 @@ class ContinuousDoubleAuction(BaseComponent):
                     )
 
         return masks
+    
+    def cancel_all_orders_for_agent(self, agent_idx):
+        """
+        Remove all open bids/asks for agent_idx and return escrowed assets.
+        Useful when an agent changes region due to travel.
+        """
+        world = self.world
+        agent_idx = int(agent_idx)
+
+        for resource in self.commodities:
+            # --- cancel bids ---
+            kept_bids = []
+            for bid in self.bids[resource]:
+                if int(bid["buyer"]) == agent_idx:
+                    reserved = int(bid.get("escrowed_coin", bid["bid"]))
+                    amount = world.agents[agent_idx].escrow_to_inventory("Coin", reserved)
+                    assert amount == reserved
+
+                    self.bid_hists[resource][agent_idx][bid["bid"] - self.price_floor] -= 1
+                    self.n_orders[resource][agent_idx] -= 1
+                else:
+                    kept_bids.append(bid)
+            self.bids[resource] = kept_bids
+
+            # --- cancel asks ---
+            kept_asks = []
+            for ask in self.asks[resource]:
+                if int(ask["seller"]) == agent_idx:
+                    amount = world.agents[agent_idx].escrow_to_inventory(resource, 1)
+                    assert amount == 1
+
+                    self.ask_hists[resource][agent_idx][ask["ask"] - self.price_floor] -= 1
+                    self.n_orders[resource][agent_idx] -= 1
+                else:
+                    kept_asks.append(ask)
+            self.asks[resource] = kept_asks
 
     # For non-required customization
     # ------------------------------
