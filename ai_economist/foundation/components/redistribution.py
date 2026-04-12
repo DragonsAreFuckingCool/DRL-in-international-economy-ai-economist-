@@ -1235,7 +1235,7 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
     # ---------------------------------------------------------------------
     # Tax brackets
     # ---------------------------------------------------------------------
-        usd_scaling = 1000
+        usd_scaling = 1000 #1000
         self.regional_brackets = np.array([
             0,
             9700,
@@ -1395,13 +1395,19 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
             self._occupancy["{:03d}".format(int(self.income_bin(income)))] += 1
 
         # ----- Redistribute lump sum to agents IN THIS REGION only -----
-        # (Option C typically redistributes within region)
+
         # Add travel revenue from scenario
         travel_rev = 0.0
         if hasattr(self.world, "scenario"):
             travel_rev = self.world.scenario.travel_revenue.get(self._region, 0.0)
 
-        total_revenue = net_tax_revenue + travel_rev
+        tariff_rev = 0.0
+        if hasattr(self.world.scenario, "trade_tariff_revenue"):
+            tariff_rev = self.world.scenario.trade_tariff_revenue.get(self._region, 0.0)
+
+        total_revenue = net_tax_revenue + travel_rev + tariff_rev
+
+        
 
         region_agents = [
             agent for agent in self.world.agents
@@ -1424,7 +1430,10 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
         self.taxes.append(tax_dict)
 
         if hasattr(self.world, "scenario"):
-            self.world.scenario.travel_revenue[self._region] = 0.0
+            if hasattr(self.world.scenario, "travel_revenue"):
+                self.world.scenario.travel_revenue[self._region] = 0.0
+            if hasattr(self.world.scenario, "trade_tariff_revenue"):
+                self.world.scenario.trade_tariff_revenue[self._region] = 0.0
 
         # Update period logs
         self._last_income_obs = np.array(self.last_income) / self.period
