@@ -18,12 +18,11 @@ from ray.rllib.agents.ppo import PPOTrainer
 # -----------------------------------------------------------------------------
 # Local project imports
 # -----------------------------------------------------------------------------
-# Adjust this path for your machine if the repository is not installed as a package.
 PROJECT_ROOT = Path(r"C:\Users\adria\coding\katja\DRL-in-international-economy-ai-economist-")
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from ai_economist import foundation  # noqa: F401  # imported for scenario/component registration side effects
+from ai_economist import foundation 
 from ai_economist.foundation.scenarios.utils.rewards import coin_eq_times_productivity
 from rllib.env_wrapper import RLlibEnvWrapper
 
@@ -48,8 +47,9 @@ class ExperimentSettings:
     world_size: Tuple[int, int] = (51, 25)
     layout_file: str = "stacked_51x25_symetric_original.txt"
 
-    save_results: bool = False
+    save_results: bool = True
     results_dir: str = "results"
+    #scp -r user@server:\Users\adria\coding\katja\DRL-in-international-economy-ai-economist-\tutorials\results ./results_copy
 
     restrict_trade_to_region: bool = False
 
@@ -976,7 +976,7 @@ def run_experiment(settings: ExperimentSettings) -> Dict[str, Any]:
     dense_logs_final = generate_rollout_with_planner_actions(
         trainer_phase3b,
         env_phase3b,
-        num_dense_logs=3,
+        num_dense_logs=20, #3
         explore=True,
         log_only_tax_days=True,
     )
@@ -1069,12 +1069,12 @@ def main() -> None:
         results = run_experiment(SETTINGS)
     finally:
         # Uncomment this block if you want automatic cleanup every run.
-        # if results is not None:
-        #     for trainer in results["trainers"].values():
-        #         trainer.stop()
-        #     del results
-        # gc.collect()
-        # ray.shutdown()
+        if results is not None:
+            for trainer in results["trainers"].values():
+                trainer.stop()
+            del results
+        gc.collect()
+        ray.shutdown()
         pass
 
 
