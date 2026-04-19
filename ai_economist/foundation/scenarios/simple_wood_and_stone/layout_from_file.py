@@ -1206,6 +1206,7 @@ class CustomSplitOverlayFromFile(LayoutFromFile):
         vertical_gap_rows=None,
         vertical_gap_height=3,
         agent_start_locs=None,
+
         **kwargs,
     ):
         super().__init__(*args, agent_start_locs=agent_start_locs, **kwargs)
@@ -1308,6 +1309,37 @@ class CustomSplitOverlayFromFile(LayoutFromFile):
         self._overlay_water_row = water_row
         self._overlay_vertical = add_vertical_line
         self._overlay_vertical_col = int(vertical_col) if add_vertical_line else None
+
+    COMMON_AGENT_START_LOCS = [
+    (0, 0), (24, 0), (0, 24), (24, 24),
+    (26, 0), (50, 0), (26, 24), (50, 24),
+]
+
+    def _apply_custom_start_locs(self):
+        if not hasattr(self, "custom_start_locs") or self.custom_start_locs is None:
+            return False
+
+        assert len(self.custom_start_locs) == len(self.world.agents), (
+            f"Expected {len(self.world.agents)} start locations, got {len(self.custom_start_locs)}"
+        )
+
+        self.world.clear_agent_locs()
+
+        # important: use a fixed agent order, not random order
+        for i, agent in enumerate(self.world.agents):
+            r, c = self.custom_start_locs[i]
+
+            if not self.world.can_agent_occupy(r, c, agent):
+                raise ValueError(f"Agent {i} cannot be placed at {(r, c)}")
+
+            self.world.set_agent_loc(agent, r, c)
+
+        curr = self.get_current_optimization_metrics()
+        self.curr_optimization_metric = deepcopy(curr)
+        self.init_optimization_metric = deepcopy(curr)
+        self.prev_optimization_metric = deepcopy(curr)
+
+        return True
 
     def _apply_custom_start_locs(self):
         if self.agent_start_locs is None:
@@ -1417,6 +1449,11 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
 
     name = "custom/splitworld_overlay_regional"
 
+    COMMON_AGENT_START_LOCS = [
+        (0, 0), (24, 0), (0, 24), (24, 24),
+        (26, 0), (50, 0), (26, 24), (50, 24),
+    ]
+
     def __init__(self, *args, **kwargs):
         planner_subclasses = kwargs.pop("planner_subclasses", None)
 
@@ -1426,17 +1463,17 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
         super().__init__(*args, **kwargs)
 
         self.world.scenario = self
-
         self.travel_revenue = {"top": 0.0, "bottom": 0.0}
-
         self.trade_revenue = {"top": 0.0, "bottom": 0.0}
 
+        #self.custom_start_locs = None
+        self.custom_start_locs = list(self.COMMON_AGENT_START_LOCS)
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     def add_trade_tariff_revenue(self, region, amount):
-        if region in self.trade_tariff_revenue:
-            self.trade_tariff_revenue[region] += float(amount)
+        if region in self.trade_revenue:
+            self.trade_revenue[region] += float(amount)
     
     def _split_row(self):
         return int(
@@ -1614,6 +1651,34 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
         self.prev_optimization_metric = deepcopy(curr)
 
     # ------------------------------------------------------------------
+    # Starting location 
+    # ------------------------------------------------------------------
+    def _apply_custom_start_locs(self):
+        if not hasattr(self, "custom_start_locs") or self.custom_start_locs is None:
+            return False
+
+        assert len(self.custom_start_locs) == len(self.world.agents), (
+            f"Expected {len(self.world.agents)} start locations, got {len(self.custom_start_locs)}"
+        )
+
+        self.world.clear_agent_locs()
+
+        # important: use a fixed agent order, not random order
+        for i, agent in enumerate(self.world.agents):
+            r, c = self.custom_start_locs[i]
+
+            if not self.world.can_agent_occupy(r, c, agent):
+                raise ValueError(f"Agent {i} cannot be placed at {(r, c)}")
+
+            self.world.set_agent_loc(agent, r, c)
+
+        curr = self.get_current_optimization_metrics()
+        self.curr_optimization_metric = deepcopy(curr)
+        self.init_optimization_metric = deepcopy(curr)
+        self.prev_optimization_metric = deepcopy(curr)
+
+        return True
+    # ------------------------------------------------------------------
     # Reset hook
     # ------------------------------------------------------------------
     def additional_reset_steps(self):
@@ -1626,6 +1691,9 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
 
         # regional money from travel
         self.travel_revenue = {"top": 0.0, "bottom": 0.0}
+        
+        if self._apply_custom_start_locs():
+            return
 
         # --- CUSTOM STARTING LOCATIONS / SKILL MULTIPLIERS ---
         if hasattr(self, "agent_start_locs") and self.agent_start_locs is not None:

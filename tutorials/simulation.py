@@ -577,17 +577,19 @@ def summarize_dense_log(log: Dict[str, Any]) -> Dict[str, Any]:
     final_labor: List[float] = []
     final_region = {"top": 0, "bottom": 0}
 
+    split = SETTINGS.world_size[0] // 2   # for 51 rows this is 25
+
     for aid in agent_ids:
         state = last_state[str(aid)]
         coin = state["inventory"]["Coin"] + state["escrow"]["Coin"]
         labor = state["endogenous"]["Labor"]
+        r, c = state["loc"]
 
         final_coin.append(float(coin))
         final_labor.append(float(labor))
 
-        region = state.get("region")
-        if region in final_region:
-            final_region[region] += 1
+        region = "top" if r < split else "bottom"
+        final_region[region] += 1
 
     n_trades = 0
     if "Trade" in log:
