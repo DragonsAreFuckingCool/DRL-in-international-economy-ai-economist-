@@ -18,9 +18,19 @@ from ray.rllib.agents.ppo import PPOTrainer
 # -----------------------------------------------------------------------------
 # Local project imports
 # -----------------------------------------------------------------------------
-PROJECT_ROOT = Path(r"C:\Users\adria\coding\katja\DRL-in-international-economy-ai-economist-")
+# PROJECT_ROOT = Path(r"C:\Users\adria\coding\katja\DRL-in-international-economy-ai-economist-")
+
+
+# -----------------------------------------------------------------------------
+# Project imports for HPC
+# -----------------------------------------------------------------------------
+CURRENT_FILE = Path(__file__).resolve()
+PROJECT_ROOT = CURRENT_FILE.parents[1] # Go up to project root (simulation.py → tutorials → project root)
+print(PROJECT_ROOT)
+
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
+
 
 from ai_economist import foundation 
 from ai_economist.foundation.scenarios.utils.rewards import coin_eq_times_productivity
@@ -49,7 +59,7 @@ class ExperimentSettings:
 
     save_results: bool = True
     results_dir: str = "results"
-    #scp -r user@server:\Users\adria\coding\katja\DRL-in-international-economy-ai-economist-\tutorials\results ./results_copy
+    #scp -r user@server:~/DRL-in-international-economy-ai-economist-/tutorials/results ./results_copy
 
     restrict_trade_to_region: bool = False
 
