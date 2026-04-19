@@ -5,11 +5,11 @@ ray.shutdown()
 ray.init(ignore_reinit_error=True, log_to_driver=False)
 
 settings = exp.ExperimentSettings(
-    phase1_iters = 50,
-    phase2_iters = 125,
-    phase3a_iters = 50,
-    phase3b_iters = 125,
-    save_results=False,
+    phase1_iters = 5,
+    phase2_iters = 12,
+    phase3a_iters = 5,
+    phase3b_iters = 12,
+    save_results=True,
     travel_enabled_phase3a=False,
     travel_enabled_phase3b=False,
     restrict_trade_to_region = True,
