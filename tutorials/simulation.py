@@ -1079,12 +1079,12 @@ def main() -> None:
         results = run_experiment(SETTINGS)
     finally:
         # Uncomment this block if you want automatic cleanup every run.
-        if results is not None:
-            for trainer in results["trainers"].values():
-                trainer.stop()
-            del results
-        gc.collect()
-        ray.shutdown()
+        # if results is not None:
+        #     for trainer in results["trainers"].values():
+        #         trainer.stop()
+        #     del results
+        # gc.collect()
+        # ray.shutdown()
         pass
 
 
