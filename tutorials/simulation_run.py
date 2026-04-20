@@ -11,10 +11,10 @@ ray.init(
     num_gpus=1,
 )
 settings = exp.ExperimentSettings(
-    phase1_iters = 500,
-    phase2_iters = 1500,
-    phase3a_iters = 500,
-    phase3b_iters = 1500,
+    phase1_iters = 5,
+    phase2_iters = 15,
+    phase3a_iters = 5,
+    phase3b_iters = 15,
     save_results=True,
     travel_enabled_phase3a=False,
     travel_enabled_phase3b=False,
