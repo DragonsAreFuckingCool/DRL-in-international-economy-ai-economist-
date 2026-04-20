@@ -441,7 +441,7 @@ def build_trainer_config(
         "sgd_minibatch_size": settings.sgd_minibatch_size,
         "num_sgd_iter": settings.num_sgd_iter,
         "log_level": "WARN",
-        "reuse_actors": True, # Could be false, but i think its good for runtime 
+        #"reuse_actors": True, # Could be false, but i think its good for runtime 
     }
 
 # def build_trainer_config(
