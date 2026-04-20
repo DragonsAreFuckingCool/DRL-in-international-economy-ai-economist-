@@ -51,6 +51,15 @@ class ExperimentSettings:
     phase3a_iters: int = 50
     phase3b_iters: int = 125
 
+    num_workers: int = 0
+    num_envs_per_worker: int = 1
+    num_gpus: int = 1
+    num_cpus_per_worker: int = 1
+    rollout_fragment_length: int = 100
+    train_batch_size: int = 800
+    sgd_minibatch_size: int = 128
+    num_sgd_iter: int = 2
+
     min_band: int = 4
     period: int = 100
     episode_length: int = 1000
@@ -59,7 +68,6 @@ class ExperimentSettings:
 
     save_results: bool = True
     results_dir: str = "results"
-    #scp -r user@server:~/DRL-in-international-economy-ai-economist-/tutorials/results ./results_copy
 
     restrict_trade_to_region: bool = False
 
@@ -374,6 +382,36 @@ def build_policies(
     }
 
 
+# def build_trainer_config(
+#     *,
+#     settings: ExperimentSettings,
+#     env_config_dict: Dict[str, Any],
+#     policies: Dict[str, Any],
+#     policies_to_train: Sequence[str],
+# ) -> Dict[str, Any]:
+#     return {
+#         "env": RLlibEnvWrapper,
+#         "env_config": {
+#             "env_config_dict": env_config_dict,
+#             "num_envs_per_worker": 1,
+#         },
+#         "multiagent": {
+#             "policies": policies,
+#             "policies_to_train": list(policies_to_train),
+#             "policy_mapping_fn": policy_mapping_fn,
+#         },
+#         "num_workers": 0,
+#         "num_envs_per_worker": 1,
+#         "framework": settings.framework,
+#         "num_gpus": 1,
+#         "rollout_fragment_length": 50,
+#         "batch_mode": "truncate_episodes",
+#         "train_batch_size": 800,
+#         "sgd_minibatch_size": 128,
+#         "num_sgd_iter": 2,
+#         "log_level": "WARN",
+#     }
+
 def build_trainer_config(
     *,
     settings: ExperimentSettings,
@@ -385,24 +423,66 @@ def build_trainer_config(
         "env": RLlibEnvWrapper,
         "env_config": {
             "env_config_dict": env_config_dict,
-            "num_envs_per_worker": 1,
+            "num_envs_per_worker": settings.num_envs_per_worker,
         },
         "multiagent": {
             "policies": policies,
             "policies_to_train": list(policies_to_train),
             "policy_mapping_fn": policy_mapping_fn,
         },
-        "num_workers": 0,
-        "num_envs_per_worker": 1,
+        "num_workers": settings.num_workers,
+        "num_envs_per_worker": settings.num_envs_per_worker,
+        "num_cpus_per_worker": settings.num_cpus_per_worker,
         "framework": settings.framework,
-        "num_gpus": 1,
-        "rollout_fragment_length": 50,
+        "num_gpus": settings.num_gpus,
+        "rollout_fragment_length": settings.rollout_fragment_length,
         "batch_mode": "truncate_episodes",
-        "train_batch_size": 800,
-        "sgd_minibatch_size": 128,
-        "num_sgd_iter": 2,
+        "train_batch_size": settings.train_batch_size,
+        "sgd_minibatch_size": settings.sgd_minibatch_size,
+        "num_sgd_iter": settings.num_sgd_iter,
         "log_level": "WARN",
+        "reuse_actors": True, # Could be false, but i think its good for runtime 
     }
+
+# def build_trainer_config(
+#     *,
+#     settings: ExperimentSettings,
+#     env_config_dict: Dict[str, Any],
+#     policies: Dict[str, Any],
+#     policies_to_train: Sequence[str],
+# ) -> Dict[str, Any]:
+#     return {
+#         "env": RLlibEnvWrapper,
+#         "env_config": {
+#             "env_config_dict": env_config_dict,
+#             "num_envs_per_worker": 2,
+#         },
+#         "multiagent": {
+#             "policies": policies,
+#             "policies_to_train": list(policies_to_train),
+#             "policy_mapping_fn": policy_mapping_fn,
+#         },
+
+#         # parallel rollout
+#         "num_workers": 12,
+#         "num_envs_per_worker": 2,
+
+#         # hardware
+#         "framework": settings.framework,
+#         "num_gpus": 1,
+#         "num_cpus_per_worker": 1,
+#         "num_gpus_per_worker": 0,
+
+#         # PPO sampling/training
+#         "rollout_fragment_length": 200,
+#         "batch_mode": "truncate_episodes",
+#         "train_batch_size": 4800,      # 12 workers * 2 envs * 200 steps
+#         "sgd_minibatch_size": 512,
+#         "num_sgd_iter": 8,
+
+#         # stability / practical
+#         "log_level": "WARN",
+#     }
 
 
 # -----------------------------------------------------------------------------
