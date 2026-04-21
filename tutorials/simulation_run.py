@@ -7,8 +7,8 @@ ray.shutdown()
 ray.init(
     ignore_reinit_error=True,
     log_to_driver=False,
-    num_cpus=18, 
-    num_gpus=1,
+    #num_cpus=18, 
+    #num_gpus=1,
 )
 settings = exp.ExperimentSettings(
     phase1_iters = 5,
