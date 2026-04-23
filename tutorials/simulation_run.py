@@ -50,4 +50,6 @@ settings = exp.ExperimentSettings(
     # num_sgd_iter=4, #How many times PPO reuses the same batch.
 )
 
+print(ray.available_resources())
+
 results = exp.run_experiment(settings)
