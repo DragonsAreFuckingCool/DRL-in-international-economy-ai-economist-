@@ -837,6 +837,7 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
 #----------------------------------------
 import numpy as np
 import matplotlib.pyplot as plt
+from simulation import get_disc_rates
 
 def plot_avg_final_tax_schedules_two_planners_from_dense_logs(
     dense_logs,
@@ -889,7 +890,7 @@ def plot_avg_final_tax_schedules_two_planners_from_dense_logs(
     idx_top_arr = np.stack(idx_top_list, axis=0)
     idx_bottom_arr = np.stack(idx_bottom_list, axis=0)
 
-    disc_rates = _get_disc_rates(env_obj)
+    disc_rates = get_disc_rates(env_obj)
 
     top_rates_all = disc_rates[np.clip(idx_top_arr, 0, len(disc_rates) - 1)]
     bottom_rates_all = disc_rates[np.clip(idx_bottom_arr, 0, len(disc_rates) - 1)]
@@ -1027,11 +1028,11 @@ def plot_planner_tax_lines(
 
         return []
 
-    def _get_disc_rates(env_obj):
-        for comp in env_obj.env.components:
-            if "BracketTax" in comp.name and hasattr(comp, "disc_rates"):
-                return np.array(comp.disc_rates, dtype=float)
-        return np.arange(0.0, 1.0 + 1e-9, 0.05)
+    # def _get_disc_rates(env_obj):
+    #     for comp in env_obj.env.components:
+    #         if "BracketTax" in comp.name and hasattr(comp, "disc_rates"):
+    #             return np.array(comp.disc_rates, dtype=float)
+    #     return np.arange(0.0, 1.0 + 1e-9, 0.05)
 
     eps = _extract_episode_logs(dense_logs)
     if len(eps) == 0:
@@ -1062,7 +1063,7 @@ def plot_planner_tax_lines(
     top_stack = np.stack([a[:min_T] for a in top_list], axis=0)   # (E, T, 7)
     bot_stack = np.stack([a[:min_T] for a in bot_list], axis=0)
 
-    disc_rates = _get_disc_rates(env_obj)
+    disc_rates = get_disc_rates(env_obj)
 
     top_rates = disc_rates[np.clip(top_stack.astype(int), 0, len(disc_rates) - 1)]
     bot_rates = disc_rates[np.clip(bot_stack.astype(int), 0, len(disc_rates) - 1)]
