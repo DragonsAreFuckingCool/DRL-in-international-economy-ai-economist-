@@ -7,7 +7,6 @@ ray.shutdown()
 ray.init(
     ignore_reinit_error=True,
     log_to_driver=False,
-    num_cpus=26, 
     #num_gpus=1,
     memory=63 * 1024**3,          # 63 GB for workers
     object_store_memory=27 * 1024**3  # 27 GB for object store
