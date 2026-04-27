@@ -1031,3 +1031,329 @@ def forced_move_delta_table(log, window_before=100, window_after=100):
     delta = after[numeric_cols] - before[numeric_cols]
     delta = delta.reset_index()
     return delta
+
+
+def generate_paired_baseline_forced_rollout_batch(
+    trainer,
+    env_obj,
+    n_rollouts=20,
+    forced_agent_id=0,
+    forced_timestep=200,
+    forced_target_region="bottom",
+    explore=False,
+    progress=True,
+):
+    """
+    Generate many paired baseline/forced rollouts.
+
+    Each pair shares the same pre-forced-move trajectory, then branches into:
+    - a baseline continuation
+    - a continuation where forced_agent_id is moved at forced_timestep
+    """
+    baseline_logs = []
+    forced_logs = []
+
+    for rollout_id in range(n_rollouts):
+        if progress:
+            print(f"Generating paired rollout {rollout_id + 1}/{n_rollouts}")
+
+        baseline_log, forced_log = generate_paired_baseline_forced_rollouts(
+            trainer=trainer,
+            env_obj=env_obj,
+            forced_agent_id=forced_agent_id,
+            forced_timestep=forced_timestep,
+            forced_target_region=forced_target_region,
+            explore=explore,
+        )
+
+        baseline_log["rollout_id"] = rollout_id
+        forced_log["rollout_id"] = rollout_id
+        baseline_logs.append(baseline_log)
+        forced_logs.append(forced_log)
+
+    return baseline_logs, forced_logs
+
+
+def paired_forced_move_summary_tables(
+    baseline_logs,
+    forced_logs,
+    window_before=100,
+    window_after=100,
+):
+    """
+    Build raw and averaged before/after summary tables across paired rollouts.
+    """
+    rows = []
+
+    for rollout_id, (baseline_log, forced_log) in enumerate(zip(baseline_logs, forced_logs)):
+        moved_agent = int(forced_log["forced_move"]["agent"])
+        reference_timestep = int(forced_log["forced_move"]["timestep"])
+
+        df_baseline = baseline_system_summary_table(
+            baseline_log,
+            moved_agent=moved_agent,
+            reference_timestep=reference_timestep,
+            window_before=window_before,
+            window_after=window_after,
+        )
+        df_baseline["run_type"] = "baseline"
+        df_baseline["rollout_id"] = rollout_id
+
+        df_forced = forced_move_system_summary_table(
+            forced_log,
+            window_before=window_before,
+            window_after=window_after,
+        )
+        df_forced["run_type"] = "forced_move"
+        df_forced["rollout_id"] = rollout_id
+
+        rows.append(df_baseline)
+        rows.append(df_forced)
+
+    raw_df = pd.concat(rows, ignore_index=True)
+
+    id_cols = ["run_type", "group", "period"]
+    skip_cols = set(id_cols + ["rollout_id"])
+    numeric_cols = [
+        c for c in raw_df.columns
+        if c not in skip_cols and pd.api.types.is_numeric_dtype(raw_df[c])
+    ]
+
+    summary_df = (
+        raw_df
+        .groupby(id_cols, sort=False)[numeric_cols]
+        .agg(["mean", "std", "count"])
+    )
+
+    summary_df.columns = [
+        f"{metric}_{stat}"
+        for metric, stat in summary_df.columns
+    ]
+    summary_df = summary_df.reset_index()
+
+    for metric in numeric_cols:
+        count_col = f"{metric}_count"
+        std_col = f"{metric}_std"
+        sem_col = f"{metric}_sem"
+        if count_col in summary_df and std_col in summary_df:
+            summary_df[std_col] = summary_df[std_col].fillna(0.0)
+            summary_df[sem_col] = summary_df[std_col] / np.sqrt(summary_df[count_col])
+
+    return raw_df, summary_df
+
+
+def plot_paired_forced_move_summary_average(
+    summary_df,
+    metric="coin_change",
+    groups=("moved_agent", "other_agents"),
+    errorbar="std",
+    figsize=(10, 4.5),
+):
+    """
+    Plot averaged baseline vs forced before/after summary metrics.
+    """
+    fig, axes = plt.subplots(1, len(groups), figsize=figsize, sharey=True)
+    if len(groups) == 1:
+        axes = [axes]
+
+    periods = ["before_move", "after_move"]
+    run_types = ["baseline", "forced_move"]
+    colors = {"baseline": "#1f77b4", "forced_move": "#d62728"}
+
+    for ax, group in zip(axes, groups):
+        plot_df = summary_df[summary_df["group"] == group]
+        x = np.arange(len(periods))
+        width = 0.36
+
+        for j, run_type in enumerate(run_types):
+            values = []
+            errors = []
+
+            for period in periods:
+                row = plot_df[
+                    (plot_df["run_type"] == run_type)
+                    & (plot_df["period"] == period)
+                ]
+
+                if row.empty:
+                    values.append(np.nan)
+                    errors.append(np.nan)
+                    continue
+
+                values.append(float(row[f"{metric}_mean"].iloc[0]))
+                if errorbar == "std":
+                    errors.append(float(row[f"{metric}_std"].iloc[0]))
+                elif errorbar == "sem":
+                    errors.append(float(row[f"{metric}_sem"].iloc[0]))
+                elif errorbar is None:
+                    errors.append(np.nan)
+                else:
+                    raise ValueError("errorbar must be None, 'std', or 'sem'")
+
+            offset = (j - 0.5) * width
+            ax.bar(
+                x + offset,
+                values,
+                width=width,
+                yerr=None if errorbar is None else errors,
+                capsize=5 if errorbar is not None else 0,
+                color=colors[run_type],
+                alpha=0.9,
+                label=run_type,
+            )
+
+        ax.set_title(group.replace("_", " ").title())
+        ax.set_xticks(x)
+        ax.set_xticklabels(["Before", "After"])
+        ax.grid(True, axis="y", alpha=0.3)
+
+    axes[0].set_ylabel(metric.replace("_", " ").title())
+    axes[-1].legend(loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=2)
+
+    title = f"Average {metric.replace('_', ' ').title()} Across Paired Forced-Move Rollouts"
+    if errorbar == "std":
+        title += " ± SD"
+    elif errorbar == "sem":
+        title += " ± SEM"
+    fig.suptitle(title, y=1.03)
+    fig.tight_layout()
+
+    return fig
+
+
+def _paired_forced_move_utility_table(log, run_type, rollout_id, moved_agent, reference_timestep, window=100):
+    states = log["states"]
+    first_state = states[0]
+    agent_ids = sorted(int(k) for k in first_state.keys() if str(k).isdigit())
+    other_agents = [aid for aid in agent_ids if aid != moved_agent]
+
+    t0 = int(reference_timestep)
+    t_start = max(0, t0 - window)
+    t_end = min(len(states), t0 + window + 1)
+
+    p_top_arr = np.array(log.get("planner_rewards", {}).get("p_top", []), dtype=float)
+    p_bottom_arr = np.array(log.get("planner_rewards", {}).get("p_bottom", []), dtype=float)
+
+    rows = []
+    for t in range(t_start, t_end):
+        others_u = [
+            states[t][str(aid)].get("utility", np.nan)
+            for aid in other_agents
+        ]
+
+        rows.append({
+            "run_type": run_type,
+            "rollout_id": rollout_id,
+            "t": t,
+            "relative_t": t - t0,
+            "moved_agent_utility": states[t][str(moved_agent)].get("utility", np.nan),
+            "other_agents_avg_utility": float(np.nanmean(np.array(others_u, dtype=float))),
+            "p_top_reward": p_top_arr[t] if t < len(p_top_arr) else np.nan,
+            "p_bottom_reward": p_bottom_arr[t] if t < len(p_bottom_arr) else np.nan,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def plot_paired_forced_move_utilities_average(
+    baseline_logs,
+    forced_logs,
+    window=100,
+    errorbar="std",
+    figsize=(10, 8),
+):
+    """
+    Plot averaged baseline vs forced utility/reward trajectories around the forced timestep.
+    """
+    rows = []
+
+    for rollout_id, (baseline_log, forced_log) in enumerate(zip(baseline_logs, forced_logs)):
+        moved_agent = int(forced_log["forced_move"]["agent"])
+        reference_timestep = int(forced_log["forced_move"]["timestep"])
+
+        rows.append(_paired_forced_move_utility_table(
+            baseline_log,
+            run_type="baseline",
+            rollout_id=rollout_id,
+            moved_agent=moved_agent,
+            reference_timestep=reference_timestep,
+            window=window,
+        ))
+        rows.append(_paired_forced_move_utility_table(
+            forced_log,
+            run_type="forced_move",
+            rollout_id=rollout_id,
+            moved_agent=moved_agent,
+            reference_timestep=reference_timestep,
+            window=window,
+        ))
+
+    raw_df = pd.concat(rows, ignore_index=True)
+
+    metrics = [
+        "moved_agent_utility",
+        "other_agents_avg_utility",
+        "p_top_reward",
+        "p_bottom_reward",
+    ]
+
+    summary_df = (
+        raw_df
+        .groupby(["run_type", "relative_t"], sort=False)[metrics]
+        .agg(["mean", "std", "count"])
+    )
+    summary_df.columns = [
+        f"{metric}_{stat}"
+        for metric, stat in summary_df.columns
+    ]
+    summary_df = summary_df.reset_index()
+
+    for metric in metrics:
+        summary_df[f"{metric}_std"] = summary_df[f"{metric}_std"].fillna(0.0)
+        summary_df[f"{metric}_sem"] = (
+            summary_df[f"{metric}_std"] / np.sqrt(summary_df[f"{metric}_count"])
+        )
+
+    fig, axes = plt.subplots(2, 1, figsize=figsize, sharex=True)
+    colors = {"baseline": "#1f77b4", "forced_move": "#d62728"}
+
+    panels = [
+        (axes[0], ["moved_agent_utility", "other_agents_avg_utility"], "Agent utility"),
+        (axes[1], ["p_top_reward", "p_bottom_reward"], "Planner rewards"),
+    ]
+
+    for ax, panel_metrics, title in panels:
+        for run_type in ["baseline", "forced_move"]:
+            run_df = summary_df[summary_df["run_type"] == run_type].sort_values("relative_t")
+            color = colors[run_type]
+
+            for metric in panel_metrics:
+                x = run_df["relative_t"].to_numpy()
+                mean = run_df[f"{metric}_mean"].to_numpy()
+                err = run_df[f"{metric}_{errorbar}"].to_numpy() if errorbar is not None else None
+
+                label = f"{run_type}: {metric.replace('_', ' ')}"
+                linestyle = "-" if metric in ["moved_agent_utility", "p_top_reward"] else "--"
+
+                ax.plot(x, mean, color=color, linestyle=linestyle, linewidth=2.0, label=label)
+
+                if errorbar is not None:
+                    ax.fill_between(
+                        x,
+                        mean - err,
+                        mean + err,
+                        color=color,
+                        alpha=0.10,
+                        linewidth=0,
+                    )
+
+        ax.axvline(0, linestyle=":", color="black", linewidth=1.5)
+        ax.set_title(title)
+        ax.set_ylabel("Reward / utility")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=9)
+
+    axes[1].set_xlabel("Timesteps relative to forced move")
+    fig.tight_layout()
+
+    return fig, summary_df, raw_df
