@@ -76,7 +76,8 @@ class CrossWaterTravel(BaseComponent):
         if homes is None:
             return None
 
-        current_region = agent.state["region"]
+        #current_region = agent.state["region"]
+        current_region = self._region_from_row(agent.loc[0])
 
         if current_region == "top":
             return homes["bottom"]
@@ -94,7 +95,7 @@ class CrossWaterTravel(BaseComponent):
         if agent_cls_name == "BasicMobileAgent":
             return {
                 "travel_cooldown": 0,
-                "region": "top", 
+                "location_region": "top", 
             }
         return {}
     
@@ -166,11 +167,11 @@ class CrossWaterTravel(BaseComponent):
             new_r, new_c = world.set_agent_loc(agent, target_r, target_c)
 
             if (new_r, new_c) == (target_r, target_c):
-                origin_region = agent.state["region"]
+                origin_region = agent.state["location_region"]
                 agent.inventory["Coin"] -= self.travel_cost_coin
                 agent.state["endogenous"]["Labor"] += self.travel_cost_labor
                 agent.state["travel_cooldown"] = self.cooldown
-                agent.state["region"] = self._region_from_row(new_r)
+                agent.state["location_region"] = self._region_from_row(new_r)
 
                 # Remove any market listings/orders from old region when agent travels
                 if hasattr(self.world, "scenario") and hasattr(self.world.scenario, "get_component"):
@@ -262,8 +263,8 @@ class CrossWaterTravel(BaseComponent):
             obs[agent.idx] = {
                 "travel_cooldown": agent.state["travel_cooldown"],
                 "travel_enabled_for_me": eligible if self.enabled else 0.0,
-                "my_region_top": 1.0 if agent.state["region"] == "top" else 0.0,
-                "my_region_bottom": 1.0 if agent.state["region"] == "bottom" else 0.0,
+                "my_region_top": 1.0 if agent.state["location_region"] == "top" else 0.0,
+                "my_region_bottom": 1.0 if agent.state["location_region"] == "bottom" else 0.0,
             }
         return obs
 
@@ -276,7 +277,7 @@ class CrossWaterTravel(BaseComponent):
             row = int(agent.loc[0])
             col = int(agent.loc[1])
 
-            agent.state["region"] = self._region_from_row(row)
+            agent.state["location_region"] = self._region_from_row(row)
             agent.state["travel_cooldown"] = 0
 
             self.agent_start_locs[int(agent.idx)] = (row, col)

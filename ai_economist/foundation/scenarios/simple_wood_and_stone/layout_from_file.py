@@ -1466,8 +1466,8 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
         self.travel_revenue = {"top": 0.0, "bottom": 0.0}
         self.trade_revenue = {"top": 0.0, "bottom": 0.0}
 
-        #self.custom_start_locs = None
-        self.custom_start_locs = list(self.COMMON_AGENT_START_LOCS)
+        self.custom_start_locs = None
+        #self.custom_start_locs = list(self.COMMON_AGENT_START_LOCS)
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
