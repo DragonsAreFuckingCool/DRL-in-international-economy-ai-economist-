@@ -1715,11 +1715,6 @@ def load_experiment_run(run_dir):
 
     metrics = pd.read_csv(os.path.join(run_dir, "training_metrics.csv"))
 
-    with open(os.path.join(run_dir, "dense_logs_final.pkl"), "rb") as f:
-        dense_log = pickle.load(f)
-
-
-        
     #dense_log = dense_log[0] #maybe change
     if isinstance(dense_logs, dict) and 0 in dense_logs:
         dense_log = dense_logs[0]
@@ -1732,6 +1727,7 @@ def load_experiment_run(run_dir):
         "name": summary.get("experiment_name", os.path.basename(run_dir)),
         "summary": summary,
         "metrics": metrics,
+        "dense_logs": dense_logs,
         "dense_log": dense_log,
     }
 
@@ -2285,18 +2281,30 @@ def compare_gini(
         if obj is None:
             return []
 
-        # single episode
+        # single episode / rollout
         if isinstance(obj, dict) and "states" in obj:
             return [obj]
 
-        # dict of episodes
-        if isinstance(obj, dict):
-            vals = list(obj.values())
-            return [v for v in vals if isinstance(v, dict) and "states" in v]
+        # list/tuple of episodes, or nested containers of episodes
+        if isinstance(obj, (list, tuple)):
+            eps = []
+            for v in obj:
+                eps.extend(extract_episode_logs(v))
+            return eps
 
-        # list of episodes
-        if isinstance(obj, list):
-            return [v for v in obj if isinstance(v, dict) and "states" in v]
+        # dict keyed by rollout id, or wrappers such as {"final": {...}}
+        if isinstance(obj, dict):
+            eps = []
+            for key in ["final", "episodes", "dense_logs", "logs", "data"]:
+                if key in obj:
+                    eps.extend(extract_episode_logs(obj[key]))
+
+            if eps:
+                return eps
+
+            for v in obj.values():
+                eps.extend(extract_episode_logs(v))
+            return eps
 
         return []
 
@@ -2444,6 +2452,208 @@ def compare_gini(
     }, index=df.index)
 
     return fig, out_df
+
+
+def compare_gini_over_tax_periods(
+    runs,
+    short_labels=None,
+    show_legend=True,
+    period=100,
+    errorbar="std",      # None, "std", or "sem"
+    max_periods=None,
+    figsize=(8, 4.5),
+):
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    def gini(x):
+        x = np.asarray(x, dtype=float)
+        x = x[np.isfinite(x)]
+        if len(x) == 0:
+            return np.nan
+        if np.sum(x) <= 0:
+            return np.nan
+        x = np.sort(x)
+        n = len(x)
+        return (2 * np.sum((np.arange(1, n + 1) * x))) / (n * np.sum(x)) - (n + 1) / n
+
+    def extract_episode_logs(obj):
+        if obj is None:
+            return []
+
+        if isinstance(obj, dict) and "states" in obj:
+            return [obj]
+
+        if isinstance(obj, (list, tuple)):
+            eps = []
+            for v in obj:
+                eps.extend(extract_episode_logs(v))
+            return eps
+
+        if isinstance(obj, dict):
+            eps = []
+            for key in ["final", "episodes", "dense_logs", "logs", "data"]:
+                if key in obj:
+                    eps.extend(extract_episode_logs(obj[key]))
+
+            if eps:
+                return eps
+
+            for v in obj.values():
+                eps.extend(extract_episode_logs(v))
+            return eps
+
+        return []
+
+    def gini_from_state(state):
+        coins = []
+
+        for k, s in state.items():
+            if str(k).isdigit():
+                coins.append(
+                    float(s["inventory"].get("Coin", 0.0))
+                    + float(s["escrow"].get("Coin", 0.0))
+                )
+
+        return gini(np.array(coins, dtype=float))
+
+    run_names = [run["name"] for run in runs]
+
+    if short_labels is None:
+        short_labels = {name: f"E{i+1}" for i, name in enumerate(run_names)}
+    elif isinstance(short_labels, list):
+        short_labels = {name: short_labels[i] for i, name in enumerate(run_names)}
+
+    colors_list = [
+        "#1f77b4",
+        "#d62728",
+        "#2ca02c",
+        "#9467bd",
+        "#ff7f0e",
+        "#8c564b",
+        "#e377c2",
+        "#17becf",
+    ]
+
+    rows = []
+
+    for run in runs:
+        name = run["name"]
+        dense_logs_obj = run.get("dense_logs", None)
+        if dense_logs_obj is None:
+            dense_logs_obj = run.get("dense_log", None)
+
+        eps = extract_episode_logs(dense_logs_obj)
+
+        for rollout_id, ep in enumerate(eps):
+            states = ep.get("states", [])
+            tax_days = list(range(period - 1, len(states), period))
+            if max_periods is not None:
+                tax_days = tax_days[:max_periods]
+
+            for tax_day_number, timestep in enumerate(tax_days, start=1):
+                try:
+                    gini_value = gini_from_state(states[timestep])
+                except Exception:
+                    gini_value = np.nan
+
+                rows.append({
+                    "run": name,
+                    "label": short_labels[name],
+                    "rollout_id": rollout_id,
+                    "tax_day_number": tax_day_number,
+                    "timestep": timestep,
+                    "gini": gini_value,
+                })
+
+    raw_df = pd.DataFrame(rows)
+    if raw_df.empty:
+        raise ValueError("No dense logs with states were found in the supplied runs.")
+
+    raw_df = raw_df[np.isfinite(raw_df["gini"])]
+    if raw_df.empty:
+        raise ValueError("Dense logs were found, but no finite Gini values could be computed.")
+
+    grouped = raw_df.groupby(["run", "label", "tax_day_number"], sort=False)
+    out_df = grouped.agg(
+        timestep=("timestep", "median"),
+        gini_mean=("gini", "mean"),
+        gini_std=("gini", "std"),
+        n_dense_logs=("gini", "count"),
+    ).reset_index()
+
+    out_df["gini_std"] = out_df["gini_std"].fillna(0.0)
+    out_df["gini_sem"] = out_df["gini_std"] / np.sqrt(out_df["n_dense_logs"])
+
+    if errorbar == "std":
+        out_df["gini_error"] = out_df["gini_std"]
+    elif errorbar == "sem":
+        out_df["gini_error"] = out_df["gini_sem"]
+    elif errorbar is None:
+        out_df["gini_error"] = np.nan
+    else:
+        raise ValueError("errorbar must be None, 'std', or 'sem'")
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    for i, name in enumerate(run_names):
+        run_df = out_df[out_df["run"] == name].sort_values("tax_day_number")
+        if run_df.empty:
+            continue
+
+        color = colors_list[i % len(colors_list)]
+        label = short_labels[name]
+
+        x = run_df["tax_day_number"].to_numpy()
+        mean = run_df["gini_mean"].to_numpy()
+        err = run_df["gini_error"].to_numpy()
+
+        ax.plot(
+            x,
+            mean,
+            marker="o",
+            linewidth=2.2,
+            markersize=5,
+            color=color,
+            label=label,
+        )
+
+        if errorbar is not None:
+            ax.fill_between(
+                x,
+                mean - err,
+                mean + err,
+                color=color,
+                alpha=0.18,
+                linewidth=0,
+            )
+
+    title = "Average Gini Coefficient by Tax Period Across Dense Logs"
+    if errorbar == "std":
+        title += " ± SD"
+    elif errorbar == "sem":
+        title += " ± SEM"
+
+    ax.set_title(title)
+    ax.set_xlabel("Tax period")
+    ax.set_ylabel("Gini")
+    ax.set_xticks(sorted(out_df["tax_day_number"].unique()))
+    ax.set_ylim(bottom=0)
+    ax.grid(True, alpha=0.3)
+
+    if show_legend:
+        ax.legend(
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.15),
+            ncol=min(3, len(run_names)),
+            frameon=True,
+        )
+        fig.subplots_adjust(bottom=0.25)
+    else:
+        fig.tight_layout()
+
+    return fig, out_df, raw_df
 
 
 
