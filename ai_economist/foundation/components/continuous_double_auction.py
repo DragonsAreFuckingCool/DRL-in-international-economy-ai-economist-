@@ -116,10 +116,6 @@ class ContinuousDoubleAuction(BaseComponent):
 
     # Region Helper
     def get_agent_region(self, agent):
-        if "region" in agent.state:
-            return agent.state["region"]
-
-        # Fallback from location
         row = int(agent.loc[0])
         waterline = self.world.world_size[0] // 2
         return "top" if row < waterline else "bottom"
@@ -139,9 +135,6 @@ class ContinuousDoubleAuction(BaseComponent):
             agent = agent_or_idx
         else:
             agent = self.world.agents[int(agent_or_idx)]
-
-        if "region" in agent.state:
-            return str(agent.state["region"])
 
         split = self.world.world_size[0] // 2
         return "top" if int(agent.loc[0]) < split else "bottom"

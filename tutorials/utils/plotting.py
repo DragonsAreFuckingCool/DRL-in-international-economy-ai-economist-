@@ -1330,6 +1330,7 @@ def tax_day_income_report(
     log,
     period=100,
     bracket_cutoffs=(-np.inf, 0, 9.7, 39.475, 84.2, 160.725, 204.1, 510.3, np.inf),
+    split_row=None,
     #[0,\;10,\;25,\;50,\;80,\;120,\;180,\;\infty]
 ):
     """
@@ -1349,13 +1350,36 @@ def tax_day_income_report(
             + state[str(aid)]["escrow"].get("Coin", 0.0)
         )
 
-    def get_region(state, aid):
-        # Prefer explicit region if present
-        if "region" in state[str(aid)]:
-            return state[str(aid)]["region"]
-        # fallback from row location
-        row = state[str(aid)]["loc"][0]
-        waterline = 25  # for 51x25 world split at row 25
+    def infer_split_row():
+        if split_row is not None:
+            return int(split_row)
+
+        for world_state in log.get("world", []):
+            if not world_state:
+                continue
+            for arr in world_state.values():
+                try:
+                    shape = np.asarray(arr).shape
+                except Exception:
+                    continue
+                if len(shape) >= 2 and shape[0] > 0:
+                    return int(shape[0] // 2)
+
+        rows = [
+            int(s["loc"][0])
+            for state in log.get("states", [])
+            for k, s in state.items()
+            if str(k).isdigit() and "loc" in s
+        ]
+        if rows:
+            return int((max(rows) + 1) // 2)
+
+        return 25
+
+    waterline = infer_split_row()
+
+    def get_region_from_loc(state, aid):
+        row = int(state[str(aid)]["loc"][0])
         return "top" if row < waterline else "bottom"
 
     def bracket_label(x, cutoffs):
@@ -1389,7 +1413,10 @@ def tax_day_income_report(
                 "tax_day_number": td_idx + 1,
                 "timestep": t,
                 "agent": aid,
-                "region": get_region(state_t, aid),
+                "region": get_region_from_loc(state_t, aid),
+                "state_region": state_t[str(aid)].get("region", None),
+                "location_region": state_t[str(aid)].get("location_region", None),
+                "split_row": waterline,
                 "coin_start": coin_prev,
                 "coin_end": coin_now,
                 "income": income,
@@ -2654,6 +2681,52 @@ def compare_gini_over_tax_periods(
         fig.tight_layout()
 
     return fig, out_df, raw_df
+
+
+def load_dense_logs_from_result_folder(result_dir):
+    import pickle
+    from pathlib import Path
+
+    result_dir = Path(result_dir)
+    dense_logs_path = result_dir / "dense_logs_final.pkl"
+
+    if not dense_logs_path.exists():
+        raise FileNotFoundError(f"No dense_logs_final.pkl found in {result_dir}")
+
+    with open(dense_logs_path, "rb") as f:
+        return pickle.load(f)
+
+
+def get_dense_log_from_result_folder(result_dir, episode_key=0):
+    dense_logs = load_dense_logs_from_result_folder(result_dir)
+
+    if isinstance(dense_logs, dict):
+        if episode_key in dense_logs:
+            return dense_logs[episode_key], dense_logs
+
+        episode_key_str = str(episode_key)
+        if episode_key_str in dense_logs:
+            return dense_logs[episode_key_str], dense_logs
+
+        for v in dense_logs.values():
+            if isinstance(v, dict) and "states" in v:
+                return v, dense_logs
+
+    if isinstance(dense_logs, list):
+        if len(dense_logs) == 0:
+            raise ValueError(f"No dense logs found in {result_dir}")
+        return dense_logs[int(episode_key)], dense_logs
+
+    if isinstance(dense_logs, dict) and "states" in dense_logs:
+        return dense_logs, dense_logs
+
+    raise ValueError(f"Could not find an episode log with states in {result_dir}")
+
+
+def breakdown_all_agents_from_result_folder(result_dir, episode_key=0, remap_key="build_payment", n_cols=4):
+    dense_log, dense_logs = get_dense_log_from_result_folder(result_dir, episode_key=episode_key)
+    breakdown = breakdown_all_agents(dense_log, remap_key=remap_key, n_cols=n_cols)
+    return breakdown, dense_log, dense_logs
 
 
 
