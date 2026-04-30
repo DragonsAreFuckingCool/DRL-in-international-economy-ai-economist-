@@ -290,16 +290,18 @@ def full_build_str(all_builds, a_indices):
     return "{:<15}: {}".format(s_head, s_tail)
 
 
-def header_str(n_agents):
+def header_str(n_agents, a_indices=None):
+    if a_indices is None:
+        a_indices = list(range(n_agents))
     s_head = ("_" * 15) + ":_"
-    s_tail = "_|_".join([" Agent {:2d} ____".format(i) for i in range(n_agents)])
+    s_tail = "_|_".join([" Agent {:2d} ____".format(i) for i in a_indices])
     return s_head + s_tail
 
 
 def report(c_trades, all_builds, n_agents, a_indices=None):
     if a_indices is None:
         a_indices = list(range(n_agents))
-    print(header_str(n_agents))
+    print(header_str(n_agents, a_indices))
     resources = ["Wood", "Stone"]
     if c_trades is not None:
         for resource in resources:
@@ -543,16 +545,26 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
         p = s.get("bonus_gather_prob", np.nan)
         gather_mults[aid] = 1.0 + p if np.isfinite(p) else np.nan
 
+    finite_skills = sorted({v for v in build_payment.values() if np.isfinite(v)})
+    skill_rank = {v: i for i, v in enumerate(finite_skills)}
+
+    skill_vals = np.array([build_payment.get(aid, np.nan) for aid in aidx], dtype=float)
+    lowest_skill = np.nanmin(skill_vals)
+    highest_skill = np.nanmax(skill_vals)
+
     for i, aid in enumerate(aidx):
         base = f"Agent {aid}"
-        if i == 0:
+        build = build_payment.get(aid, np.nan)
+
+        if np.isfinite(build) and np.isclose(build, lowest_skill):
             base += " (Lowest Skill)"
-        elif i == len(aidx) - 1:
+        elif np.isfinite(build) and np.isclose(build, highest_skill):
             base += " (Highest Skill)"
 
-        build = build_payment.get(aid, np.nan)
         gather = gather_mults.get(aid, np.nan)
-        skill_line = f"\nBuild: {build:.2f} | Gather: {gather:.2f}"
+        rank = skill_rank.get(build, np.nan)
+        rank_text = f"Skill level {rank + 1}/{len(finite_skills)}" if np.isfinite(rank) else "Skill level ?"
+        skill_line = f"\n{rank_text} | Build: {build:.2f} | Gather: {gather:.2f}"
         rank_labels.append(base + skill_line)
 
     # --- Collect builds over time ---
@@ -622,7 +634,12 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
     report(c_trades, all_builds, n, aidx)
 
     # --- Time series plots: resources + labor + utility ---
-    cmap = plt.get_cmap("jet", n)
+    cmap = plt.get_cmap("jet", max(1, len(finite_skills)))
+    agent_colors = {}
+    for aid in aidx:
+        build = build_payment.get(aid, np.nan)
+        rank = skill_rank.get(build, 0)
+        agent_colors[aid] = cmap(rank)
     rs = ["Wood", "Stone", "Coin"]
 
     fig1, axes = plt.subplots(1, len(rs) + 2, figsize=(22, 4), sharey=False)
@@ -635,7 +652,7 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
                     for x in log["states"]
                 ],
                 label=rank_labels[i],
-                color=cmap(i),
+                color=agent_colors[aidx[i]],
             )
         ax.set_title(r)
         ax.grid(True)
@@ -645,7 +662,7 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
         ax.plot(
             [x[str(aidx[i])]["endogenous"]["Labor"] for x in log["states"]],
             label=rank_labels[i],
-            color=cmap(i),
+            color=agent_colors[aidx[i]],
         )
     ax.set_title("Labor")
     ax.grid(True)
@@ -657,7 +674,7 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
             vals = [x[str(aidx[i])].get("utility", np.nan) for x in log["states"]]
             if np.any(np.isfinite(vals)):
                 utility_ok = True
-                ax.plot(vals, label=rank_labels[i], color=cmap(i))
+                ax.plot(vals, label=rank_labels[i], color=agent_colors[aidx[i]])
         if utility_ok:
             ax.set_title("Utility")
         else:
@@ -666,7 +683,7 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
                     x[str(aidx[i])]["inventory"]["Coin"] + x[str(aidx[i])]["escrow"]["Coin"]
                     for x in log["states"]
                 ]
-                ax.plot(vals, label=rank_labels[i], color=cmap(i))
+                ax.plot(vals, label=rank_labels[i], color=agent_colors[aidx[i]])
             ax.set_title("Coin (duplicate)")
     except Exception:
         for i in range(n):
@@ -674,7 +691,7 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
                 x[str(aidx[i])]["inventory"]["Coin"] + x[str(aidx[i])]["escrow"]["Coin"]
                 for x in log["states"]
             ]
-            ax.plot(vals, label=rank_labels[i], color=cmap(i))
+            ax.plot(vals, label=rank_labels[i], color=agent_colors[aidx[i]])
         ax.set_title("Coin (duplicate)")
     ax.grid(True)
 
@@ -771,7 +788,7 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
             ax.plot(
                 [c0, c1],
                 [-r0, -r1],
-                color=cmap(i),
+                color=agent_colors[aidx[i]],
                 linewidth=1.2,
                 alpha=0.25 if is_travel else 0.9,
             )
