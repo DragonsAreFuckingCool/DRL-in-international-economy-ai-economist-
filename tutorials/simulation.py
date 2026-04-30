@@ -899,6 +899,19 @@ def create_trainer(settings, env_config_dict, env_obj, policies_to_train, agent_
     )
 
 
+def set_policy_weights_and_sync(trainer, policy_weights: Dict[str, Any]) -> None:
+    """Set local policy weights and push them to remote rollout workers."""
+    for policy_id, weights in policy_weights.items():
+        trainer.get_policy(policy_id).set_weights(weights)
+
+    # With num_workers=0 this is effectively a no-op. With remote workers it is
+    # essential: manual get_policy(...).set_weights(...) only touches the local worker.
+    try:
+        trainer.workers.sync_weights(policies=list(policy_weights.keys()))
+    except TypeError:
+        trainer.workers.sync_weights()
+
+
 def run_experiment(settings: ExperimentSettings) -> Dict[str, Any]:
     experiment_name = make_experiment_name(
         travel_enabled=settings.travel_enabled_phase3b,
@@ -973,7 +986,7 @@ def run_experiment(settings: ExperimentSettings) -> Dict[str, Any]:
         policies_to_train=["p_top", "p_bottom"],
     )
     patch_trainer_envs(trainer_phase2, min_band=settings.min_band)
-    trainer_phase2.get_policy("a").set_weights(agent_weights_phase1)
+    set_policy_weights_and_sync(trainer_phase2, {"a": agent_weights_phase1})
 
     ckpt_phase2 = train_phase(
         trainer_phase2,
@@ -1011,9 +1024,14 @@ def run_experiment(settings: ExperimentSettings) -> Dict[str, Any]:
     )
     patch_trainer_envs(trainer_phase3a, min_band=settings.min_band)
 
-    trainer_phase3a.get_policy("a").set_weights(agent_weights_phase1)
-    trainer_phase3a.get_policy("p_top").set_weights(planner_top_weights_phase2)
-    trainer_phase3a.get_policy("p_bottom").set_weights(planner_bottom_weights_phase2)
+    set_policy_weights_and_sync(
+        trainer_phase3a,
+        {
+            "a": agent_weights_phase1,
+            "p_top": planner_top_weights_phase2,
+            "p_bottom": planner_bottom_weights_phase2,
+        },
+    )
 
     ckpt_phase3a = train_phase(
         trainer_phase3a,
@@ -1049,9 +1067,14 @@ def run_experiment(settings: ExperimentSettings) -> Dict[str, Any]:
     )
     patch_trainer_envs(trainer_phase3b, min_band=settings.min_band)
 
-    trainer_phase3b.get_policy("a").set_weights(agent_weights_phase3a)
-    trainer_phase3b.get_policy("p_top").set_weights(planner_top_weights_phase2)
-    trainer_phase3b.get_policy("p_bottom").set_weights(planner_bottom_weights_phase2)
+    set_policy_weights_and_sync(
+        trainer_phase3b,
+        {
+            "a": agent_weights_phase3a,
+            "p_top": planner_top_weights_phase2,
+            "p_bottom": planner_bottom_weights_phase2,
+        },
+    )
 
     ckpt_phase3b = train_phase(
         trainer_phase3b,
