@@ -1474,6 +1474,42 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
     def add_trade_tariff_revenue(self, region, amount):
         if region in self.trade_revenue:
             self.trade_revenue[region] += float(amount)
+
+    def _apply_agent_start_build_payments(self):
+        """
+        Force configured build-payment multipliers after component reset.
+
+        The Build component samples Pareto skills in its own reset hook. Custom
+        scenario skills must be applied after that hook, and its internal
+        sampled_skills cache must be kept in sync because observations read it.
+        """
+        if (
+            not hasattr(self, "agent_start_build_payment_multipliers")
+            or self.agent_start_build_payment_multipliers is None
+        ):
+            return False
+
+        if len(self.agent_start_build_payment_multipliers) != self.n_agents:
+            raise ValueError(
+                f"agent_start_build_payment_multipliers must have {self.n_agents} entries, "
+                f"got {len(self.agent_start_build_payment_multipliers)}"
+            )
+
+        bm = self.get_component("Build")
+        if bm is None:
+            raise ValueError("Custom build skill multipliers require the Build component.")
+
+        if not hasattr(bm, "sampled_skills") or bm.sampled_skills is None:
+            bm.sampled_skills = {}
+
+        for i, agent in enumerate(self.world.agents):
+            mult = float(self.agent_start_build_payment_multipliers[i])
+            build_payment = float(bm.payment * mult)
+            agent.state["build_payment"] = build_payment
+            agent.state["build_skill"] = mult
+            bm.sampled_skills[agent.idx] = mult
+
+        return True
     
     def _split_row(self):
         return int(
@@ -1672,6 +1708,8 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
 
             self.world.set_agent_loc(agent, r, c)
 
+        self._apply_agent_start_build_payments()
+
         curr = self.get_current_optimization_metrics()
         self.curr_optimization_metric = deepcopy(curr)
         self.init_optimization_metric = deepcopy(curr)
@@ -1703,22 +1741,8 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
                     f"got {len(self.agent_start_locs)}"
                 )
 
-            if (
-                hasattr(self, "agent_start_build_payment_multipliers")
-                and self.agent_start_build_payment_multipliers is not None
-            ):
-                if len(self.agent_start_build_payment_multipliers) != self.n_agents:
-                    raise ValueError(
-                        f"agent_start_build_payment_multipliers must have {self.n_agents} entries, "
-                        f"got {len(self.agent_start_build_payment_multipliers)}"
-                    )
-
             self.world.clear_agent_locs()
             H, W = self.world_size
-
-            bm = self.get_component("Build")
-            if bm is None:
-                raise ValueError("Custom build skill multipliers require the Build component.")
 
             for i, (agent, (r, c)) in enumerate(zip(self.world.agents, self.agent_start_locs)):
                 r = int(r)
@@ -1737,13 +1761,7 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
 
                 self.world.set_agent_loc(agent, r, c)
 
-                # Optional custom skill multiplier -> build payment
-                if (
-                    hasattr(self, "agent_start_build_payment_multipliers")
-                    and self.agent_start_build_payment_multipliers is not None
-                ):
-                    mult = float(self.agent_start_build_payment_multipliers[i])
-                    agent.state["build_payment"] = float(bm.payment * mult)
+            self._apply_agent_start_build_payments()
 
             # Recompute objective trackers and return early
             curr_optimization_metric = self.get_current_optimization_metrics()
