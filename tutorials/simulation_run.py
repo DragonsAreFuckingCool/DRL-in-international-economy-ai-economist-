@@ -22,8 +22,8 @@ settings = exp.ExperimentSettings(
     save_results=True,
     travel_enabled_phase3a=False,
     travel_enabled_phase3b=False,
-    restrict_trade_to_region = True,
-    experiment_extra_tag = "rerun original",
+    restrict_trade_to_region = False,
+    experiment_extra_tag = "with_trade",
 
 
 # same as AI economist original 
