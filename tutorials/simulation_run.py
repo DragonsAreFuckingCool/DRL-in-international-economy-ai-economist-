@@ -20,10 +20,10 @@ settings = exp.ExperimentSettings(
     phase3a_iters = 500,
     phase3b_iters = 1500,
     save_results=True,
-    travel_enabled_phase3a=False,
-    travel_enabled_phase3b=False,
+    travel_enabled_phase3a=True,
+    travel_enabled_phase3b=True,
     restrict_trade_to_region = False,
-    experiment_extra_tag = "with_trade",
+    experiment_extra_tag = "with_travel",
 
 
 # same as AI economist original 
