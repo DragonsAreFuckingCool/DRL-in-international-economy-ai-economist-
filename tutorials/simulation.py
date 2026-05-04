@@ -92,6 +92,11 @@ class ExperimentSettings:
     travel_cost_labor_phase3b: float = 4
     travel_cooldown_phase3b: int = 101
 
+    fixed_tax_planner_id: Optional[str] = None
+    fixed_tax_bracket_rates: Tuple[float, ...] = (
+        0.30, 0.25, 0.20, 0.15, 0.10, 0.05, 0.00
+    )
+
     experiment_extra_tag: str = "original_baseline"
 
 
@@ -236,7 +241,14 @@ def gather_component() -> Tuple[str, Dict[str, Any]]:
     )
 
 
-def regional_tax_component(*, region: str, planner_id: str, disable_taxes: bool, period: int) -> Tuple[str, Dict[str, Any]]:
+def regional_tax_component(
+    *,
+    region: str,
+    planner_id: str,
+    disable_taxes: bool,
+    period: int,
+    fixed_bracket_rates: Optional[Sequence[float]] = None,
+) -> Tuple[str, Dict[str, Any]]:
     cfg: Dict[str, Any] = {
         "region": region,
         "planner_id": planner_id,
@@ -249,9 +261,12 @@ def regional_tax_component(*, region: str, planner_id: str, disable_taxes: bool,
         cfg.update(
             {
                 "tax_model": "model_wrapper",
-                "tax_annealing_schedule": [-100, 0.001],
             }
         )
+        if fixed_bracket_rates is None:
+            cfg["tax_annealing_schedule"] = [-100, 0.001]
+        else:
+            cfg["fixed_planner_bracket_rates"] = list(fixed_bracket_rates)
     return ("RegionalPeriodicBracketTax", cfg)
 
 
@@ -286,6 +301,11 @@ def make_phase_env_config(
     restrict_trade_to_region: bool,
 ) -> Dict[str, Any]:
     cfg = deepcopy(base_env_config(settings))
+    fixed_tax_planner_id = (
+        str(settings.fixed_tax_planner_id)
+        if settings.fixed_tax_planner_id is not None
+        else None
+    )
     cfg["components"] = [
         build_component(),
         auction_component(restrict_trade_to_region=restrict_trade_to_region),
@@ -295,12 +315,22 @@ def make_phase_env_config(
             planner_id="p_top",
             disable_taxes=disable_taxes,
             period=settings.period,
+            fixed_bracket_rates=(
+                settings.fixed_tax_bracket_rates
+                if fixed_tax_planner_id == "p_top"
+                else None
+            ),
         ),
         regional_tax_component(
             region="bottom",
             planner_id="p_bottom",
             disable_taxes=disable_taxes,
             period=settings.period,
+            fixed_bracket_rates=(
+                settings.fixed_tax_bracket_rates
+                if fixed_tax_planner_id == "p_bottom"
+                else None
+            ),
         ),
         travel_component_config(
             enabled=travel_enabled,
@@ -311,6 +341,19 @@ def make_phase_env_config(
         ),
     ]
     return cfg
+
+
+def trainable_planner_policies(settings: ExperimentSettings) -> List[str]:
+    planner_ids = ["p_top", "p_bottom"]
+    if settings.fixed_tax_planner_id is None:
+        return planner_ids
+    fixed_id = str(settings.fixed_tax_planner_id)
+    if fixed_id not in planner_ids:
+        raise ValueError(
+            "fixed_tax_planner_id must be None, 'p_top', or 'p_bottom'; "
+            f"got {settings.fixed_tax_planner_id!r}"
+        )
+    return [pid for pid in planner_ids if pid != fixed_id]
 
 
 def build_all_phase_env_configs(settings: ExperimentSettings) -> Dict[str, Dict[str, Any]]:
@@ -519,7 +562,9 @@ def patch_regional_tax_masks(env_obj: RLlibEnvWrapper, min_band: int = 4) -> Non
                 if allowed_idx.size < min_band:
                     allowed_idx = np.arange(min(min_band, n_rates))
 
-                if getattr(self, "tax_cycle_pos", None) == 1:
+                if getattr(self, "_fixed_planner_bracket_rates", None) is not None:
+                    rate_mask = np.zeros(n_rates, dtype=np.float32)
+                elif getattr(self, "tax_cycle_pos", None) == 1:
                     rate_mask = np.zeros(n_rates, dtype=np.float32)
                     rate_mask[allowed_idx] = 1.0
                 else:
@@ -921,6 +966,7 @@ def run_experiment(settings: ExperimentSettings) -> Dict[str, Any]:
     )
 
     phase_env_configs = build_all_phase_env_configs(settings)
+    trainable_planners = trainable_planner_policies(settings)
     run_dir = make_experiment_dir(experiment_name, settings.save_results, settings.results_dir)
 
     if settings.save_results and run_dir is not None:
@@ -983,7 +1029,7 @@ def run_experiment(settings: ExperimentSettings) -> Dict[str, Any]:
         settings=settings,
         env_config_dict=phase_env_configs["phase2"],
         env_obj=env_phase2,
-        policies_to_train=["p_top", "p_bottom"],
+        policies_to_train=trainable_planners,
     )
     patch_trainer_envs(trainer_phase2, min_band=settings.min_band)
     set_policy_weights_and_sync(trainer_phase2, {"a": agent_weights_phase1})
@@ -1063,7 +1109,7 @@ def run_experiment(settings: ExperimentSettings) -> Dict[str, Any]:
         settings=settings,
         env_config_dict=phase_env_configs["phase3b"],
         env_obj=env_phase3b,
-        policies_to_train=["a", "p_top", "p_bottom"],
+        policies_to_train=["a", *trainable_planners],
     )
     patch_trainer_envs(trainer_phase3b, min_band=settings.min_band)
 

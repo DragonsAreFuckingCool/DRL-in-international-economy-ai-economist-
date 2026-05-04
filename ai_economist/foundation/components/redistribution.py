@@ -1219,10 +1219,18 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
     name = "RegionalPeriodicBracketTax"
     agent_subclasses = ["BasicMobileAgent", "BasicPlanner", "TopPlanner", "BottomPlanner"]
 
-    def __init__(self, *args, region=None, planner_id=None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        region=None,
+        planner_id=None,
+        fixed_planner_bracket_rates=None,
+        **kwargs
+    ):
         # Store and REMOVE custom args before calling parent
         self._region = str(region) if region is not None else None      # "top" / "bottom"
         self._planner_id = str(planner_id) if planner_id is not None else None
+        self._fixed_planner_bracket_rates = fixed_planner_bracket_rates
 
 
 
@@ -1245,6 +1253,15 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
             204100,
             510300
         ]) / usd_scaling
+
+        if self._fixed_planner_bracket_rates is not None:
+            self._fixed_planner_bracket_rates = np.array(
+                self._fixed_planner_bracket_rates,
+                dtype=float,
+            )
+            assert len(self._fixed_planner_bracket_rates) == self.n_brackets
+            assert np.min(self._fixed_planner_bracket_rates) >= 0.0
+            assert np.max(self._fixed_planner_bracket_rates) <= 1.0
 
     # ---------------------------------------------------------------------
     # Utilities
@@ -1310,6 +1327,13 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
     def set_new_period_rates_model(self):
         """Use ONLY the bound planner's actions."""
         if self.disable_taxes:
+            return
+
+        if self._fixed_planner_bracket_rates is not None:
+            for i, fixed_rate in enumerate(self._fixed_planner_bracket_rates):
+                self.curr_rate_indices[i] = int(
+                    np.argmin(np.abs(self.disc_rates - fixed_rate))
+                )
             return
 
         planner = self._get_bound_planner(self.world)
@@ -1562,7 +1586,9 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
             allowed_idx = allowed_idx[allowed_idx < n]  # guard
 
         # --- Rate masks for tax day vs non-tax day ---
-        if self.tax_cycle_pos == 1:
+        if self._fixed_planner_bracket_rates is not None:
+            rate_mask_active = np.zeros(n, dtype=np.float32)
+        elif self.tax_cycle_pos == 1:
             rate_mask_active = np.zeros(n, dtype=np.float32)
             rate_mask_active[allowed_idx] = 1.0
         else:

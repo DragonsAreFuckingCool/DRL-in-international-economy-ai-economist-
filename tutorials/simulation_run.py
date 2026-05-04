@@ -23,13 +23,16 @@ settings = exp.ExperimentSettings(
     travel_enabled_phase3a=True,
     travel_enabled_phase3b=True,
     restrict_trade_to_region = False,
-    experiment_extra_tag = "with_travel",
+
+    fixed_tax_planner_id="p_top",
+    fixed_tax_bracket_rates=(0.30, 0.25, 0.20, 0.15, 0.10, 0.05, 0.00),
+    experiment_extra_tag="fixed_top_tax",
 
 
 # same as AI economist original 
     # num_workers=15,
     # num_envs_per_worker=2,
-    # num_gpus=1,
+    # num_gpus=1, 
     # num_cpus_per_worker= 1,
     # rollout_fragment_length=200,
     # train_batch_size=6000,      # 15 workers * 2 envs * 200 steps
