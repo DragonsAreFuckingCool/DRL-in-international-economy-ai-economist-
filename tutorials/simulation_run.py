@@ -24,8 +24,8 @@ settings = exp.ExperimentSettings(
     travel_enabled_phase3b=True,
     restrict_trade_to_region = False,
 
-    fixed_tax_planner_id="p_top",
-    fixed_tax_bracket_rates=(0.30, 0.25, 0.20, 0.15, 0.10, 0.05, 0.00),
+    fixed_tax_planner_id=None,
+    fixed_tax_bracket_rates=(0.00, 0.095, 0.15, 0.23, 0.32, 0.395, 0.42),
     experiment_extra_tag="fixed_top_tax",
 
 

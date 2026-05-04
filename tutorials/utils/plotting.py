@@ -1346,9 +1346,8 @@ def diagnose_resource_market(log, resource="Wood", period=100):
 def tax_day_income_report(
     log,
     period=100,
-    bracket_cutoffs=(-np.inf, 0, 9.7, 39.475, 84.2, 160.725, 204.1, 510.3, np.inf),
+    bracket_cutoffs=(-np.inf, 0, 13.2, 22.05, 31.1, 40.3, 51.75, 234.85, np.inf),
     split_row=None,
-    #[0,\;10,\;25,\;50,\;80,\;120,\;180,\;\infty]
 ):
     """
     Reconstructs per-agent income at each tax day and assigns tax brackets.

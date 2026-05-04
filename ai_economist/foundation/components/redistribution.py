@@ -17,6 +17,11 @@ from ai_economist.foundation.components.utils import (
     annealed_tax_mask,
 )
 
+DEFAULT_TAX_BRACKET_CUTOFFS = np.array(
+    [0, 13200, 22050, 31100, 40300, 51750, 234850],
+    dtype=float,
+)
+
 
 @component_registry.add
 class WealthRedistribution(BaseComponent):
@@ -229,7 +234,7 @@ class PeriodicBracketTax(BaseComponent):
             )
         elif self.bracket_spacing == "us-federal":
             self.bracket_cutoffs = (
-                np.array([0, 9700, 39475, 84200, 160725, 204100, 510300])
+                DEFAULT_TAX_BRACKET_CUTOFFS
                 / self.usd_scale
             )
             self.n_brackets = len(self.bracket_cutoffs)
@@ -1244,15 +1249,7 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
     # Tax brackets
     # ---------------------------------------------------------------------
         usd_scaling = 1000 #1000
-        self.regional_brackets = np.array([
-            0,
-            9700,
-            39475,
-            84200,
-            160725,
-            204100,
-            510300
-        ]) / usd_scaling
+        self.regional_brackets = DEFAULT_TAX_BRACKET_CUTOFFS / usd_scaling
 
         if self._fixed_planner_bracket_rates is not None:
             self._fixed_planner_bracket_rates = np.array(
