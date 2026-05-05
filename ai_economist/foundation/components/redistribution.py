@@ -18,7 +18,16 @@ from ai_economist.foundation.components.utils import (
 )
 
 DEFAULT_TAX_BRACKET_CUTOFFS = np.array(
-    [0, 13200, 22050, 31100, 40300, 51750, 234850],
+    # [0, 13200, 22050, 31100, 40300, 51750, 234850],
+    [
+    0,
+    9700,
+    39475,
+    84200,
+    160725,
+    204100,
+    510300
+    ],
     dtype=float,
 )
 
