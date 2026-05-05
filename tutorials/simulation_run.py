@@ -20,13 +20,14 @@ settings = exp.ExperimentSettings(
     phase3a_iters = 500,
     phase3b_iters = 1500,
     save_results=True,
-    travel_enabled_phase3a=False,
-    travel_enabled_phase3b=False,
-    restrict_trade_to_region = True,
+    travel_enabled_phase3a=True,
+    travel_enabled_phase3b=True,
+    restrict_trade_to_region = False,
 
     fixed_tax_planner_id=None,
     fixed_tax_bracket_rates=(0.00, 0.095, 0.15, 0.23, 0.32, 0.395, 0.42),
-    experiment_extra_tag="base_lux",
+    experiment_extra_tag="less_top",
+    layout_file = "stacked_51x25_20_less_top.txt",
 
 
 # same as AI economist original 
