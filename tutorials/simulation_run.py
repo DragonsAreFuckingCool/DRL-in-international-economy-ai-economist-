@@ -26,8 +26,8 @@ settings = exp.ExperimentSettings(
 
     fixed_tax_planner_id=None,
     fixed_tax_bracket_rates=(0.00, 0.095, 0.15, 0.23, 0.32, 0.395, 0.42),
-    experiment_extra_tag="less_top",
-    layout_file = "stacked_51x25_20_less_top.txt",
+    experiment_extra_tag="more_top",
+    layout_file = "stacked_51x25_20_more_top.txt",
 
 
 # same as AI economist original 
