@@ -85,11 +85,11 @@ class ExperimentSettings:
     travel_cooldown_phase2: int = 20
 
     travel_cost_coin_phase3a: float = 10
-    travel_cost_labor_phase3a: float = 4
+    travel_cost_labor_phase3a: float = 10
     travel_cooldown_phase3a: int = 101
 
     travel_cost_coin_phase3b: float = 10
-    travel_cost_labor_phase3b: float = 4
+    travel_cost_labor_phase3b: float = 10
     travel_cooldown_phase3b: int = 101
 
     fixed_tax_planner_id: Optional[str] = None
@@ -184,8 +184,8 @@ def travel_component_config(
     *,
     enabled: bool,
     allow_only_agent: Optional[int] = None,
-    travel_cost_coin: float = 5.0,
-    travel_cost_labor: float = 2.0,
+    travel_cost_coin: float = 10.0,
+    travel_cost_labor: float = 10.0,
     cooldown: int = 100,
 ) -> Tuple[str, Dict[str, Any]]:
     return (
