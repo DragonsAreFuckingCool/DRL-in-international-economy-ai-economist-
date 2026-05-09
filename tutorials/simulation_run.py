@@ -30,7 +30,7 @@ settings = exp.ExperimentSettings(
     layout_file = "stacked_51x25_symetric_original.txt",
 
     travel_cost_coin_phase3a = 10,
-    travel_cost_labor_phase3a = 13,
+    travel_cost_labor_phase3a = 18,
 
     travel_cost_coin_phase3b = 10,
     travel_cost_labor_phase3b = 18,
