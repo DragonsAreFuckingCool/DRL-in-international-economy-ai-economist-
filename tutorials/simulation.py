@@ -2,6 +2,7 @@ import gc
 import json
 import os
 import pickle
+import shutil
 import sys
 import time
 import types
@@ -166,6 +167,40 @@ def maybe_save_pickle(obj: Any, run_dir: Optional[Path], filename: str) -> None:
         save_pickle(obj, run_dir / filename)
 
 
+def copy_rllib_checkpoint_to_run_dir(
+    checkpoint_path: str,
+    run_dir: Optional[Path],
+    phase_key: str,
+) -> str:
+    if run_dir is None:
+        return str(checkpoint_path)
+
+    source = Path(checkpoint_path)
+    if not source.exists():
+        print(f"[WARN] Checkpoint not copied for {phase_key}; missing: {source}")
+        return str(checkpoint_path)
+
+    checkpoint_root = run_dir / "ray_checkpoints" / phase_key
+
+    if source.is_dir():
+        destination = checkpoint_root / source.name
+        shutil.copytree(source, destination, dirs_exist_ok=True)
+        return str(destination)
+
+    destination_dir = checkpoint_root / source.parent.name
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / source.name
+    shutil.copy2(source, destination)
+
+    metadata_source = Path(str(source) + ".tune_metadata")
+    if metadata_source.exists():
+        shutil.copy2(metadata_source, Path(str(destination) + ".tune_metadata"))
+    else:
+        print(f"[WARN] Checkpoint metadata not found for {phase_key}: {metadata_source}")
+
+    return str(destination)
+
+
 # -----------------------------------------------------------------------------
 # Environment / component configuration
 # -----------------------------------------------------------------------------
@@ -221,7 +256,7 @@ def auction_component(restrict_trade_to_region: bool) -> Tuple[str, Dict[str, An
             "max_num_orders": 5,
             "order_duration": 50,
             "restrict_trade_to_region": restrict_trade_to_region,
-            "cross_region_trade_tax_mode": "none",
+            "cross_region_trade_tax_mode": "percent",
             "cross_region_trade_tax_flat": 0.0,
             "cross_region_trade_tax_rate": 0.10,
             "cross_region_trade_tax_sink": False,
@@ -1145,17 +1180,16 @@ def run_experiment(settings: ExperimentSettings) -> Dict[str, Any]:
     metrics_df = pd.DataFrame(all_metrics)
     maybe_save_pickle(dense_logs_final, run_dir, "dense_logs_final.pkl")
 
+    portable_checkpoints = {
+        "phase1": copy_rllib_checkpoint_to_run_dir(ckpt_phase1, run_dir, "phase1"),
+        "phase2": copy_rllib_checkpoint_to_run_dir(ckpt_phase2, run_dir, "phase2"),
+        "phase3a": copy_rllib_checkpoint_to_run_dir(ckpt_phase3a, run_dir, "phase3a"),
+        "phase3b": copy_rllib_checkpoint_to_run_dir(ckpt_phase3b, run_dir, "phase3b"),
+    }
+
     if settings.save_results and run_dir is not None:
         metrics_df.to_csv(run_dir / "training_metrics.csv", index=False)
-        save_json(
-            {
-                "phase1": ckpt_phase1,
-                "phase2": ckpt_phase2,
-                "phase3a": ckpt_phase3a,
-                "phase3b": ckpt_phase3b,
-            },
-            run_dir / "checkpoints.json",
-        )
+        save_json(portable_checkpoints, run_dir / "checkpoints.json")
 
     summary = summarize_dense_log(dense_logs_final[0])
     summary.update(
@@ -1198,12 +1232,7 @@ def run_experiment(settings: ExperimentSettings) -> Dict[str, Any]:
         "summary": summary,
         "metrics_df": metrics_df,
         "dense_logs": dense_logs_final,
-        "phase_checkpoints": {
-            "phase1": ckpt_phase1,
-            "phase2": ckpt_phase2,
-            "phase3a": ckpt_phase3a,
-            "phase3b": ckpt_phase3b,
-        },
+        "phase_checkpoints": portable_checkpoints,
         "trainers": {
             "phase2": trainer_phase2,
             "phase3a": trainer_phase3a,
