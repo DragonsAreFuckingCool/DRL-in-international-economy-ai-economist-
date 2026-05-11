@@ -1181,9 +1181,9 @@ def run_experiment(settings: ExperimentSettings) -> Dict[str, Any]:
     maybe_save_pickle(dense_logs_final, run_dir, "dense_logs_final.pkl")
 
     portable_checkpoints = {
-        "phase1": copy_rllib_checkpoint_to_run_dir(ckpt_phase1, run_dir, "phase1"),
-        "phase2": copy_rllib_checkpoint_to_run_dir(ckpt_phase2, run_dir, "phase2"),
-        "phase3a": copy_rllib_checkpoint_to_run_dir(ckpt_phase3a, run_dir, "phase3a"),
+        "phase1": ckpt_phase1,
+        "phase2": ckpt_phase2,
+        "phase3a": ckpt_phase3a,
         "phase3b": copy_rllib_checkpoint_to_run_dir(ckpt_phase3b, run_dir, "phase3b"),
     }
 
