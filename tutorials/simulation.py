@@ -93,10 +93,12 @@ class ExperimentSettings:
     travel_cost_labor_phase3b: float = 10
     travel_cooldown_phase3b: int = 101
 
-    fixed_tax_planner_id: Optional[str] = None
+    fixed_tax_planner_id: Any = None
     fixed_tax_bracket_rates: Tuple[float, ...] = (
         0.30, 0.25, 0.20, 0.15, 0.10, 0.05, 0.00
     )
+    fixed_tax_bracket_rates_top: Optional[Tuple[float, ...]] = None
+    fixed_tax_bracket_rates_bottom: Optional[Tuple[float, ...]] = None
 
     experiment_extra_tag: str = "original_baseline"
 
@@ -336,11 +338,7 @@ def make_phase_env_config(
     restrict_trade_to_region: bool,
 ) -> Dict[str, Any]:
     cfg = deepcopy(base_env_config(settings))
-    fixed_tax_planner_id = (
-        str(settings.fixed_tax_planner_id)
-        if settings.fixed_tax_planner_id is not None
-        else None
-    )
+    fixed_tax_planner_ids = fixed_tax_planner_ids_from_settings(settings)
     cfg["components"] = [
         build_component(),
         auction_component(restrict_trade_to_region=restrict_trade_to_region),
@@ -351,8 +349,8 @@ def make_phase_env_config(
             disable_taxes=disable_taxes,
             period=settings.period,
             fixed_bracket_rates=(
-                settings.fixed_tax_bracket_rates
-                if fixed_tax_planner_id == "p_top"
+                fixed_tax_bracket_rates_for_planner(settings, "p_top")
+                if "p_top" in fixed_tax_planner_ids
                 else None
             ),
         ),
@@ -362,8 +360,8 @@ def make_phase_env_config(
             disable_taxes=disable_taxes,
             period=settings.period,
             fixed_bracket_rates=(
-                settings.fixed_tax_bracket_rates
-                if fixed_tax_planner_id == "p_bottom"
+                fixed_tax_bracket_rates_for_planner(settings, "p_bottom")
+                if "p_bottom" in fixed_tax_planner_ids
                 else None
             ),
         ),
@@ -378,17 +376,50 @@ def make_phase_env_config(
     return cfg
 
 
-def trainable_planner_policies(settings: ExperimentSettings) -> List[str]:
+def fixed_tax_planner_ids_from_settings(settings: ExperimentSettings) -> List[str]:
     planner_ids = ["p_top", "p_bottom"]
-    if settings.fixed_tax_planner_id is None:
-        return planner_ids
-    fixed_id = str(settings.fixed_tax_planner_id)
-    if fixed_id not in planner_ids:
+
+    value = settings.fixed_tax_planner_id
+    if value is None:
+        return []
+
+    if isinstance(value, str):
+        fixed_ids = planner_ids if value.lower() == "both" else [value]
+    elif isinstance(value, (list, tuple, set)):
+        fixed_ids = list(value)
+    else:
         raise ValueError(
-            "fixed_tax_planner_id must be None, 'p_top', or 'p_bottom'; "
+            "fixed_tax_planner_id must be None, 'p_top', 'p_bottom', 'both', "
+            "or a list/tuple/set of planner ids; "
             f"got {settings.fixed_tax_planner_id!r}"
         )
-    return [pid for pid in planner_ids if pid != fixed_id]
+
+    fixed_ids = [str(pid) for pid in fixed_ids]
+    unknown = [pid for pid in fixed_ids if pid not in planner_ids]
+    if unknown:
+        raise ValueError(
+            "fixed_tax_planner_id can only contain 'p_top' and/or 'p_bottom'; "
+            f"got {unknown!r}"
+        )
+
+    return [pid for pid in planner_ids if pid in set(fixed_ids)]
+
+
+def fixed_tax_bracket_rates_for_planner(
+    settings: ExperimentSettings,
+    planner_id: str,
+) -> Sequence[float]:
+    if planner_id == "p_top" and settings.fixed_tax_bracket_rates_top is not None:
+        return settings.fixed_tax_bracket_rates_top
+    if planner_id == "p_bottom" and settings.fixed_tax_bracket_rates_bottom is not None:
+        return settings.fixed_tax_bracket_rates_bottom
+    return settings.fixed_tax_bracket_rates
+
+
+def trainable_planner_policies(settings: ExperimentSettings) -> List[str]:
+    planner_ids = ["p_top", "p_bottom"]
+    fixed_ids = set(fixed_tax_planner_ids_from_settings(settings))
+    return [pid for pid in planner_ids if pid not in fixed_ids]
 
 
 def build_all_phase_env_configs(settings: ExperimentSettings) -> Dict[str, Dict[str, Any]]:
