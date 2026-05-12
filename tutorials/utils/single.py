@@ -2,7 +2,27 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-def force_single_agent_move(env_obj, agent_id, target_region, max_tries=500):
+def _wrapped_observations(env_obj):
+    obs = env_obj.env._generate_observations(
+        flatten_observations=env_obj.env._flatten_observations,
+        flatten_masks=env_obj.env._flatten_masks,
+    )
+
+    def recursive_list_to_np_array(d):
+        if isinstance(d, dict):
+            return {k: recursive_list_to_np_array(v) for k, v in d.items()}
+        if isinstance(d, list):
+            return np.array(d)
+        if isinstance(d, (float, int, np.floating, np.integer)):
+            return np.array([d])
+        if isinstance(d, np.ndarray):
+            return d
+        raise AssertionError(f"Unexpected observation value type: {type(d)}")
+
+    return recursive_list_to_np_array(obs)
+
+
+def force_single_agent_move(env_obj, agent_id, target_region, max_tries=500, seed=0):
     """
     Force a single agent to relocate once to a valid empty tile in the target region.
     Does not use the travel action or require CrossWaterTravel target attributes.
@@ -21,9 +41,12 @@ def force_single_agent_move(env_obj, agent_id, target_region, max_tries=500):
         raise ValueError("target_region must be 'top' or 'bottom'")
 
     old_r, old_c = agent.loc
+    rng = np.random.default_rng(seed)
 
     # If already in target region, do nothing
     if (target_region == "top" and old_r < split) or (target_region == "bottom" and old_r > split):
+        agent.state["location_region"] = target_region
+        agent.state["region"] = target_region
         return {
             "agent": int(agent.idx),
             "from": (int(old_r), int(old_c)),
@@ -35,15 +58,15 @@ def force_single_agent_move(env_obj, agent_id, target_region, max_tries=500):
 
     # Try random valid locations in the target region
     for _ in range(max_tries):
-        r = np.random.randint(r_min, r_max)
-        c = np.random.randint(0, W)
+        r = rng.integers(r_min, r_max)
+        c = rng.integers(0, W)
 
         if world.maps.unoccupied[r, c] and world.can_agent_occupy(r, c, agent):
             new_r, new_c = world.set_agent_loc(agent, r, c)
+            new_region = "top" if int(new_r) < split else "bottom"
 
-            # update region state if present
-            if "region" in agent.state:
-                agent.state["region"] = "top" if int(new_r) < split else "bottom"
+            agent.state["location_region"] = new_region
+            agent.state["region"] = new_region
 
             # remove outstanding market listings/orders if supported
             try:
@@ -57,7 +80,7 @@ def force_single_agent_move(env_obj, agent_id, target_region, max_tries=500):
                 "agent": int(agent.idx),
                 "from": (int(old_r), int(old_c)),
                 "to": (int(new_r), int(new_c)),
-                "new_region": agent.state.get("region", target_region),
+                "new_region": new_region,
                 "moved": True,
             }
 
@@ -69,6 +92,7 @@ def generate_rollout_with_forced_move(
     forced_agent_id=0,
     forced_timestep=200,
     forced_target_region="bottom",
+    forced_move_seed=0,
     explore=False,
 ):
     def _compute_action(pid, obs, state):
@@ -96,6 +120,8 @@ def generate_rollout_with_forced_move(
 
     forced_move_log = None
     agent_utility_history = []
+    planner_rewards_top = []
+    planner_rewards_bottom = []
 
     for t in range(env_obj.env.episode_length):
         actions = {}
@@ -112,14 +138,18 @@ def generate_rollout_with_forced_move(
         actions["p_bottom"] = a_bottom
 
         obs, rew, done, info = env_obj.step(actions)
+        planner_rewards_top.append(rew.get("p_top", np.nan))
+        planner_rewards_bottom.append(rew.get("p_bottom", np.nan))
 
         if t == forced_timestep:
             forced_move_log = force_single_agent_move(
                 env_obj=env_obj,
                 agent_id=forced_agent_id,
                 target_region=forced_target_region,
+                seed=forced_move_seed,
             )
             forced_move_log["timestep"] = t
+            obs = _wrapped_observations(env_obj)
 
         util_t = {}
         for agent in env_obj.env.world.agents:
@@ -143,6 +173,10 @@ def generate_rollout_with_forced_move(
                     dense_log["states"][tt][aid]["utility"] = util
 
     dense_log["forced_move"] = forced_move_log
+    dense_log["planner_rewards"] = {
+        "p_top": planner_rewards_top,
+        "p_bottom": planner_rewards_bottom,
+    }
     return dense_log
 
 
@@ -277,7 +311,7 @@ def forced_move_event_table(log, window=100):
         row = {
             "t": t,
             "relative_t": t - t0,
-            "region": state.get("region", np.nan),
+            "region": state.get("location_region", state.get("region", np.nan)),
             "coin": state["inventory"]["Coin"] + state["escrow"]["Coin"],
             "wood": state["inventory"]["Wood"] + state["escrow"]["Wood"],
             "stone": state["inventory"]["Stone"] + state["escrow"]["Stone"],
@@ -719,7 +753,7 @@ def _inject_utility_into_dense_log(dense_log, agent_utility_history):
     return dense_log
 
 
-def force_single_agent_move(env_obj, agent_id, target_region, max_tries=500):
+def force_single_agent_move(env_obj, agent_id, target_region, max_tries=500, seed=0):
     world = env_obj.env.world
     agent = world.agents[int(agent_id)]
 
@@ -734,8 +768,11 @@ def force_single_agent_move(env_obj, agent_id, target_region, max_tries=500):
         raise ValueError("target_region must be 'top' or 'bottom'")
 
     old_r, old_c = agent.loc
+    rng = np.random.default_rng(seed)
 
     if (target_region == "top" and old_r < split) or (target_region == "bottom" and old_r > split):
+        agent.state["location_region"] = target_region
+        agent.state["region"] = target_region
         return {
             "agent": int(agent.idx),
             "from": (int(old_r), int(old_c)),
@@ -746,14 +783,15 @@ def force_single_agent_move(env_obj, agent_id, target_region, max_tries=500):
         }
 
     for _ in range(max_tries):
-        r = np.random.randint(r_min, r_max)
-        c = np.random.randint(0, W)
+        r = rng.integers(r_min, r_max)
+        c = rng.integers(0, W)
 
         if world.maps.unoccupied[r, c] and world.can_agent_occupy(r, c, agent):
             new_r, new_c = world.set_agent_loc(agent, r, c)
+            new_region = "top" if int(new_r) < split else "bottom"
 
-            if "region" in agent.state:
-                agent.state["region"] = "top" if int(new_r) < split else "bottom"
+            agent.state["location_region"] = new_region
+            agent.state["region"] = new_region
 
             try:
                 cda = env_obj.env.get_component("ContinuousDoubleAuction")
@@ -766,7 +804,7 @@ def force_single_agent_move(env_obj, agent_id, target_region, max_tries=500):
                 "agent": int(agent.idx),
                 "from": (int(old_r), int(old_c)),
                 "to": (int(new_r), int(new_c)),
-                "new_region": agent.state.get("region", target_region),
+                "new_region": new_region,
                 "moved": True,
             }
 
@@ -779,6 +817,7 @@ def generate_paired_baseline_forced_rollouts(
     forced_agent_id=0,
     forced_timestep=200,
     forced_target_region="bottom",
+    forced_move_seed=0,
     explore=False,
 ):
     """
@@ -897,8 +936,10 @@ def generate_paired_baseline_forced_rollouts(
         env_forced,
         agent_id=forced_agent_id,
         target_region=forced_target_region,
+        seed=forced_move_seed,
     )
     move_log["timestep"] = int(forced_timestep)
+    obs_forced = _wrapped_observations(env_forced)
 
     for t in range(forced_timestep + 1, env_forced.env.episode_length):
         actions, agent_states_forced, p_top_state_forced, p_bottom_state_forced = _compute_actions_from_obs(
@@ -959,6 +1000,24 @@ def plot_forced_move_utilities_system(log, window=100):
     first_state = states[0]
     agent_ids = sorted(int(k) for k in first_state.keys() if str(k).isdigit())
     other_agents = [aid for aid in agent_ids if aid != moved_agent]
+    split = None
+    if states and str(moved_agent) in states[0] and "loc" in states[0][str(moved_agent)]:
+        all_rows = [
+            int(agent_state["loc"][0])
+            for state in states
+            for aid, agent_state in state.items()
+            if str(aid).isdigit() and "loc" in agent_state
+        ]
+        if all_rows:
+            split = (max(all_rows) + 1) // 2
+
+    def state_region(agent_state):
+        region = agent_state.get("location_region", agent_state.get("region", None))
+        if region in ["top", "bottom"]:
+            return region
+        if split is not None and "loc" in agent_state:
+            return "top" if int(agent_state["loc"][0]) < split else "bottom"
+        return None
 
     t_start = max(0, t0 - window)
     t_end = min(len(states), t0 + window + 1)
@@ -969,10 +1028,18 @@ def plot_forced_move_utilities_system(log, window=100):
 
         moved_u = states[t][str(moved_agent)].get("utility", np.nan)
 
-        others_u = []
+        others_top_u = []
+        others_bottom_u = []
         for aid in other_agents:
-            others_u.append(states[t][str(aid)].get("utility", np.nan))
-        others_u = np.array(others_u, dtype=float)
+            agent_state = states[t][str(aid)]
+            utility = agent_state.get("utility", np.nan)
+            region = state_region(agent_state)
+            if region == "top":
+                others_top_u.append(utility)
+            elif region == "bottom":
+                others_bottom_u.append(utility)
+        others_top_u = np.array(others_top_u, dtype=float)
+        others_bottom_u = np.array(others_bottom_u, dtype=float)
 
         p_top_arr = np.array(log.get("planner_rewards", {}).get("p_top", []), dtype=float)
         p_bottom_arr = np.array(log.get("planner_rewards", {}).get("p_bottom", []), dtype=float)
@@ -984,7 +1051,8 @@ def plot_forced_move_utilities_system(log, window=100):
             "t": t,
             "relative_t": rel_t,
             "moved_agent_utility": moved_u,
-            "other_agents_avg_utility": float(np.nanmean(others_u)),
+            "other_top_agents_avg_utility": float(np.nanmean(others_top_u)) if len(others_top_u) else np.nan,
+            "other_bottom_agents_avg_utility": float(np.nanmean(others_bottom_u)) if len(others_bottom_u) else np.nan,
             "p_top_reward": p_top_val,
             "p_bottom_reward": p_bottom_val,
         })
@@ -994,7 +1062,8 @@ def plot_forced_move_utilities_system(log, window=100):
     fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
 
     axes[0].plot(df["relative_t"], df["moved_agent_utility"], label="Moved agent utility")
-    axes[0].plot(df["relative_t"], df["other_agents_avg_utility"], label="Other agents avg utility")
+    axes[0].plot(df["relative_t"], df["other_top_agents_avg_utility"], label="Other top agents avg utility")
+    axes[0].plot(df["relative_t"], df["other_bottom_agents_avg_utility"], label="Other bottom agents avg utility")
     axes[0].axvline(0, linestyle="--")
     axes[0].set_title("Agent utility before and after forced move")
     axes[0].set_ylabel("Utility")
@@ -1040,6 +1109,7 @@ def generate_paired_baseline_forced_rollout_batch(
     forced_agent_id=0,
     forced_timestep=200,
     forced_target_region="bottom",
+    forced_move_seed=0,
     explore=False,
     progress=True,
 ):
@@ -1063,6 +1133,7 @@ def generate_paired_baseline_forced_rollout_batch(
             forced_agent_id=forced_agent_id,
             forced_timestep=forced_timestep,
             forced_target_region=forced_target_region,
+            forced_move_seed=forced_move_seed + rollout_id,
             explore=explore,
         )
 

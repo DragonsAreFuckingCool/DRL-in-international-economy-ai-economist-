@@ -11,7 +11,20 @@ import json
 import pickle
 import pandas as pd
 
-from ai_economist.foundation import landmarks, resources
+try:
+    from ai_economist.foundation import landmarks, resources
+except ModuleNotFoundError:
+    class _MissingRegistry:
+        def has(self, key):
+            return False
+
+        def get(self, key):
+            raise ModuleNotFoundError(
+                "ai_economist optional dependencies are needed for map/resource plotting."
+            )
+
+    landmarks = _MissingRegistry()
+    resources = _MissingRegistry()
 
 def numeric_agent_ids_from_states(state_dict):
     """
@@ -20,14 +33,41 @@ def numeric_agent_ids_from_states(state_dict):
     """
     return sorted([int(k) for k in state_dict.keys() if str(k).isdigit()])
 
+def _make_agent_colors(agent_ids):
+    """Stable, unique color per actual agent id; no gray."""
+    agent_ids = sorted([int(a) for a in agent_ids])
 
-def plot_map(maps, locs, ax=None, cmap_order=None, show_water=True):
-    """Universal map renderer that works for live env (Maps) and dense logs (dict).
-    Handles large worlds cleanly and can optionally hide water for debugging.
-    """
-    # Helpers
+    base_colors = [
+        "#1f77b4",  # blue
+        "#ff7f0e",  # orange
+        "#2ca02c",  # green
+        "#17becf",  # cyan, replacing default tab10 red slot
+        "#9467bd",  # purple
+        "#8c564b",  # brown
+        "#e377c2",  # pink
+        "#d62728",  # red, replacing the default gray slot
+        "#bcbd22",  # olive
+        "#aec7e8",  # light blue
+        "#ffbb78",  # light orange
+        "#98df8a",  # light green
+        "#c5b0d5",  # light purple
+        "#c49c94",  # light brown
+        "#f7b6d2",  # light pink
+        "#9edae5",  # light cyan
+    ]
+
+    return {
+        aid: base_colors[i % len(base_colors)]
+        for i, aid in enumerate(agent_ids)
+    }
+
+
+
+def plot_map(maps, locs, ax=None, cmap_order=None, show_water=True, agent_ids=None, agent_colors=None, house_alpha=0.35):
+    import matplotlib.colors as mcolors
+
+    """Universal map renderer with stable per-agent colors and owned houses tinted by builder."""
     def _map_keys(m):
-        # Both Maps and dict expose .keys()
         return list(m.keys()) if hasattr(m, "keys") else []
 
     def _map_get(m, key, default=None):
@@ -40,34 +80,52 @@ def plot_map(maps, locs, ax=None, cmap_order=None, show_water=True):
     if not keys:
         raise ValueError("plot_map: No map keys found to infer world size.")
 
-    # Pick any entity to infer world size
-    example_map = _map_get(maps, keys[0])
-    world_size = np.array(example_map).shape
+    world_size = None
+    for key in keys:
+        arr = _map_get(maps, key)
+        if isinstance(arr, dict):
+            if "health" in arr:
+                world_size = np.array(arr["health"]).shape
+                break
+        else:
+            a = np.array(arr)
+            if a.ndim == 2:
+                world_size = a.shape
+                break
+
+    if world_size is None:
+        raise ValueError("plot_map: Could not infer world size.")
 
     if ax is None:
-        _, ax = plt.subplots(1, 1, figsize=(min(0.4*world_size[1], 16), min(0.4*world_size[0], 16)))
+        _, ax = plt.subplots(1, 1, figsize=(min(0.4 * world_size[1], 16), min(0.4 * world_size[0], 16)))
     else:
         ax.cla()
 
-    tmp = np.zeros((3, world_size[0], world_size[1]), dtype=float)
     n_agents = len(locs)
-    cmap = plt.get_cmap("jet", n_agents)
+    if agent_ids is None:
+        agent_ids = list(range(n_agents))
+    agent_ids = [int(a) for a in agent_ids]
 
     if cmap_order is None:
         cmap_order = list(range(n_agents))
 
-    # Dynamically draw all non-source entities
+    if agent_colors is None:
+        agent_colors = _make_agent_colors(agent_ids)
+
+    tmp = np.zeros((3, world_size[0], world_size[1]), dtype=float)
+
+    # Draw resources and non-house landmarks.
     for key in keys:
-        if key is None:
+        if key is None or "source" in str(key).lower():
             continue
-        if "source" in str(key).lower():
+
+        if str(key) == "House":
             continue
 
         arr = _map_get(maps, key)
         if arr is None:
             continue
 
-        # Skip water if we don't want to show it
         if not show_water and str(key).lower() == "water":
             continue
 
@@ -79,42 +137,52 @@ def plot_map(maps, locs, ax=None, cmap_order=None, show_water=True):
 
         elif landmarks.has(key):
             ldef = landmarks.get(key)
-            a = np.array(arr)
-            if a.ndim == 2:
-                tmp += ldef.color[:, None, None] * a[None].astype(float)
-            elif isinstance(arr, dict):  # e.g., House in logs
+            if isinstance(arr, dict):
                 health = np.array(arr.get("health", np.zeros(world_size)), dtype=float)
                 tmp += ldef.color[:, None, None] * health[None]
+            else:
+                a = np.array(arr)
+                if a.ndim == 2:
+                    tmp += ldef.color[:, None, None] * a[None].astype(float)
 
-    # Agent-owned houses with per-agent colors
+    # Draw houses in the same color as the builder, but lighter / less opaque.
     if "House" in keys:
         house = _map_get(maps, "House")
+
         if isinstance(house, dict):
-            house_idx = np.array(house.get("owner", np.zeros(world_size)), dtype=int)
+            house_owner = np.array(house.get("owner", -np.ones(world_size)), dtype=int)
             house_health = np.array(house.get("health", np.zeros(world_size)), dtype=float)
         else:
-            h = np.array(house, dtype=float)
-            house_idx = np.zeros_like(h, dtype=int)
-            house_health = h
+            house_health = np.array(house, dtype=float)
+            house_owner = -np.ones_like(house_health, dtype=int)
 
-        for i in range(n_agents):
-            houses = (house_idx == cmap_order[i]) * house_health
-            col = np.array(cmap(i)[:3])
-            tmp += col[:, None, None] * houses[None]
+        for aid in agent_ids:
+            mask = (house_owner == aid) & (house_health > 0)
+            if not np.any(mask):
+                continue
 
-    # brighten + clip
+            base = np.array(mcolors.to_rgb(agent_colors[aid]), dtype=float)
+            light = (1.0 - house_alpha) * np.ones(3) + house_alpha * base
+            tmp[:, mask] = light[:, None]
+
+        # Fallback for old logs without owner info.
+        unowned = (house_owner < 0) & (house_health > 0)
+        if np.any(unowned):
+            tmp[:, unowned] = np.array([0.85, 0.85, 0.85])[:, None]
+
     tmp = 0.7 * tmp + 0.3
     tmp = np.transpose(np.minimum(tmp, 1.0), [1, 2, 0])
 
-    im = ax.imshow(tmp, vmax=1.0, interpolation='nearest')  # keep grid crisp
-    ax.set_aspect('equal')  # no stretching
+    im = ax.imshow(tmp, vmax=1.0, interpolation="nearest")
+    ax.set_aspect("equal")
 
-    # Agent markers scale with axes size, not world size
     bbox = ax.get_window_extent().transformed(ax.figure.dpi_scale_trans.inverted())
     pix_h = bbox.height * ax.figure.dpi
-    for i in range(n_agents):
-        r, c = locs[cmap_order[i]]
-        col = np.array(cmap(i)[:3])
+
+    for pos in cmap_order:
+        aid = agent_ids[pos]
+        r, c = locs[pos]
+        col = agent_colors[aid]
         ax.plot(c, r, "o", markersize=max(4, pix_h * 0.03), color="w")
         ax.plot(c, r, "*", markersize=max(3, pix_h * 0.02), color=col)
 
@@ -137,28 +205,20 @@ def plot_env_state(env, ax=None, remap_key=None):
 
     plot_map(maps, locs, ax, cmap_order)
 
-def plot_log_state(dense_log, t, ax=None, remap_key=None):
+def plot_log_state(dense_log, t, ax=None, remap_key=None, agent_colors=None):
     maps = dense_log["world"][t]
     states = dense_log["states"][t]
 
-    # --- MULTI-PLANNER SAFE: only numeric agent ids ---
     agent_ids = numeric_agent_ids_from_states(states)
-    n_agents = len(agent_ids)
-
-    # Agent locations in the order of agent_ids
     locs = [states[str(i)]["loc"] for i in agent_ids]
 
-    # Build color order (optional remap)
     if remap_key is None:
-        # No remap: keep the agent_ids’ order; colormap expects 0..n_agents-1 positions
         cmap_order = None
     else:
-        assert isinstance(remap_key, str)
         key_val = np.array([dense_log["states"][0][str(i)][remap_key] for i in agent_ids])
-        # Order refers to positions within the current agent_ids array
         cmap_order = np.argsort(key_val).tolist()
 
-    plot_map(maps, locs, ax, cmap_order)
+    plot_map(maps, locs, ax, cmap_order, agent_ids=agent_ids, agent_colors=agent_colors)
 
 
 
@@ -178,7 +238,8 @@ def _format_logs_and_eps(dense_logs, eps):
         raise NotImplementedError
 
 
-def vis_world_array(dense_logs, ts, eps=None, axes=None, remap_key=None):
+
+def vis_world_array(dense_logs, ts, eps=None, axes=None, remap_key=None, agent_colors=None):
     dense_logs, eps = _format_logs_and_eps(dense_logs, eps)
     if isinstance(ts, (int, float)):
         ts = [ts]
@@ -190,22 +251,16 @@ def vis_world_array(dense_logs, ts, eps=None, axes=None, remap_key=None):
             figsize=(np.minimum(3.2 * len(ts), 16), 3 * len(eps)),
             squeeze=False,
         )
-
     else:
         fig = None
-
         if len(ts) == 1 and len(eps) == 1:
             axes = np.array([[axes]]).reshape(1, 1)
         else:
-            try:
-                axes = np.array(axes).reshape(len(eps), len(ts))
-            except ValueError:
-                print("Could not reshape provided axes array into the necessary shape!")
-                raise
+            axes = np.array(axes).reshape(len(eps), len(ts))
 
     for ti, t in enumerate(ts):
         for ei, ep in enumerate(eps):
-            plot_log_state(dense_logs[ep], t, ax=axes[ei, ti], remap_key=remap_key)
+            plot_log_state(dense_logs[ep], t, ax=axes[ei, ti], remap_key=remap_key, agent_colors=agent_colors)
 
     for ax, t in zip(axes[0], ts):
         ax.set_title("T = {}".format(t))
@@ -215,15 +270,15 @@ def vis_world_array(dense_logs, ts, eps=None, axes=None, remap_key=None):
     return fig
 
 
-def vis_world_range(
-    dense_logs, t0=0, tN=None, N=5, eps=None, axes=None, remap_key=None
-):
+
+
+def vis_world_range(dense_logs, t0=0, tN=None, N=5, eps=None, axes=None, remap_key=None, agent_colors=None):
     dense_logs, eps = _format_logs_and_eps(dense_logs, eps)
 
     viable_ts = np.array([i for i, w in enumerate(dense_logs[0]["world"]) if w])
     if tN is None:
         tN = viable_ts[-1]
-    assert 0 <= t0 < tN
+
     target_ts = np.linspace(t0, tN, N).astype(np.int32)
 
     ts = set()
@@ -231,10 +286,11 @@ def vis_world_range(
         closest = np.argmin(np.abs(tt - viable_ts))
         ts.add(viable_ts[closest])
     ts = sorted(list(ts))
+
     if axes is not None:
         axes = axes[: len(ts)]
-    return vis_world_array(dense_logs, ts, axes=axes, eps=eps, remap_key=remap_key)
 
+    return vis_world_array(dense_logs, ts, axes=axes, eps=eps, remap_key=remap_key, agent_colors=agent_colors)
 
 def vis_builds(dense_logs, eps=None, ax=None):
     dense_logs, eps = _format_logs_and_eps(dense_logs, eps)
@@ -508,25 +564,27 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
     """
     Like breakdown(...), but:
       - shows ALL mobile agents
-      - uses up to n_cols columns
+      - uses stable, unique colors per actual agent id
+      - colors houses as lighter versions of the builder's agent color
       - marks travel as lower-opacity movement
-      - defines travel simply as crossing the middle divider
-      - avoids shadow lines by plotting each step separately
     """
     import math
     import numpy as np
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
 
-    # Snapshot montage figure
-    fig0 = vis_world_range(log, remap_key=remap_key)
-
-    # --- Only numeric mobile agents ---
     agent_ids = numeric_agent_ids_from_states(log["states"][0])
     n = len(agent_ids)
     trading_active = "Trade" in log
 
-    # Agent ordering
+    agent_colors = _make_agent_colors(agent_ids)
+
+    fig0 = vis_world_range(
+        log,
+        remap_key=remap_key,
+        agent_colors=agent_colors,
+    )
+
     if remap_key is None:
         aidx = agent_ids[:]
     else:
@@ -534,16 +592,15 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
         order = np.argsort(key_vals).tolist()
         aidx = [agent_ids[j] for j in order]
 
-    # Labels with skill-rank annotation
     rank_labels = []
     build_payment = {}
-    gather_mults = {}
+    #gather_mults = {}
 
     for aid in aidx:
         s = log["states"][0][str(aid)]
         build_payment[aid] = s.get("build_payment", np.nan)
-        p = s.get("bonus_gather_prob", np.nan)
-        gather_mults[aid] = 1.0 + p if np.isfinite(p) else np.nan
+        #p = s.get("bonus_gather_prob", np.nan)
+        #gather_mults[aid] = 1.0 + p if np.isfinite(p) else np.nan
 
     finite_skills = sorted({v for v in build_payment.values() if np.isfinite(v)})
     skill_rank = {v: i for i, v in enumerate(finite_skills)}
@@ -552,7 +609,7 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
     lowest_skill = np.nanmin(skill_vals)
     highest_skill = np.nanmax(skill_vals)
 
-    for i, aid in enumerate(aidx):
+    for aid in aidx:
         base = f"Agent {aid}"
         build = build_payment.get(aid, np.nan)
 
@@ -561,11 +618,12 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
         elif np.isfinite(build) and np.isclose(build, highest_skill):
             base += " (Highest Skill)"
 
-        gather = gather_mults.get(aid, np.nan)
         rank = skill_rank.get(build, np.nan)
         rank_text = f"Skill level {rank + 1}/{len(finite_skills)}" if np.isfinite(rank) else "Skill level ?"
-        skill_line = f"\n{rank_text} | Build: {build:.2f} | Gather: {gather:.2f}"
+        skill_line = f"\n{rank_text} | Build: {build:.2f}"
         rank_labels.append(base + skill_line)
+
+
 
     # --- Collect builds over time ---
     all_builds = []
@@ -634,12 +692,12 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
     report(c_trades, all_builds, n, aidx)
 
     # --- Time series plots: resources + labor + utility ---
-    cmap = plt.get_cmap("jet", max(1, len(finite_skills)))
-    agent_colors = {}
-    for aid in aidx:
-        build = build_payment.get(aid, np.nan)
-        rank = skill_rank.get(build, 0)
-        agent_colors[aid] = cmap(rank)
+    # cmap = plt.get_cmap("jet", max(1, len(finite_skills)))
+    # agent_colors = {}
+    # for aid in aidx:
+    #     build = build_payment.get(aid, np.nan)
+    #     rank = skill_rank.get(build, 0)
+    #     agent_colors[aid] = cmap(rank)
     rs = ["Wood", "Stone", "Coin"]
 
     fig1, axes = plt.subplots(1, len(rs) + 2, figsize=(22, 4), sharey=False)
@@ -854,7 +912,11 @@ def breakdown_all_agents(log, remap_key="build_payment", n_cols=4):
 #----------------------------------------
 import numpy as np
 import matplotlib.pyplot as plt
-from simulation import get_disc_rates
+try:
+    from simulation import get_disc_rates
+except ModuleNotFoundError:
+    def get_disc_rates(env_obj=None):
+        return np.arange(0.0, 1.0 + 1e-9, 0.05)
 
 def plot_avg_final_tax_schedules_two_planners_from_dense_logs(
     dense_logs,
@@ -1963,11 +2025,25 @@ def compare_summary_bars(
     if metrics is None:
         metrics = [
             "mean_final_coin",
-            "std_final_coin",
+            "gini_final_coin",
             "mean_final_labor",
             "n_trades",
             "n_builds",
         ]
+
+    def gini(values):
+        values = np.asarray(values, dtype=float)
+        values = values[np.isfinite(values)]
+        if len(values) == 0:
+            return np.nan
+        if np.any(values < 0):
+            values = values - np.min(values)
+        total = np.sum(values)
+        if total <= 0:
+            return 0.0
+        values = np.sort(values)
+        n = len(values)
+        return float((2 * np.sum((np.arange(1, n + 1) * values))) / (n * total) - (n + 1) / n)
 
     def summarize_one_dense_log(log):
         states = log["states"]
@@ -2001,6 +2077,7 @@ def compare_summary_bars(
         return {
             "mean_final_coin": float(np.mean(final_coin)) if final_coin else np.nan,
             "std_final_coin": float(np.std(final_coin)) if final_coin else np.nan,
+            "gini_final_coin": gini(final_coin),
             "mean_final_labor": float(np.mean(final_labor)) if final_labor else np.nan,
             "n_trades": float(n_trades),
             "n_builds": float(n_builds),
@@ -2029,8 +2106,6 @@ def compare_summary_bars(
     summary_df = pd.DataFrame(
         [{"name": r["name"], **r["summary"]} for r in runs]
     ).set_index("name")
-
-    metrics = [m for m in metrics if m in summary_df.columns]
     run_names = list(summary_df.index)
 
     if short_labels is None:
@@ -2050,6 +2125,7 @@ def compare_summary_bars(
 
     # Compute episode-level metric variability for each run
     err_lookup = {name: {} for name in run_names}
+    dense_summary_lookup = {}
 
     for run in runs:
         run_name = run["name"]
@@ -2075,6 +2151,7 @@ def compare_summary_bars(
             continue
 
         ep_df = pd.DataFrame(ep_rows)
+        dense_summary_lookup[run_name] = ep_df.mean(numeric_only=True).to_dict()
 
         for metric in metrics:
             if metric not in ep_df.columns:
@@ -2091,30 +2168,48 @@ def compare_summary_bars(
             else:
                 err_lookup[run_name][metric] = np.nan
 
-    fig, axes = plt.subplots(len(metrics), 1, figsize=(9, 3 * len(metrics)), squeeze=False)
+    for metric in metrics:
+        if metric not in summary_df.columns:
+            summary_df[metric] = np.nan
+        for run_name in run_names:
+            if pd.isna(summary_df.at[run_name, metric]):
+                summary_df.at[run_name, metric] = dense_summary_lookup.get(run_name, {}).get(metric, np.nan)
 
-    for i, metric in enumerate(metrics):
-        ax = axes[i, 0]
+    metrics = [m for m in metrics if m in summary_df.columns and summary_df[m].notna().any()]
 
-        vals = summary_df[metric]
-        x = np.arange(len(vals))
-        yerr = np.array([err_lookup[name].get(metric, np.nan) for name in vals.index], dtype=float)
+    fig_width = max(8, 1.25 * len(metrics))
+    fig, ax = plt.subplots(1, 1, figsize=(fig_width, 4.8), constrained_layout=False)
+
+    x = np.arange(len(metrics))
+    group_width = 0.62
+    bar_width = group_width / max(1, len(run_names))
+    offsets = (np.arange(len(run_names)) - (len(run_names) - 1) / 2) * bar_width
+
+    for run_i, name in enumerate(run_names):
+        vals = summary_df.loc[name, metrics].to_numpy(dtype=float)
+        yerr = np.array(
+            [err_lookup[name].get(metric, np.nan) for metric in metrics],
+            dtype=float,
+        )
+        yerr = np.where(np.isfinite(yerr), yerr, 0.0)
 
         ax.bar(
-            x,
-            vals.values,
-            color=[colors[name] for name in vals.index],
-            width=0.6,
+            x + offsets[run_i],
+            vals,
+            color=colors[name],
+            width=bar_width * 0.82,
             alpha=0.9,
             yerr=None if errorbar is None else yerr,
-            capsize=5 if errorbar is not None else 0,
+            capsize=3 if errorbar is not None else 0,
             ecolor="black",
+            linewidth=0,
+            label=short_labels[name],
         )
 
-        ax.set_title(metric.replace("_", " ").title())
-        ax.set_xticks(x)
-        ax.set_xticklabels([short_labels[name] for name in vals.index])
-        ax.grid(True, axis="y", alpha=0.3)
+    ax.set_title("Summary Metrics")
+    ax.set_xticks(x)
+    ax.set_xticklabels([metric.replace("_", " ").title() for metric in metrics], rotation=20, ha="right")
+    ax.grid(True, axis="y", alpha=0.3)
 
     if show_legend:
         legend_handles = [
@@ -2125,13 +2220,13 @@ def compare_summary_bars(
         fig.legend(
             handles=legend_handles,
             loc="lower center",
-            bbox_to_anchor=(0.5, 0.02),
-            ncol=min(3, len(run_names)),
+            bbox_to_anchor=(0.5, 0.01),
+            ncol=min(len(run_names), 6),
             frameon=True,
             fontsize=10,
         )
 
-        fig.subplots_adjust(bottom=0.15, top=0.95)
+        fig.subplots_adjust(bottom=0.28, top=0.90, left=0.08, right=0.98)
     else:
         fig.tight_layout()
 
@@ -2295,6 +2390,1073 @@ def compare_trade_dynamics(
         fig.tight_layout()
 
     return fig
+
+def extract_market_size_price_trade_over_time(log, resources=("Wood", "Stone")):
+    """
+    Build timestep-level market diagnostics from a dense log.
+
+    Market size is the total amount of the selected resources currently in
+    escrow. Prices and trade activity are taken from executed trades.
+    """
+    import numpy as np
+    import pandas as pd
+
+    n_steps = max(len(log.get("states", [])), len(log.get("Trade", [])))
+    rows = []
+
+    for t in range(n_steps):
+        state = log["states"][t] if t < len(log.get("states", [])) else {}
+        trades_t = []
+        if t < len(log.get("Trade", [])):
+            raw_trades = log["Trade"][t]
+            trades_t = raw_trades.get("trades", []) if isinstance(raw_trades, dict) else raw_trades
+
+        agents = [k for k in state.keys() if str(k).isdigit()]
+        market_size = 0.0
+        for aid in agents:
+            agent_state = state[str(aid)]
+            escrow = agent_state.get("escrow", {})
+            market_size += sum(float(escrow.get(r, 0.0)) for r in resources)
+
+        resource_trades = [
+            tr for tr in trades_t
+            if isinstance(tr, dict) and tr.get("commodity") in resources
+        ]
+        prices = [float(tr["price"]) for tr in resource_trades if "price" in tr]
+
+        row = {
+            "timestep": t,
+            "market_size": market_size,
+            "mean_price": np.nan if len(prices) == 0 else float(np.mean(prices)),
+            "trade_count": len(resource_trades),
+        }
+
+        for resource in resources:
+            trades_r = [tr for tr in resource_trades if tr.get("commodity") == resource]
+            prices_r = [float(tr["price"]) for tr in trades_r if "price" in tr]
+            row[f"{resource.lower()}_price"] = (
+                np.nan if len(prices_r) == 0 else float(np.mean(prices_r))
+            )
+            row[f"{resource.lower()}_trades"] = len(trades_r)
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+def compare_market_size_prices_trade_activity(
+    runs,
+    short_labels=None,
+    resources=("Wood", "Stone"),
+    mode="single",
+    smooth_window=1,
+    price_fill_method="interpolate",
+    show_legend=True,
+    figsize=(12, 10),
+):
+    """
+    Compare market size, transaction prices, and trade activity across runs.
+
+    Parameters mirror the other comparison helpers: pass a list of loaded runs,
+    optionally slice it first (for example, runs[:2]).
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    def extract_episode_logs(obj):
+        if obj is None:
+            return []
+        if isinstance(obj, dict) and ("states" in obj or "Trade" in obj):
+            return [obj]
+        if isinstance(obj, dict):
+            return [
+                v for v in obj.values()
+                if isinstance(v, dict) and ("states" in v or "Trade" in v)
+            ]
+        if isinstance(obj, list):
+            return [
+                v for v in obj
+                if isinstance(v, dict) and ("states" in v or "Trade" in v)
+            ]
+        return []
+
+    def smooth_series(series, window):
+        if window <= 1:
+            return series
+        return series.rolling(window=window, min_periods=1, center=True).mean()
+
+    def display_price_series(series):
+        if price_fill_method is None:
+            out = series
+        elif price_fill_method == "interpolate":
+            out = series.interpolate(limit_direction="both")
+        elif price_fill_method == "ffill":
+            out = series.ffill().bfill()
+        else:
+            raise ValueError("price_fill_method must be None, 'interpolate', or 'ffill'")
+        return smooth_series(out, smooth_window)
+
+    def mean_frame(frames):
+        min_len = min(len(df) for df in frames)
+        aligned = [df.iloc[:min_len].reset_index(drop=True) for df in frames]
+        numeric_cols = aligned[0].select_dtypes(include=[np.number]).columns
+        stacked = np.stack([df[numeric_cols].to_numpy(dtype=float) for df in aligned])
+        valid = np.sum(np.isfinite(stacked), axis=0)
+        sums = np.nansum(stacked, axis=0)
+        means = np.full_like(sums, np.nan, dtype=float)
+        np.divide(sums, valid, out=means, where=valid > 0)
+        out = pd.DataFrame(means, columns=numeric_cols)
+        out["timestep"] = np.arange(min_len)
+        return out
+
+    run_names = [run["name"] for run in runs]
+    if short_labels is None:
+        short_labels = {name: f"Run {i + 1}" for i, name in enumerate(run_names)}
+    elif isinstance(short_labels, list):
+        short_labels = {name: short_labels[i] for i, name in enumerate(run_names)}
+
+    colors_list = [
+        "#1f77b4", "#d62728", "#2ca02c", "#9467bd",
+        "#ff7f0e", "#8c564b", "#e377c2", "#17becf"
+    ]
+    colors = {name: colors_list[i % len(colors_list)] for i, name in enumerate(run_names)}
+
+    fig, axes = plt.subplots(3, 1, figsize=figsize, sharex=True)
+    out_frames = []
+
+    for run in runs:
+        name = run["name"]
+        label = short_labels[name]
+
+        if mode == "single":
+            log = run.get("dense_log", None)
+            if log is None:
+                eps = extract_episode_logs(run.get("dense_logs", None))
+                log = eps[0] if len(eps) > 0 else None
+            if log is None:
+                continue
+            df = extract_market_size_price_trade_over_time(log, resources=resources)
+
+        elif mode == "average":
+            eps = extract_episode_logs(run.get("dense_logs", None))
+            if len(eps) == 0 and run.get("dense_log", None) is not None:
+                eps = [run["dense_log"]]
+            frames = [
+                extract_market_size_price_trade_over_time(ep, resources=resources)
+                for ep in eps
+            ]
+            frames = [df for df in frames if not df.empty]
+            if len(frames) == 0:
+                continue
+            df = mean_frame(frames)
+
+        else:
+            raise ValueError("mode must be 'single' or 'average'")
+
+        df = df.copy()
+        df["run"] = name
+        df["label"] = label
+        out_frames.append(df)
+
+        x = df["timestep"]
+        color = colors[name]
+
+        axes[0].plot(
+            x,
+            smooth_series(df["market_size"], smooth_window),
+            color=color,
+            linewidth=2.2,
+            label=label,
+        )
+        axes[1].plot(
+            x,
+            display_price_series(df["mean_price"]),
+            color=color,
+            linewidth=2.2,
+            label=label,
+        )
+        axes[2].plot(
+            x,
+            smooth_series(df["trade_count"], smooth_window),
+            color=color,
+            linewidth=2.2,
+            label=label,
+        )
+
+    title_suffix = "Single Rollout" if mode == "single" else "Mean Across Dense Logs"
+    axes[0].set_title(f"Market Size: Escrowed Resources ({title_suffix})")
+    axes[0].set_ylabel("Escrowed Wood + Stone")
+    axes[1].set_title("Average Transaction Price")
+    axes[1].set_ylabel("Price")
+    axes[2].set_title("Trade Activity")
+    axes[2].set_ylabel("Trades")
+    axes[2].set_xlabel("Timestep")
+
+    for ax in axes:
+        ax.grid(True, alpha=0.3)
+
+    if show_legend:
+        axes[0].legend(loc="best", frameon=True)
+
+    fig.tight_layout()
+    out_df = pd.concat(out_frames, ignore_index=True) if out_frames else pd.DataFrame()
+    return fig, out_df
+
+def extract_trade_region_distribution(log, volume_field="price"):
+    """
+    Summarize traded volume by whether the buyer and seller are in the same region.
+
+    Volume defaults to the executed trade price, which is the coin value of a
+    one-unit Wood/Stone trade in these logs.
+    """
+    import numpy as np
+    import pandas as pd
+
+    states = log.get("states", [])
+    waterline = _infer_waterline(log)
+    rows = []
+
+    for t, item in enumerate(log.get("Trade", [])):
+        trades = item.get("trades", []) if isinstance(item, dict) else item
+        if not isinstance(trades, list):
+            continue
+
+        state_t = states[min(t, len(states) - 1)] if states else {}
+
+        for trade in trades:
+            if not isinstance(trade, dict):
+                continue
+
+            buyer = trade.get("buyer")
+            seller = trade.get("seller")
+            buyer_region = None
+            seller_region = None
+
+            if buyer is not None and str(buyer) in state_t:
+                buyer_region = _location_region_from_state(
+                    state_t[str(buyer)], waterline=waterline
+                )
+            if seller is not None and str(seller) in state_t:
+                seller_region = _location_region_from_state(
+                    state_t[str(seller)], waterline=waterline
+                )
+
+            if "cross_region" in trade:
+                is_cross = bool(trade.get("cross_region", False))
+            else:
+                is_cross = (
+                    buyer_region is not None
+                    and seller_region is not None
+                    and buyer_region != seller_region
+                )
+
+            if is_cross and buyer_region is not None and seller_region is not None:
+                route_type = "cross region"
+                route = f"{seller_region} to {buyer_region}"
+            elif is_cross:
+                trade_region = trade.get("region", "unknown")
+                route_type = "cross region"
+                route = f"cross region: {trade_region}"
+            elif buyer_region is not None:
+                route_type = "within region"
+                route = f"within {buyer_region}"
+            else:
+                trade_region = trade.get("region", "unknown")
+                route_type = "within region"
+                route = f"within {trade_region}"
+
+            rows.append({
+                "timestep": t,
+                "route_type": route_type,
+                "route": route,
+                "commodity": trade.get("commodity", "unknown"),
+                "units": float(trade.get("quantity", 1.0)),
+                "volume": float(trade.get(volume_field, trade.get("price", 1.0))),
+                "price": float(trade.get("price", np.nan)),
+                "buyer_cost": float(trade.get("cost", trade.get("price", np.nan))),
+                "tariff": float(trade.get("tariff", 0.0)),
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "timestep", "route_type", "route", "commodity", "units", "volume",
+            "price", "buyer_cost", "tariff"
+        ])
+
+    return pd.DataFrame(rows)
+
+def extract_planner_redistribution_table(log, period=100, rate_disc=0.05):
+    """
+    Summarize each planner region's redistribution and income-tax contribution.
+
+    The saved ``PeriodicTax`` log can contain only one regional tax component, so
+    this reconstructs both planners from planner actions, period incomes, and
+    the tax bracket cutoffs. ``redistributed`` is income tax plus any logged
+    trade-tariff revenue for that region.
+    """
+    import numpy as np
+    import pandas as pd
+
+    waterline = _infer_waterline(log)
+    aids = _numeric_agent_ids(log)
+    planner_region_by_agent = {
+        aid: _planner_region_from_initial_state(log, aid, waterline=waterline)
+        for aid in aids
+    }
+    planner_id_by_region = {"top": "p_top", "bottom": "p_bottom"}
+
+    cutoffs = None
+    for item in log.get("PeriodicTax", []):
+        if isinstance(item, dict) and "cutoffs" in item:
+            cutoffs = np.asarray(item["cutoffs"], dtype=float)
+            break
+    if cutoffs is None:
+        cutoffs = np.asarray([0.0, 9.7, 39.475, 84.2, 160.725, 204.1, 510.3], dtype=float)
+
+    schedules_by_period = _all_current_planner_schedules_from_actions(
+        log,
+        period=period,
+        rate_disc=rate_disc,
+        cutoffs=cutoffs,
+    )
+
+    rows = []
+    states = log.get("states", [])
+    tax_days = list(range(period - 1, max(0, len(states) - 1), period))
+    prev_t = 0
+
+    for tax_period, tax_t in enumerate(tax_days, start=1):
+        schedules = schedules_by_period.get(tax_period, {})
+        state_prev = states[prev_t]
+        state_tax = states[tax_t]
+
+        start_t = 0 if tax_period == 1 else prev_t + 1
+        tariff_by_region = {"top": 0.0, "bottom": 0.0}
+        for trade_t in range(start_t, tax_t + 1):
+            if trade_t >= len(log.get("Trade", [])):
+                continue
+            item = log["Trade"][trade_t]
+            trades = item.get("trades", []) if isinstance(item, dict) else item
+            if not isinstance(trades, list):
+                continue
+            state_trade = states[min(trade_t, len(states) - 1)]
+            for trade in trades:
+                buyer = trade.get("buyer")
+                if buyer is not None and str(buyer) in state_trade:
+                    region = _location_region_from_state(
+                        state_trade[str(buyer)], waterline=waterline
+                    )
+                else:
+                    region = trade.get("region")
+                if region in tariff_by_region:
+                    tariff_by_region[region] += float(trade.get("tariff", 0.0) or 0.0)
+
+        for region, planner_id in planner_id_by_region.items():
+            schedule = schedules.get(planner_id, np.zeros(len(cutoffs), dtype=float))
+            region_aids = [
+                aid for aid in aids
+                if planner_region_by_agent[aid] == region
+            ]
+
+            income_total = 0.0
+            income_tax_total = 0.0
+            for aid in region_aids:
+                income = _coin(state_tax[str(aid)]) - _coin(state_prev[str(aid)])
+                income_total += float(income)
+                tax_due = _tax_due_for_schedule(income, schedule, cutoffs)
+                inventory_coin = float(
+                    state_tax[str(aid)].get("inventory", {}).get("Coin", 0.0)
+                )
+                income_tax_total += float(np.minimum(inventory_coin, tax_due))
+
+            redistributed = income_tax_total + tariff_by_region[region]
+            rows.append({
+                "timestep": tax_t,
+                "tax_period": tax_period,
+                "planner_region": region,
+                "income": income_total,
+                "income_tax_collected": income_tax_total,
+                "tariff_revenue": tariff_by_region[region],
+                "redistributed": redistributed,
+                "n_agents": len(region_aids),
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "planner_region", "income_tax_collected", "redistributed",
+            "non_income_tax_redistribution"
+        ])
+
+    df_agent = pd.DataFrame(rows)
+    df = (
+        df_agent
+        .groupby("planner_region", as_index=False)
+        .agg(
+            income=("income", "sum"),
+            income_tax_collected=("income_tax_collected", "sum"),
+            tariff_revenue=("tariff_revenue", "sum"),
+            redistributed=("redistributed", "sum"),
+            n_agents=("n_agents", "max"),
+        )
+    )
+    df["income_tax_funded_redistribution"] = df["income_tax_collected"]
+    df["non_income_tax_redistribution"] = (
+        df["redistributed"] - df["income_tax_funded_redistribution"]
+    ).clip(lower=0.0)
+
+    return df
+
+def extract_planner_redistribution_by_period(log, period=100, rate_disc=0.05):
+    """Return planner redistribution and income-tax contribution by tax period."""
+    import numpy as np
+    import pandas as pd
+
+    waterline = _infer_waterline(log)
+    aids = _numeric_agent_ids(log)
+    planner_region_by_agent = {
+        aid: _planner_region_from_initial_state(log, aid, waterline=waterline)
+        for aid in aids
+    }
+    planner_id_by_region = {"top": "p_top", "bottom": "p_bottom"}
+
+    cutoffs = None
+    for item in log.get("PeriodicTax", []):
+        if isinstance(item, dict) and "cutoffs" in item:
+            cutoffs = np.asarray(item["cutoffs"], dtype=float)
+            break
+    if cutoffs is None:
+        cutoffs = np.asarray([0.0, 9.7, 39.475, 84.2, 160.725, 204.1, 510.3], dtype=float)
+
+    schedules_by_period = _all_current_planner_schedules_from_actions(
+        log,
+        period=period,
+        rate_disc=rate_disc,
+        cutoffs=cutoffs,
+    )
+
+    states = log.get("states", [])
+    tax_days = list(range(period - 1, max(0, len(states) - 1), period))
+    prev_t = 0
+    rows = []
+
+    for tax_period, tax_t in enumerate(tax_days, start=1):
+        schedules = schedules_by_period.get(tax_period, {})
+        state_prev = states[prev_t]
+        state_tax = states[tax_t]
+        start_t = 0 if tax_period == 1 else prev_t + 1
+
+        tariff_by_region = {"top": 0.0, "bottom": 0.0}
+        for trade_t in range(start_t, tax_t + 1):
+            if trade_t >= len(log.get("Trade", [])):
+                continue
+            item = log["Trade"][trade_t]
+            trades = item.get("trades", []) if isinstance(item, dict) else item
+            if not isinstance(trades, list):
+                continue
+            state_trade = states[min(trade_t, len(states) - 1)]
+            for trade in trades:
+                buyer = trade.get("buyer")
+                if buyer is not None and str(buyer) in state_trade:
+                    region = _location_region_from_state(
+                        state_trade[str(buyer)], waterline=waterline
+                    )
+                else:
+                    region = trade.get("region")
+                if region in tariff_by_region:
+                    tariff_by_region[region] += float(trade.get("tariff", 0.0) or 0.0)
+
+        for region, planner_id in planner_id_by_region.items():
+            schedule = schedules.get(planner_id, np.zeros(len(cutoffs), dtype=float))
+            region_aids = [
+                aid for aid in aids
+                if planner_region_by_agent[aid] == region
+            ]
+
+            income_total = 0.0
+            income_tax_total = 0.0
+            for aid in region_aids:
+                income = _coin(state_tax[str(aid)]) - _coin(state_prev[str(aid)])
+                income_total += float(income)
+                tax_due = _tax_due_for_schedule(income, schedule, cutoffs)
+                inventory_coin = float(
+                    state_tax[str(aid)].get("inventory", {}).get("Coin", 0.0)
+                )
+                income_tax_total += float(np.minimum(inventory_coin, tax_due))
+
+            redistributed = income_tax_total + tariff_by_region[region]
+            rows.append({
+                "tax_period": tax_period,
+                "timestep": tax_t,
+                "planner_region": region,
+                "income": income_total,
+                "income_tax_collected": income_tax_total,
+                "tariff_revenue": tariff_by_region[region],
+                "redistributed": redistributed,
+                "income_tax_funded_redistribution": income_tax_total,
+                "non_income_tax_redistribution": max(0.0, redistributed - income_tax_total),
+                "n_agents": len(region_aids),
+            })
+
+        prev_t = tax_t
+
+    return pd.DataFrame(rows)
+
+def plot_trade_enabled_run_trade_and_redistribution(
+    run,
+    mode="single",
+    period=100,
+    rate_disc=0.05,
+    dense_log_key=None,
+    figsize=(14, 10),
+):
+    """
+    Plot one trade-enabled run, either one dense log or the average across logs.
+
+    Top-left: units of Wood and Stone traded within-region versus cross-region
+    over the full rollout. Top-right: average untaxed transaction price by
+    commodity and route type. Bottom: redistribution by planner and tax period,
+    split into income-tax-funded and other redistribution.
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    def episode_logs_from_run(run):
+        if mode == "single":
+            if dense_log_key is not None and isinstance(run.get("dense_logs"), dict):
+                return [(dense_log_key, run["dense_logs"][dense_log_key])]
+            return [(0, run["dense_log"])]
+
+        dense_logs = run.get("dense_logs", None)
+        if isinstance(dense_logs, dict):
+            return [(k, v) for k, v in dense_logs.items() if isinstance(v, dict)]
+        if isinstance(dense_logs, list):
+            return [(i, v) for i, v in enumerate(dense_logs) if isinstance(v, dict)]
+        return [(0, run["dense_log"])] if run.get("dense_log", None) is not None else []
+
+    logs = episode_logs_from_run(run)
+    if not logs:
+        raise ValueError("No dense logs found for this run.")
+
+    run_summary = run.get("summary", {}) if isinstance(run, dict) else {}
+    run_config = run_summary.get("config", {}) if isinstance(run_summary, dict) else {}
+    if not run_config and isinstance(run, dict) and run.get("run_dir"):
+        config_path = os.path.join(run["run_dir"], "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                run_config = json.load(f)
+
+    trade_frames = []
+    redistrib_frames = []
+    for rollout_id, log in logs:
+        trade_df = extract_trade_region_distribution(log)
+        if not trade_df.empty:
+            trade_df = trade_df.copy()
+            trade_df["rollout_id"] = rollout_id
+            trade_df["route_group"] = np.where(
+                trade_df["route_type"].eq("cross region"),
+                "cross region",
+                "within region",
+            )
+            trade_frames.append(trade_df)
+
+        redist_df = extract_planner_redistribution_by_period(
+            log,
+            period=period,
+            rate_disc=rate_disc,
+        )
+        if not redist_df.empty:
+            redist_df = redist_df.copy()
+            redist_df["rollout_id"] = rollout_id
+            redistrib_frames.append(redist_df)
+
+    trade_raw = pd.concat(trade_frames, ignore_index=True) if trade_frames else pd.DataFrame()
+    redist_raw = (
+        pd.concat(redistrib_frames, ignore_index=True)
+        if redistrib_frames
+        else pd.DataFrame()
+    )
+
+    if not trade_raw.empty:
+        trade_raw = trade_raw.copy()
+        trade_raw["tax_period"] = (trade_raw["timestep"].astype(int) // int(period)) + 1
+
+    if trade_raw.empty:
+        trade_units = pd.DataFrame(columns=["tax_period", "commodity", "route_group", "units", "units_std"])
+        price_summary = pd.DataFrame(columns=["commodity", "route_group", "avg_price"])
+    elif mode == "average":
+        per_rollout_units = (
+            trade_raw
+            .groupby(["rollout_id", "tax_period", "commodity", "route_group"], as_index=False)
+            .agg(units=("units", "sum"))
+        )
+        trade_units = (
+            per_rollout_units
+            .groupby(["tax_period", "commodity", "route_group"], as_index=False)
+            .agg(units=("units", "mean"), units_std=("units", "std"))
+        )
+        trade_units["units_std"] = trade_units["units_std"].fillna(0.0)
+        per_rollout_prices = (
+            trade_raw
+            .groupby(["rollout_id", "commodity", "route_group"], as_index=False)
+            .agg(avg_price=("price", "mean"))
+        )
+        price_summary = (
+            per_rollout_prices
+            .groupby(["commodity", "route_group"], as_index=False)
+            .agg(avg_price=("avg_price", "mean"))
+        )
+    else:
+        trade_units = (
+            trade_raw
+            .groupby(["tax_period", "commodity", "route_group"], as_index=False)
+            .agg(units=("units", "sum"))
+        )
+        trade_units["units_std"] = 0.0
+        price_summary = (
+            trade_raw
+            .groupby(["commodity", "route_group"], as_index=False)
+            .agg(avg_price=("price", "mean"))
+        )
+
+    if redist_raw.empty:
+        redist = pd.DataFrame(columns=[
+            "tax_period", "planner_region", "income_tax_funded_redistribution",
+            "non_income_tax_redistribution", "redistributed"
+        ])
+    elif mode == "average":
+        redist = (
+            redist_raw
+            .groupby(["tax_period", "planner_region"], as_index=False)
+            .agg(
+                income=("income", "mean"),
+                income_tax_collected=("income_tax_collected", "mean"),
+                tariff_revenue=("tariff_revenue", "mean"),
+                redistributed=("redistributed", "mean"),
+                income_tax_funded_redistribution=("income_tax_funded_redistribution", "mean"),
+                non_income_tax_redistribution=("non_income_tax_redistribution", "mean"),
+            )
+        )
+    else:
+        redist = redist_raw.copy()
+
+    fig = plt.figure(figsize=figsize, constrained_layout=True)
+    gs = fig.add_gridspec(
+        3,
+        2,
+        width_ratios=[1.0, 1.0],
+        height_ratios=[1.25, 0.9, 1.35],
+    )
+    ax_trade = fig.add_subplot(gs[0, :])
+    ax_pies = [fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[1, 1])]
+    ax_redist = fig.add_subplot(gs[2, :])
+
+    commodities = ["Wood", "Stone"]
+    route_groups = ["within region", "cross region"]
+    commodity_colors = {"Wood": "#8fcf7b", "Stone": "#eadfbd"}
+    cross_alpha = 0.45
+    all_trade_periods = sorted(trade_units["tax_period"].dropna().unique()) if not trade_units.empty else []
+    all_redist_periods = sorted(redist["tax_period"].dropna().unique()) if not redist.empty else []
+    plot_periods = sorted(set(all_trade_periods) | set(all_redist_periods))
+    if not plot_periods:
+        plot_periods = list(range(1, 26))
+
+    period_x = np.arange(len(plot_periods))
+    bar_width = 0.34
+    commodity_offsets = {"Wood": -bar_width / 2, "Stone": bar_width / 2}
+
+    for commodity in commodities:
+        within_vals = []
+        cross_vals = []
+        within_err = []
+        cross_err = []
+        for tax_period in plot_periods:
+            within_match = trade_units[
+                (trade_units["tax_period"] == tax_period)
+                & (trade_units["commodity"] == commodity)
+                & (trade_units["route_group"] == "within region")
+            ]
+            cross_match = trade_units[
+                (trade_units["tax_period"] == tax_period)
+                & (trade_units["commodity"] == commodity)
+                & (trade_units["route_group"] == "cross region")
+            ]
+            within_vals.append(float(within_match["units"].sum()) if len(within_match) else 0.0)
+            cross_vals.append(float(cross_match["units"].sum()) if len(cross_match) else 0.0)
+            within_err.append(float(within_match["units_std"].sum()) if len(within_match) else 0.0)
+            cross_err.append(float(cross_match["units_std"].sum()) if len(cross_match) else 0.0)
+
+        pos = period_x + commodity_offsets[commodity]
+        ax_trade.bar(
+            pos,
+            within_vals,
+            width=bar_width,
+            color=commodity_colors[commodity],
+            edgecolor="0.25",
+            linewidth=0.5,
+            label=f"{commodity}: within",
+            yerr=within_err if mode == "average" else None,
+            error_kw=dict(ecolor="0.25", elinewidth=0.8, capsize=2, capthick=0.8),
+        )
+        ax_trade.bar(
+            pos,
+            cross_vals,
+            bottom=within_vals,
+            width=bar_width,
+            color=commodity_colors[commodity],
+            alpha=cross_alpha,
+            edgecolor="0.25",
+            linewidth=0.5,
+            hatch="//",
+            label=f"{commodity}: cross",
+            yerr=cross_err if mode == "average" else None,
+            error_kw=dict(ecolor="0.25", elinewidth=0.8, capsize=2, capthick=0.8),
+        )
+
+    title_suffix = "single dense log" if mode == "single" else "average across dense logs"
+    ax_trade.set_title(f"Units Traded by Tax Period ({title_suffix})")
+    ax_trade.set_ylabel("Units traded")
+    ax_trade.set_xlabel("Tax period")
+    ax_trade.set_xticks(period_x)
+    ax_trade.set_xticklabels([str(int(k)) for k in plot_periods], fontsize=8)
+    ax_trade.legend(loc="upper left", ncol=4, frameon=True, fontsize=8)
+    ax_trade.grid(True, axis="y", alpha=0.3)
+
+    for ax, commodity in zip(ax_pies, commodities):
+        values = []
+        price_lines = []
+        for route_group in route_groups:
+            units_match = trade_units[
+                (trade_units["commodity"] == commodity)
+                & (trade_units["route_group"] == route_group)
+            ]
+            values.append(float(units_match["units"].sum()) if len(units_match) else 0.0)
+            price_match = price_summary[
+                (price_summary["commodity"] == commodity)
+                & (price_summary["route_group"] == route_group)
+            ]
+            price = float(price_match["avg_price"].mean()) if len(price_match) else np.nan
+            price_label = "within" if route_group == "within region" else "cross"
+            price_lines.append(f"{price_label} avg seller price: {'n/a' if pd.isna(price) else f'{price:.2f}'}")
+
+        if sum(values) > 0:
+            ax.pie(
+                values,
+                labels=["within", "cross"],
+                autopct="%1.0f%%",
+                startangle=90,
+                colors=[commodity_colors[commodity], commodity_colors[commodity]],
+                wedgeprops=dict(edgecolor="white", linewidth=1.0),
+                textprops=dict(fontsize=9),
+            )
+            ax.patches[1].set_alpha(cross_alpha)
+            ax.patches[1].set_hatch("//")
+        else:
+            ax.text(0.5, 0.55, "no trades", transform=ax.transAxes, ha="center", va="center")
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+        ax.set_title(f"{commodity} Sold: Within vs Cross", fontsize=11)
+        ax.text(
+            0.5,
+            -0.08,
+            "\n".join(price_lines),
+            transform=ax.transAxes,
+            ha="center",
+            va="top",
+            fontsize=9,
+        )
+
+    tax_periods = sorted(redist["tax_period"].dropna().unique()) if not redist.empty else []
+    planners = ["top", "bottom"]
+    bar_width = 0.36
+    period_x = np.arange(len(tax_periods))
+    planner_offsets = {"top": -bar_width / 2, "bottom": bar_width / 2}
+    planner_colors = {"top": "#ff7f0e", "bottom": "#9467bd"}
+
+    for planner in planners:
+        income_vals = []
+        other_vals = []
+        tariff_vals = []
+        for tax_period in tax_periods:
+            match = redist[
+                (redist["tax_period"] == tax_period)
+                & (redist["planner_region"] == planner)
+            ]
+            income_vals.append(
+                float(match["income_tax_funded_redistribution"].sum())
+                if len(match) else 0.0
+            )
+            other_vals.append(
+                float(match["non_income_tax_redistribution"].sum())
+                if len(match) else 0.0
+            )
+            tariff_vals.append(
+                float(match["tariff_revenue"].sum())
+                if len(match) and "tariff_revenue" in match else 0.0
+            )
+        pos = period_x + planner_offsets[planner]
+        ax_redist.bar(
+            pos,
+            income_vals,
+            width=bar_width,
+            label=f"{planner}: from income tax",
+            color=planner_colors[planner],
+            edgecolor="white",
+            linewidth=0.8,
+        )
+        ax_redist.bar(
+            pos,
+            other_vals,
+            bottom=income_vals,
+            width=bar_width,
+            label=f"{planner}: import/travel tax",
+            color=planner_colors[planner],
+            alpha=0.35,
+            edgecolor="white",
+            linewidth=0.8,
+        )
+        totals = np.asarray(income_vals, dtype=float) + np.asarray(other_vals, dtype=float)
+        for xpos, total, tariff in zip(pos, totals, tariff_vals):
+            if tariff <= 0:
+                continue
+            ax_redist.text(
+                xpos,
+                total,
+                f"{tariff:.1f}",
+                ha="center",
+                va="bottom",
+                fontsize=7,
+                rotation=90,
+                color="0.2",
+            )
+
+    ax_redist.set_title("Redistribution by Planner and Tax Period")
+    ax_redist.set_xlabel("Tax period")
+    ax_redist.set_ylabel("Coin redistributed")
+    ax_redist.set_xticks(period_x)
+    ax_redist.set_xticklabels([str(int(k)) for k in tax_periods])
+    ax_redist.legend(ncol=2, frameon=True)
+    ax_redist.grid(True, axis="y", alpha=0.3)
+
+    return fig, trade_units, price_summary, redist
+
+def plot_regional_trade_and_planner_redistribution(
+    runs,
+    short_labels=None,
+    mode="single",
+    volume_field="price",
+    period=100,
+    rate_disc=0.05,
+    figsize=None,
+):
+    """
+    Plot trade volume distribution and planner redistribution in one figure.
+
+    The trade panel separates within-region trades from cross-region trades.
+    The redistribution panel shows total redistributed by each planner region,
+    split into the income-tax-funded portion and any remaining redistribution.
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    def as_runs(obj):
+        return obj if isinstance(obj, list) else [obj]
+
+    def extract_episode_logs(run):
+        if mode == "single":
+            log = run.get("dense_log", None)
+            if log is not None:
+                return [log]
+        dense_logs = run.get("dense_logs", None)
+        if isinstance(dense_logs, dict):
+            return [v for v in dense_logs.values() if isinstance(v, dict)]
+        if isinstance(dense_logs, list):
+            return [v for v in dense_logs if isinstance(v, dict)]
+        return [run["dense_log"]] if run.get("dense_log", None) is not None else []
+
+    runs = as_runs(runs)
+    run_names = [run.get("name", f"Run {i + 1}") for i, run in enumerate(runs)]
+    if short_labels is None:
+        labels = {name: f"Run {i + 1}" for i, name in enumerate(run_names)}
+    elif isinstance(short_labels, list):
+        labels = {name: short_labels[i] for i, name in enumerate(run_names)}
+    else:
+        labels = short_labels
+
+    trade_rows = []
+    redistrib_rows = []
+
+    for run, name in zip(runs, run_names):
+        episode_logs = extract_episode_logs(run)
+        if not episode_logs:
+            continue
+
+        per_episode_trade = []
+        per_episode_redistrib = []
+
+        for rollout_id, log in enumerate(episode_logs):
+            trade_df = extract_trade_region_distribution(log, volume_field=volume_field)
+            if not trade_df.empty:
+                grouped_trade = (
+                    trade_df
+                    .groupby(["route_type", "route"], as_index=False)
+                    .agg(volume=("volume", "sum"), n_trades=("volume", "size"))
+                )
+                grouped_trade["rollout_id"] = rollout_id
+                per_episode_trade.append(grouped_trade)
+
+            redistrib_df = extract_planner_redistribution_table(
+                log,
+                period=period,
+                rate_disc=rate_disc,
+            )
+            if not redistrib_df.empty:
+                redistrib_df = redistrib_df.copy()
+                redistrib_df["rollout_id"] = rollout_id
+                per_episode_redistrib.append(redistrib_df)
+
+        label = labels.get(name, name)
+
+        if per_episode_trade:
+            df = pd.concat(per_episode_trade, ignore_index=True)
+            if mode == "average":
+                df = (
+                    df
+                    .groupby(["route_type", "route"], as_index=False)
+                    .agg(volume=("volume", "mean"), n_trades=("n_trades", "mean"))
+                )
+            else:
+                df = df[df["rollout_id"] == df["rollout_id"].min()]
+            df["run"] = name
+            df["label"] = label
+            trade_rows.append(df)
+
+        if per_episode_redistrib:
+            df = pd.concat(per_episode_redistrib, ignore_index=True)
+            if mode == "average":
+                df = (
+                    df
+                    .groupby("planner_region", as_index=False)
+                    .agg(
+                        income=("income", "mean"),
+                        income_tax_collected=("income_tax_collected", "mean"),
+                        tariff_revenue=("tariff_revenue", "mean"),
+                        redistributed=("redistributed", "mean"),
+                        income_tax_funded_redistribution=("income_tax_funded_redistribution", "mean"),
+                        non_income_tax_redistribution=("non_income_tax_redistribution", "mean"),
+                        n_agents=("n_agents", "mean"),
+                    )
+                )
+            else:
+                df = df[df["rollout_id"] == df["rollout_id"].min()]
+            df["run"] = name
+            df["label"] = label
+            redistrib_rows.append(df)
+
+    trade_out = pd.concat(trade_rows, ignore_index=True) if trade_rows else pd.DataFrame()
+    redistrib_out = (
+        pd.concat(redistrib_rows, ignore_index=True)
+        if redistrib_rows
+        else pd.DataFrame()
+    )
+
+    n_runs = max(1, len(run_names))
+    if figsize is None:
+        figsize = (max(10, 3.2 * n_runs), 9)
+
+    fig, axes = plt.subplots(2, 1, figsize=figsize)
+    ax_trade, ax_redist = axes
+
+    route_order = ["within top", "within bottom", "top to bottom", "bottom to top"]
+    colors_trade = {
+        "within top": "#1f77b4",
+        "within bottom": "#17becf",
+        "top to bottom": "#d62728",
+        "bottom to top": "#ff7f0e",
+    }
+
+    x = np.arange(len(run_names))
+    bottom = np.zeros(len(run_names), dtype=float)
+    for route in route_order:
+        vals = []
+        for name in run_names:
+            label = labels.get(name, name)
+            if trade_out.empty:
+                vals.append(0.0)
+            else:
+                vals.append(float(trade_out[
+                    (trade_out["label"] == label) & (trade_out["route"] == route)
+                ]["volume"].sum()))
+        vals = np.asarray(vals, dtype=float)
+        ax_trade.bar(
+            x,
+            vals,
+            bottom=bottom,
+            label=route,
+            color=colors_trade.get(route),
+            edgecolor="white",
+            linewidth=0.8,
+        )
+        bottom += vals
+
+    ax_trade.set_title("Trade Volume by Region Route")
+    ax_trade.set_ylabel(f"Trade volume ({volume_field})")
+    ax_trade.set_xticks(x)
+    ax_trade.set_xticklabels([labels.get(name, name) for name in run_names])
+    ax_trade.legend(ncol=2, frameon=True)
+    ax_trade.grid(True, axis="y", alpha=0.3)
+
+    planner_order = ["top", "bottom"]
+    bar_labels = []
+    income_tax_vals = []
+    other_vals = []
+    for name in run_names:
+        label = labels.get(name, name)
+        for planner_region in planner_order:
+            bar_labels.append(f"{label}\n{planner_region}")
+            dfr = redistrib_out[
+                (redistrib_out["label"] == label)
+                & (redistrib_out["planner_region"] == planner_region)
+            ]
+            income_tax_vals.append(
+                float(dfr["income_tax_funded_redistribution"].sum())
+                if not dfr.empty else 0.0
+            )
+            other_vals.append(
+                float(dfr["non_income_tax_redistribution"].sum())
+                if not dfr.empty else 0.0
+            )
+
+    x2 = np.arange(len(bar_labels))
+    income_tax_vals = np.asarray(income_tax_vals, dtype=float)
+    other_vals = np.asarray(other_vals, dtype=float)
+    ax_redist.bar(
+        x2,
+        income_tax_vals,
+        label="from income tax",
+        color="#2ca02c",
+        edgecolor="white",
+        linewidth=0.8,
+    )
+    ax_redist.bar(
+        x2,
+        other_vals,
+        bottom=income_tax_vals,
+        label="other redistribution",
+        color="#9467bd",
+        edgecolor="white",
+        linewidth=0.8,
+    )
+    ax_redist.set_title("Planner Redistribution")
+    ax_redist.set_ylabel("Coin redistributed")
+    ax_redist.set_xticks(x2)
+    ax_redist.set_xticklabels(bar_labels)
+    ax_redist.legend(frameon=True)
+    ax_redist.grid(True, axis="y", alpha=0.3)
+
+    fig.tight_layout()
+    return fig, trade_out, redistrib_out
 
 def extract_agent_labor_allocation_over_time(
     dense_log,
@@ -3372,7 +4534,11 @@ def breakdown_all_agents_from_result_folder(result_dir, episode_key=0, remap_key
 
 
 
-from simulation import get_disc_rates
+try:
+    from simulation import get_disc_rates
+except ModuleNotFoundError:
+    def get_disc_rates(env_obj=None):
+        return np.arange(0.0, 1.0 + 1e-9, 0.05)
 
 def compare_avg_final_tax_schedules_two_planners(
     runs,
@@ -3700,7 +4866,11 @@ def compare_avg_final_tax_schedules_two_planners(
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from simulation import get_disc_rates
+try:
+    from simulation import get_disc_rates
+except ModuleNotFoundError:
+    def get_disc_rates(env_obj=None):
+        return np.arange(0.0, 1.0 + 1e-9, 0.05)
 
 
 def _extract_logs_from_run(run):
@@ -4009,7 +5179,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from matplotlib.lines import Line2D
-from simulation import get_disc_rates
+try:
+    from simulation import get_disc_rates
+except ModuleNotFoundError:
+    def get_disc_rates(env_obj=None):
+        return np.arange(0.0, 1.0 + 1e-9, 0.05)
 
 
 def _extract_logs_from_run(run):
@@ -4076,6 +5250,33 @@ def _movement_distance(log, aid):
     return float(np.abs(np.diff(locs, axis=0)).sum())
 
 
+def _iter_travel_events(log):
+    for event in log.get("CrossWaterTravel", []):
+        if isinstance(event, dict):
+            if "agent" in event:
+                yield event
+            else:
+                for value in event.values():
+                    if isinstance(value, list):
+                        for item in value:
+                            if isinstance(item, dict):
+                                yield item
+        elif isinstance(event, list):
+            for item in event:
+                if isinstance(item, dict):
+                    yield item
+
+
+def _travel_events_by_agent(log):
+    out = {}
+    for event in _iter_travel_events(log):
+        if "agent" not in event:
+            continue
+        aid = int(event["agent"])
+        out.setdefault(aid, []).append(event)
+    return out
+
+
 def _region_sequence(log, aid, waterline=None):
     if waterline is None:
         waterline = _infer_waterline(log)
@@ -4131,6 +5332,7 @@ def _agent_behavior_table(log):
 
     build_income = _build_income_by_agent(log)
     sell_income, buy_cost = _trade_income_by_agent(log)
+    travel_events = _travel_events_by_agent(log)
 
     rows = []
     for aid in aids:
@@ -4166,6 +5368,7 @@ def _agent_behavior_table(log):
             "total_income": build_income.get(aid, 0.0) + sell_income.get(aid, 0.0),
             "net_market": sell_income.get(aid, 0.0) - buy_cost.get(aid, 0.0),
             "move_distance": _movement_distance(log, aid),
+            "travel_events": len(travel_events.get(aid, [])),
         })
 
     return pd.DataFrame(rows)
@@ -4228,10 +5431,12 @@ def _period_income_table(log, period=100):
         for aid in aids:
             s_prev = states[prev_idx][str(aid)]
             s_now = states[t][str(aid)]
+            date = _date_from_state(s_now)
 
             rows.append({
                 "tax_day_number": tax_day_number,
                 "timestep": t,
+                "date": date,
                 "agent": aid,
                 "planner_region": _planner_region_from_initial_state(log, aid, waterline=waterline),
                 "location_region": _location_region_from_state(s_now, waterline=waterline),
@@ -4243,6 +5448,19 @@ def _period_income_table(log, period=100):
         prev_idx = t
 
     return pd.DataFrame(rows)
+
+
+def _date_from_state(state):
+    for value in state.values():
+        if isinstance(value, dict) and "Date" in value and value["Date"] is not None:
+            return value["Date"]
+    return None
+
+
+def _x_values_and_label(df, fallback_col="tax_day_number"):
+    if "date" in df.columns and df["date"].notna().any():
+        return pd.to_datetime(df["date"]), "date"
+    return df[fallback_col], "tax period (dates unavailable in dense log)"
 
 
 def _bracket_labels_from_cutoffs(cutoffs):
@@ -4278,6 +5496,583 @@ def _income_bracket_counts(log, brackets, period=100):
     return df, counts, labels
 
 
+def _gini_coefficient(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+
+    if len(values) == 0:
+        return np.nan
+
+    values = np.maximum(values, 0.0)
+    total = np.sum(values)
+
+    if total <= 0:
+        return np.nan
+
+    values = np.sort(values)
+    n = len(values)
+    return float(
+        (2.0 * np.sum(np.arange(1, n + 1) * values)) / (n * total)
+        - (n + 1.0) / n
+    )
+
+
+def _extract_episode_logs(obj):
+    if obj is None:
+        return []
+
+    if isinstance(obj, dict) and "states" in obj:
+        return [obj]
+
+    if isinstance(obj, (list, tuple)):
+        eps = []
+        for v in obj:
+            eps.extend(_extract_episode_logs(v))
+        return eps
+
+    if isinstance(obj, dict):
+        eps = []
+        for key in ["final", "episodes", "dense_logs", "logs", "data"]:
+            if key in obj:
+                eps.extend(_extract_episode_logs(obj[key]))
+
+        if eps:
+            return eps
+
+        for v in obj.values():
+            eps.extend(_extract_episode_logs(v))
+        return eps
+
+    return []
+
+
+def plot_agent_income_and_gini(
+    log,
+    period=100,
+    ax=None,
+    income_metric="income",
+    title="Agent Income and Gini Coefficient by Tax Period",
+    agent_cmap="tab10",
+    gini_color="#8c564b",
+    gini_alpha=0.28,
+):
+    """
+    Plot each agent's income as lines and the per-period Gini coefficient as
+    bars on a secondary y-axis.
+    """
+    df_income = _period_income_table(log, period=period)
+
+    if income_metric not in df_income.columns:
+        raise ValueError(
+            f"income_metric must be one of {sorted(df_income.columns)}; "
+            f"got {income_metric!r}"
+        )
+
+    gini_df = (
+        df_income.groupby("tax_day_number")[income_metric]
+        .apply(_gini_coefficient)
+        .reset_index(name="gini")
+    )
+
+    if ax is None:
+        fig, ax_income = plt.subplots(figsize=(12, 5))
+    else:
+        ax_income = ax
+        fig = ax_income.figure
+
+    ax_gini = ax_income.twinx()
+    ax_income.set_zorder(ax_gini.get_zorder() + 1)
+    ax_income.patch.set_visible(False)
+
+    x_gini = gini_df["tax_day_number"].to_numpy()
+    ax_gini.bar(
+        x_gini,
+        gini_df["gini"].to_numpy(),
+        width=0.72,
+        color=gini_color,
+        alpha=gini_alpha,
+        label="Gini coefficient",
+        zorder=1,
+    )
+    ax_gini.set_ylabel("Gini coefficient", color=gini_color)
+    ax_gini.tick_params(axis="y", labelcolor=gini_color)
+    finite_gini = gini_df["gini"].to_numpy(dtype=float)
+    finite_gini = finite_gini[np.isfinite(finite_gini)]
+    gini_top = max(1.0, float(finite_gini.max()) * 1.12) if len(finite_gini) else 1.0
+    ax_gini.set_ylim(0, gini_top)
+
+    agents = sorted(df_income["agent"].unique())
+    cmap = plt.get_cmap(agent_cmap, max(len(agents), 1))
+
+    for idx, aid in enumerate(agents):
+        dfa = df_income[df_income["agent"] == aid].sort_values("tax_day_number")
+        ax_income.plot(
+            dfa["tax_day_number"],
+            dfa[income_metric],
+            marker="o",
+            linewidth=1.8,
+            color=cmap(idx),
+            label=f"agent {int(aid)}",
+            zorder=3,
+        )
+
+    ax_income.axhline(0, color="black", linewidth=0.8, alpha=0.7)
+    ax_income.set_title(title)
+    ax_income.set_xlabel("tax period")
+    ax_income.set_ylabel(income_metric.replace("_", " "))
+    ax_income.grid(True, axis="y", alpha=0.3)
+
+    line_handles, line_labels = ax_income.get_legend_handles_labels()
+    bar_handles, bar_labels = ax_gini.get_legend_handles_labels()
+    ax_income.legend(
+        line_handles + bar_handles,
+        line_labels + bar_labels,
+        loc="upper left",
+        ncol=min(4, len(line_labels) + len(bar_labels)),
+        fontsize=9,
+        frameon=True,
+    )
+
+    fig.tight_layout()
+    return fig, ax_income, ax_gini, df_income, gini_df
+
+
+def plot_agent_income_and_gini_for_log(
+    log,
+    period=100,
+    max_periods=None,
+    ax=None,
+    income_metric="income",
+    title="Agent Income and Gini Coefficient by Tax Period",
+    agent_cmap="tab10",
+    gini_color="#8c564b",
+    gini_alpha=0.28,
+):
+    """
+    Plot one raw dense log. This does not average across multiple dense logs.
+    """
+    if max_periods is None:
+        return plot_agent_income_and_gini(
+            log,
+            period=period,
+            ax=ax,
+            income_metric=income_metric,
+            title=title,
+            agent_cmap=agent_cmap,
+            gini_color=gini_color,
+            gini_alpha=gini_alpha,
+        )
+
+    df_income = _period_income_table(log, period=period)
+    df_income = df_income[df_income["tax_day_number"] <= max_periods].copy()
+
+    if income_metric not in df_income.columns:
+        raise ValueError(
+            f"income_metric must be one of {sorted(df_income.columns)}; "
+            f"got {income_metric!r}"
+        )
+
+    gini_df = (
+        df_income.groupby("tax_day_number")[income_metric]
+        .apply(_gini_coefficient)
+        .reset_index(name="gini")
+    )
+
+    if ax is None:
+        fig, ax_income = plt.subplots(figsize=(12, 5))
+    else:
+        ax_income = ax
+        fig = ax_income.figure
+
+    ax_gini = ax_income.twinx()
+    ax_income.set_zorder(ax_gini.get_zorder() + 1)
+    ax_income.patch.set_visible(False)
+
+    x_gini = gini_df["tax_day_number"].to_numpy()
+    ax_gini.bar(
+        x_gini,
+        gini_df["gini"].to_numpy(),
+        width=0.72,
+        color=gini_color,
+        alpha=gini_alpha,
+        label="Gini coefficient",
+        zorder=1,
+    )
+    ax_gini.set_ylabel("Gini coefficient", color=gini_color)
+    ax_gini.tick_params(axis="y", labelcolor=gini_color)
+    finite_gini = gini_df["gini"].to_numpy(dtype=float)
+    finite_gini = finite_gini[np.isfinite(finite_gini)]
+    gini_top = max(1.0, float(finite_gini.max()) * 1.12) if len(finite_gini) else 1.0
+    ax_gini.set_ylim(0, gini_top)
+
+    agents = sorted(df_income["agent"].unique())
+    cmap = plt.get_cmap(agent_cmap, max(len(agents), 1))
+
+    for idx, aid in enumerate(agents):
+        dfa = df_income[df_income["agent"] == aid].sort_values("tax_day_number")
+        ax_income.plot(
+            dfa["tax_day_number"],
+            dfa[income_metric],
+            marker="o",
+            linewidth=1.8,
+            color=cmap(idx),
+            label=f"agent {int(aid)}",
+            zorder=3,
+        )
+
+    ax_income.axhline(0, color="black", linewidth=0.8, alpha=0.7)
+    ax_income.set_title(title)
+    ax_income.set_xlabel("tax period")
+    ax_income.set_ylabel(income_metric.replace("_", " "))
+    ax_income.grid(True, axis="y", alpha=0.3)
+
+    line_handles, line_labels = ax_income.get_legend_handles_labels()
+    bar_handles, bar_labels = ax_gini.get_legend_handles_labels()
+    ax_income.legend(
+        line_handles + bar_handles,
+        line_labels + bar_labels,
+        loc="upper left",
+        ncol=min(4, len(line_labels) + len(bar_labels)),
+        fontsize=9,
+        frameon=True,
+    )
+
+    fig.tight_layout()
+    return fig, ax_income, ax_gini, df_income, gini_df
+
+
+def _get_log_from_dense_logs(dense_logs, episode_key=0):
+    if isinstance(dense_logs, dict) and "states" in dense_logs:
+        return dense_logs
+
+    if isinstance(dense_logs, dict):
+        if episode_key in dense_logs:
+            return dense_logs[episode_key]
+
+        episode_key_str = str(episode_key)
+        if episode_key_str in dense_logs:
+            return dense_logs[episode_key_str]
+
+        for v in dense_logs.values():
+            if isinstance(v, dict) and "states" in v:
+                return v
+
+    if isinstance(dense_logs, (list, tuple)):
+        if len(dense_logs) == 0:
+            raise ValueError("No dense logs found.")
+        return dense_logs[int(episode_key)]
+
+    raise ValueError("Could not find an episode log with states.")
+
+
+def plot_agent_income_and_gini_for_dense_logs(
+    dense_logs,
+    episode_key=0,
+    period=100,
+    max_periods=None,
+    **kwargs,
+):
+    log = _get_log_from_dense_logs(dense_logs, episode_key=episode_key)
+    return plot_agent_income_and_gini_for_log(
+        log,
+        period=period,
+        max_periods=max_periods,
+        **kwargs,
+    )
+
+
+def plot_agent_income_and_gini_single_log_from_result_folder(
+    run_dir,
+    episode_key=0,
+    period=100,
+    max_periods=None,
+    **kwargs,
+):
+    dense_logs = load_dense_logs_from_result_folder(run_dir)
+    return plot_agent_income_and_gini_for_dense_logs(
+        dense_logs,
+        episode_key=episode_key,
+        period=period,
+        max_periods=max_periods,
+        **kwargs,
+    )
+
+
+def plot_agent_income_and_gini_for_runs(
+    runs,
+    short_labels=None,
+    period=100,
+    max_periods=None,
+    errorbar="std",
+    figsize_per_run=(12, 4.5),
+    agent_cmap="tab10",
+    gini_color="#8c564b",
+    gini_alpha=0.28,
+):
+    """
+    Plot agent income lines and Gini bars for experiment runs loaded with
+    load_experiment_runs(run_dirs). Uses all dense logs in each run.
+    """
+    run_names = [run["name"] for run in runs]
+
+    if short_labels is None:
+        short_labels = {name: f"E{i + 1}" for i, name in enumerate(run_names)}
+    elif isinstance(short_labels, list):
+        short_labels = {name: short_labels[i] for i, name in enumerate(run_names)}
+
+    raw_rows = []
+
+    for run in runs:
+        name = run["name"]
+        dense_logs_obj = run.get("dense_logs", None)
+        if dense_logs_obj is None:
+            dense_logs_obj = run.get("dense_log", None)
+
+        eps = _extract_episode_logs(dense_logs_obj)
+
+        for rollout_id, log in enumerate(eps):
+            df = _period_income_table(log, period=period)
+            if max_periods is not None:
+                df = df[df["tax_day_number"] <= max_periods]
+
+            for _, row in df.iterrows():
+                raw_rows.append({
+                    "run": name,
+                    "label": short_labels[name],
+                    "rollout_id": rollout_id,
+                    "tax_day_number": int(row["tax_day_number"]),
+                    "timestep": int(row["timestep"]),
+                    "agent": int(row["agent"]),
+                    "income": float(row["income"]),
+                    "planner_region": row["planner_region"],
+                    "location_region": row["location_region"],
+                })
+
+    raw_df = pd.DataFrame(raw_rows)
+    if raw_df.empty:
+        raise ValueError("No dense logs with period income were found in the supplied runs.")
+
+    income_summary = (
+        raw_df.groupby(["run", "label", "tax_day_number", "agent"], sort=False)
+        .agg(
+            income_mean=("income", "mean"),
+            income_std=("income", "std"),
+            n_dense_logs=("income", "count"),
+        )
+        .reset_index()
+    )
+    income_summary["income_std"] = income_summary["income_std"].fillna(0.0)
+    income_summary["income_sem"] = (
+        income_summary["income_std"] / np.sqrt(income_summary["n_dense_logs"])
+    )
+
+    rollout_gini = (
+        raw_df.groupby(["run", "label", "rollout_id", "tax_day_number"], sort=False)["income"]
+        .apply(_gini_coefficient)
+        .reset_index(name="gini")
+    )
+
+    gini_summary = (
+        rollout_gini.groupby(["run", "label", "tax_day_number"], sort=False)
+        .agg(
+            gini_mean=("gini", "mean"),
+            gini_std=("gini", "std"),
+            n_dense_logs=("gini", "count"),
+        )
+        .reset_index()
+    )
+    gini_summary["gini_std"] = gini_summary["gini_std"].fillna(0.0)
+    gini_summary["gini_sem"] = (
+        gini_summary["gini_std"] / np.sqrt(gini_summary["n_dense_logs"])
+    )
+
+    if errorbar == "std":
+        income_err_col = "income_std"
+        gini_err_col = "gini_std"
+    elif errorbar == "sem":
+        income_err_col = "income_sem"
+        gini_err_col = "gini_sem"
+    elif errorbar is None:
+        income_err_col = None
+        gini_err_col = None
+    else:
+        raise ValueError("errorbar must be None, 'std', or 'sem'")
+
+    fig, axes = plt.subplots(
+        len(run_names),
+        1,
+        figsize=(figsize_per_run[0], figsize_per_run[1] * len(run_names)),
+        squeeze=False,
+    )
+
+    twin_axes = []
+
+    for row_idx, name in enumerate(run_names):
+        ax_income = axes[row_idx, 0]
+        ax_gini = ax_income.twinx()
+        twin_axes.append(ax_gini)
+
+        ax_income.set_zorder(ax_gini.get_zorder() + 1)
+        ax_income.patch.set_visible(False)
+
+        run_income = income_summary[income_summary["run"] == name]
+        run_gini = gini_summary[gini_summary["run"] == name]
+
+        x_gini = run_gini["tax_day_number"].to_numpy()
+        y_gini = run_gini["gini_mean"].to_numpy()
+        yerr_gini = None if gini_err_col is None else run_gini[gini_err_col].to_numpy()
+
+        ax_gini.bar(
+            x_gini,
+            y_gini,
+            width=0.72,
+            color=gini_color,
+            alpha=gini_alpha,
+            label="Gini coefficient",
+            yerr=yerr_gini,
+            capsize=4 if gini_err_col is not None else 0,
+            ecolor=gini_color,
+            zorder=1,
+        )
+
+        finite_gini = y_gini[np.isfinite(y_gini)]
+        gini_top = max(1.0, float(finite_gini.max()) * 1.12) if len(finite_gini) else 1.0
+        ax_gini.set_ylim(0, gini_top)
+        ax_gini.set_ylabel("Gini coefficient", color=gini_color)
+        ax_gini.tick_params(axis="y", labelcolor=gini_color)
+
+        agents = sorted(run_income["agent"].unique())
+        cmap = plt.get_cmap(agent_cmap, max(len(agents), 1))
+
+        for idx, aid in enumerate(agents):
+            dfa = run_income[run_income["agent"] == aid].sort_values("tax_day_number")
+            x = dfa["tax_day_number"].to_numpy()
+            y = dfa["income_mean"].to_numpy()
+
+            color = cmap(idx)
+            ax_income.plot(
+                x,
+                y,
+                marker="o",
+                linewidth=1.8,
+                color=color,
+                label=f"agent {int(aid)}",
+                zorder=3,
+            )
+
+            if income_err_col is not None:
+                err = dfa[income_err_col].to_numpy()
+                ax_income.fill_between(
+                    x,
+                    y - err,
+                    y + err,
+                    color=color,
+                    alpha=0.10,
+                    linewidth=0,
+                    zorder=2,
+                )
+
+        ax_income.axhline(0, color="black", linewidth=0.8, alpha=0.7)
+        ax_income.set_title(f"{short_labels[name]}: Agent Income and Gini by Tax Period")
+        ax_income.set_xlabel("Tax period")
+        ax_income.set_ylabel("Income")
+        ax_income.grid(True, axis="y", alpha=0.3)
+
+        line_handles, line_labels = ax_income.get_legend_handles_labels()
+        bar_handles, bar_labels = ax_gini.get_legend_handles_labels()
+        ax_income.legend(
+            line_handles + bar_handles,
+            line_labels + bar_labels,
+            loc="upper left",
+            ncol=min(4, len(line_labels) + len(bar_labels)),
+            fontsize=9,
+            frameon=True,
+        )
+
+    fig.tight_layout()
+    return fig, axes[:, 0].tolist(), twin_axes, income_summary, gini_summary, raw_df
+
+
+def plot_agent_income_and_gini_for_run(
+    run,
+    label=None,
+    period=100,
+    max_periods=None,
+    errorbar="std",
+    figsize=(12, 4.5),
+    agent_cmap="tab10",
+    gini_color="#8c564b",
+    gini_alpha=0.28,
+):
+    """
+    Plot one experiment run loaded with load_experiment_run(run_dir). Uses all
+    dense logs in that run.
+    """
+    run_name = run["name"]
+    short_labels = [label] if label is not None else None
+
+    fig, ax_income_list, ax_gini_list, income_summary, gini_summary, raw_df = (
+        plot_agent_income_and_gini_for_runs(
+            [run],
+            short_labels=short_labels,
+            period=period,
+            max_periods=max_periods,
+            errorbar=errorbar,
+            figsize_per_run=figsize,
+            agent_cmap=agent_cmap,
+            gini_color=gini_color,
+            gini_alpha=gini_alpha,
+        )
+    )
+
+    return (
+        fig,
+        ax_income_list[0],
+        ax_gini_list[0],
+        income_summary[income_summary["run"] == run_name].reset_index(drop=True),
+        gini_summary[gini_summary["run"] == run_name].reset_index(drop=True),
+        raw_df[raw_df["run"] == run_name].reset_index(drop=True),
+    )
+
+
+def plot_agent_income_and_gini_from_result_folder(
+    run_dir,
+    label=None,
+    period=100,
+    max_periods=None,
+    errorbar="std",
+    figsize=(12, 4.5),
+):
+    run = load_experiment_run(run_dir)
+    return plot_agent_income_and_gini_for_run(
+        run,
+        label=label,
+        period=period,
+        max_periods=max_periods,
+        errorbar=errorbar,
+        figsize=figsize,
+    )
+
+
+def plot_agent_income_and_gini_from_result_folders(
+    run_dirs,
+    short_labels=None,
+    period=100,
+    max_periods=None,
+    errorbar="std",
+    figsize_per_run=(12, 4.5),
+):
+    runs = load_experiment_runs(run_dirs)
+    return plot_agent_income_and_gini_for_runs(
+        runs,
+        short_labels=short_labels,
+        period=period,
+        max_periods=max_periods,
+        errorbar=errorbar,
+        figsize_per_run=figsize_per_run,
+    )
+
+
 def plot_tax_and_agent_behavior_for_logs_v2(
     runs,
     env_obj,
@@ -4306,7 +6101,14 @@ def plot_tax_and_agent_behavior_for_logs_v2(
         available = available[:max_logs]
 
     if len(available) == 0:
-        raise ValueError("No dense logs selected/found.")
+        available_keys = {
+            run_idx: list(_extract_logs_from_run(run).keys())
+            for run_idx, run in enumerate(runs)
+        }
+        raise ValueError(
+            "No dense logs selected/found. "
+            f"Available log keys by run are: {available_keys}"
+        )
 
     region_colors = {"top": "#1f77b4", "bottom": "#ff7f0e"}
     edge_colors = {"top": "#08306b", "bottom": "#7f2704"}
@@ -4331,6 +6133,11 @@ def plot_tax_and_agent_behavior_for_logs_v2(
 
         df_agents = _agent_behavior_table(log)
         df_agents = df_agents.sort_values(["planner_region", "skill_build_payment", "agent"])
+        if behavior_metric not in df_agents.columns:
+            raise ValueError(
+                f"Unknown behavior_metric {behavior_metric!r}. "
+                f"Available metrics include: {sorted(df_agents.columns)}"
+            )
 
         # 1. p_top final tax
         ax = axes[row, 0]
@@ -4413,7 +6220,37 @@ def plot_tax_and_agent_behavior_for_logs_v2(
         ax.set_yticks(np.arange(len(aids)))
         ax.set_yticklabels([str(a) for a in aids], fontsize=8)
         ax.set_title("Location over time")
-        ax.set_xlabel("timestep")
+        travel_by_agent = _travel_events_by_agent(log)
+        for y, aid in enumerate(aids):
+            ts = [
+                int(event["t"])
+                for event in travel_by_agent.get(aid, [])
+                if "t" in event
+            ]
+            if ts:
+                ax.scatter(
+                    ts,
+                    np.full(len(ts), y),
+                    marker="|",
+                    s=90,
+                    color="crimson",
+                    linewidths=1.6,
+                    alpha=0.95,
+                )
+
+        states = log.get("states", [])
+        date_ticks = [
+            (i, _date_from_state(state))
+            for i, state in enumerate(states)
+            if _date_from_state(state) is not None
+        ]
+        if date_ticks:
+            tick_idx = np.linspace(0, len(date_ticks) - 1, min(5, len(date_ticks))).round().astype(int)
+            ax.set_xticks([date_ticks[i][0] for i in tick_idx])
+            ax.set_xticklabels([str(date_ticks[i][1]) for i in tick_idx], rotation=30, ha="right")
+            ax.set_xlabel("date")
+        else:
+            ax.set_xlabel("timestep (dates unavailable)")
         ax.set_ylabel("agent")
 
         print(f"{run_label}, log {log_key}")
@@ -4423,6 +6260,8 @@ def plot_tax_and_agent_behavior_for_logs_v2(
         print(df_agents["majority_location_region"].value_counts(dropna=False).to_string())
         print("final_location_region counts:")
         print(df_agents["final_location_region"].value_counts(dropna=False).to_string())
+        print("travel_events by agent:")
+        print(df_agents.set_index("agent")["travel_events"].to_string())
         print()
 
     legend_handles = [
@@ -4432,8 +6271,10 @@ def plot_tax_and_agent_behavior_for_logs_v2(
                markeredgecolor=edge_colors["top"], markeredgewidth=2.5, label="edge: p_top assigned"),
         Line2D([0], [0], marker="o", color="w", markerfacecolor="white",
                markeredgecolor=edge_colors["bottom"], markeredgewidth=2.5, label="edge: p_bottom assigned"),
+        Line2D([0], [0], marker="|", color="crimson", linestyle="None",
+               markersize=12, markeredgewidth=1.8, label="travel event"),
     ]
-    fig.legend(handles=legend_handles, loc="lower center", ncol=4, frameon=True)
+    fig.legend(handles=legend_handles, loc="lower center", ncol=5, frameon=True)
     fig.subplots_adjust(bottom=0.12)
     fig.tight_layout(rect=[0, 0.08, 1, 1])
 
@@ -4447,6 +6288,13 @@ def plot_bracket_counts_for_log(
     figsize=(13, 5),
 ):
     df_income, counts, labels = _income_bracket_counts(log, brackets, period=period)
+    date_by_period = (
+        df_income.dropna(subset=["date"])
+        .drop_duplicates("tax_day_number")
+        .set_index("tax_day_number")["date"]
+        if "date" in df_income.columns
+        else pd.Series(dtype=object)
+    )
 
     fig, axes = plt.subplots(
         1, 2,
@@ -4477,7 +6325,10 @@ def plot_bracket_counts_for_log(
         ax.set_yticks(np.arange(len(labels)))
         ax.set_yticklabels(labels)
         ax.set_xticks(np.arange(len(pivot.columns)))
-        ax.set_xticklabels(pivot.columns)
+        if len(date_by_period):
+            ax.set_xticklabels([date_by_period.get(c, c) for c in pivot.columns], rotation=30, ha="right")
+        else:
+            ax.set_xticklabels(pivot.columns)
 
     axes[0].set_ylabel("income bracket")
 
@@ -4507,10 +6358,12 @@ def plot_income_and_tax_over_time(
     for aid, dfa in df_income.groupby("agent"):
         planner_region = dfa["planner_region"].iloc[0]
         color = "#1f77b4" if planner_region == "top" else "#ff7f0e"
-        ax.plot(dfa["tax_day_number"], dfa["income"], marker="o", linewidth=1.5, color=color, alpha=0.8, label=f"agent {aid}")
+        x, x_label = _x_values_and_label(dfa)
+        ax.plot(x, dfa["income"], marker="o", linewidth=1.5, color=color, alpha=0.8, label=f"agent {aid}")
 
     ax.axhline(0, color="black", linewidth=0.8)
     ax.set_title("Agent income by tax period")
+    ax.set_xlabel(x_label)
     ax.set_ylabel("income")
     ax.grid(True, alpha=0.3)
 
@@ -4521,13 +6374,27 @@ def plot_income_and_tax_over_time(
         .mean()
         .reset_index()
     )
+    date_by_period = (
+        df_income.dropna(subset=["date"])
+        .drop_duplicates("tax_day_number")
+        .set_index("tax_day_number")["date"]
+        if "date" in df_income.columns
+        else pd.Series(dtype=object)
+    )
 
     for region, color in [("top", "#1f77b4"), ("bottom", "#ff7f0e")]:
         dfr = mean_income[mean_income["planner_region"] == region]
-        ax.plot(dfr["tax_day_number"], dfr["income"], marker="o", linewidth=2.5, color=color, label=region)
+        if len(date_by_period):
+            x = pd.to_datetime(dfr["tax_day_number"].map(date_by_period))
+            x_label = "date"
+        else:
+            x = dfr["tax_day_number"]
+            x_label = "tax period (dates unavailable in dense log)"
+        ax.plot(x, dfr["income"], marker="o", linewidth=2.5, color=color, label=region)
 
     ax.axhline(0, color="black", linewidth=0.8)
     ax.set_title("Mean income by fixed planner assignment")
+    ax.set_xlabel(x_label)
     ax.set_ylabel("mean income")
     ax.grid(True, alpha=0.3)
     ax.legend()
@@ -4655,26 +6522,28 @@ def plot_tax_bracket_snapshots_compact(
         idx = np.linspace(0, len(tax_days) - 1, n_snapshots).round().astype(int)
         chosen_days = [tax_days[i] for i in idx]
 
+    n_cols = 5
+    n_rows = 4
+
     if figsize is None:
-        figsize = (2.8 * len(chosen_days), 6.2)
+        figsize = (2.8 * n_cols, 10.8)
 
     fig, axes = plt.subplots(
-        2,
-        len(chosen_days),
+        n_rows,
+        n_cols,
         figsize=figsize,
         sharey=True,
         constrained_layout=True,
     )
 
-    if len(chosen_days) == 1:
-        axes = np.asarray(axes).reshape(2, 1)
+    axes = np.asarray(axes).reshape(n_rows, n_cols)
 
     bracket_x = np.arange(len(labels))
     max_count = max(1, int(counts["n_agents"].max()))
 
     configs = [
         ("top", "p_top", ptop_rates, rewards_top, "#1f77b4", 0),
-        ("bottom", "p_bottom", pbot_rates, rewards_bottom, "#ff7f0e", 1),
+        ("bottom", "p_bottom", pbot_rates, rewards_bottom, "#ff7f0e", 2),
     ]
 
     def tax_day_to_decision_idx(tax_day, rate_matrix):
@@ -4701,11 +6570,17 @@ def plot_tax_bracket_snapshots_compact(
         ridx = int(np.clip(round(frac * (len(reward_arr) - 1)), 0, len(reward_arr) - 1))
         return reward_arr[ridx]
 
-    for region, planner_id, rate_matrix, reward_arr, color, row in configs:
+    for ax in axes.flat:
+        ax.set_visible(False)
+
+    for region, planner_id, rate_matrix, reward_arr, color, base_row in configs:
         tax_ymax = max(1.0, float(np.nanmax(rate_matrix)) * 1.05)
 
-        for col, tax_day in enumerate(chosen_days):
+        for snapshot_idx, tax_day in enumerate(chosen_days[: n_rows // 2 * n_cols]):
+            row = base_row + snapshot_idx // n_cols
+            col = snapshot_idx % n_cols
             ax = axes[row, col]
+            ax.set_visible(True)
 
             day_counts = (
                 counts[
@@ -4751,8 +6626,10 @@ def plot_tax_bracket_snapshots_compact(
             else:
                 production = np.nan
                 equality = np.nan
+                planner_reward = np.nan
 
-            planner_reward = sr["planner_reward_sum"]
+            if len(swf_row):
+                planner_reward = sr["planner_reward_sum"]
 
 
             txt = (
@@ -4781,7 +6658,8 @@ def plot_tax_bracket_snapshots_compact(
             else:
                 ax.tick_params(axis="y", labelleft=False)
 
-            if col == len(chosen_days) - 1:
+            is_last_visible_col = col == min(n_cols, len(chosen_days) - (row - base_row) * n_cols) - 1
+            if is_last_visible_col:
                 axr = ax.secondary_yaxis(
                     "right",
                     functions=(
@@ -4802,3 +6680,1197 @@ def plot_tax_bracket_snapshots_compact(
     )
 
     return fig, df_income, counts, df_swf
+
+
+def _extract_tax_policy_from_actions(log, period=100, rate_disc=0.05):
+    """
+    Return one regional tax schedule per tax period from dense_log["actions"].
+
+    The rollout logs full planner actions at every timestep. At tax-period starts
+    those action dicts contain the active regional bracket keys for p_top and
+    p_bottom. Planner action 0 is no-op; positive actions are one-based indices
+    into the discrete rate grid.
+    """
+    actions = log.get("actions", [])
+    n_periods = int(np.ceil((len(log.get("states", [])) - 1) / float(period)))
+    rows = []
+
+    for tax_period in range(1, n_periods + 1):
+        t = min((tax_period - 1) * period, max(0, len(actions) - 1))
+        action_t = actions[t] if t < len(actions) else {}
+
+        for region, planner_id in [("top", "p_top"), ("bottom", "p_bottom")]:
+            planner_action = action_t.get(planner_id, {}) if isinstance(action_t, dict) else {}
+            pairs = []
+            for key, value in planner_action.items():
+                if "TaxIndexBracket" not in str(key):
+                    continue
+                try:
+                    cutoff = float(str(key).split("_")[-1])
+                except ValueError:
+                    cutoff = float(len(pairs))
+                rate = max(0.0, (float(value) - 1.0) * float(rate_disc))
+                pairs.append((cutoff, min(1.0, rate)))
+
+            if not pairs:
+                continue
+
+            pairs = sorted(pairs, key=lambda x: x[0])
+            rates = np.asarray([rate for _, rate in pairs], dtype=float)
+            rows.append({
+                "tax_period": tax_period,
+                "decision_timestep": t,
+                "planner_region": region,
+                "planner_id": planner_id,
+                "tax_schedule": rates,
+                "top_marginal_rate": float(rates[-1]),
+                "avg_marginal_rate": float(np.mean(rates)),
+                "progressivity": float(rates[-1] - rates[0]),
+            })
+
+    if rows:
+        return pd.DataFrame(rows)
+
+    # Fallback for older logs that only have planner_actions. In the current
+    # two-planner rollout format, the active regional half is stored in the last
+    # half of each planner vector.
+    planner_actions = log.get("planner_actions", {})
+    for region, planner_id in [("top", "p_top"), ("bottom", "p_bottom")]:
+        arr = np.asarray(planner_actions.get(planner_id, []))
+        if arr.ndim != 2 or arr.shape[1] == 0:
+            continue
+        half = arr.shape[1] // 2
+        active = arr[:, half:]
+        for idx, row in enumerate(active, start=1):
+            rates = np.clip((row.astype(float) - 1.0) * float(rate_disc), 0.0, 1.0)
+            rows.append({
+                "tax_period": idx,
+                "decision_timestep": (idx - 1) * period,
+                "planner_region": region,
+                "planner_id": planner_id,
+                "tax_schedule": rates,
+                "top_marginal_rate": float(rates[-1]),
+                "avg_marginal_rate": float(np.mean(rates)),
+                "progressivity": float(rates[-1] - rates[0]),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def _region_from_loc(loc, waterline):
+    row = int(loc[0])
+    return "top" if row <= waterline else "bottom"
+
+
+def _tax_policy_table(log, period=100, rate_disc=0.05):
+    tax_df = _extract_tax_policy_from_actions(log, period=period, rate_disc=rate_disc)
+    if tax_df.empty:
+        raise ValueError("No regional tax policy could be extracted from the dense log.")
+    return tax_df
+
+
+def _period_region_income_table(log, brackets, period=100):
+    states = log["states"]
+    aids = _numeric_agent_ids(log)
+    waterline = _infer_waterline(log)
+    brackets = np.asarray(brackets, dtype=float)
+    cutoffs = np.r_[-np.inf, brackets[1:], np.inf]
+    labels = _bracket_labels_from_cutoffs(cutoffs)
+
+    rows = []
+    tax_days = list(range(period - 1, len(states), period))
+    prev_idx = 0
+
+    for tax_period, t in enumerate(tax_days, start=1):
+        for aid in aids:
+            s_prev = states[prev_idx][str(aid)]
+            s_now = states[t][str(aid)]
+            income = _coin(s_now) - _coin(s_prev)
+            physical_region = _location_region_from_state(s_now, waterline=waterline)
+
+            rows.append({
+                "tax_period": tax_period,
+                "tax_day_number": tax_period,
+                "timestep": t,
+                "agent": aid,
+                "region": physical_region,
+                "income": income,
+                "coin_end": _coin(s_now),
+                "labor_used": float(s_now.get("endogenous", {}).get("Labor", np.nan))
+                - float(s_prev.get("endogenous", {}).get("Labor", np.nan)),
+                "build_payment": float(states[0][str(aid)].get("build_payment", np.nan)),
+            })
+
+        prev_idx = t
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["tax_bracket"] = pd.cut(
+            df["income"],
+            bins=cutoffs,
+            labels=labels,
+            right=False,
+            include_lowest=True,
+        )
+
+    counts = (
+        df.groupby(["tax_period", "region", "tax_bracket"], observed=False)
+        .size()
+        .reset_index(name="n_agents")
+        if not df.empty
+        else pd.DataFrame(columns=["tax_period", "region", "tax_bracket", "n_agents"])
+    )
+
+    return df, counts, labels
+
+
+def _regional_period_outcomes_from_income(df_income):
+    rows = []
+    for (tax_period, region), dfr in df_income.groupby(["tax_period", "region"]):
+        incomes = dfr["income"].to_numpy(dtype=float)
+        nonnegative_income = np.maximum(incomes, 0.0)
+        production = float(np.sum(nonnegative_income))
+        equality = _equality_from_values(nonnegative_income)
+
+        rows.append({
+            "tax_period": tax_period,
+            "region": region,
+            "production": production,
+            "equality": equality,
+            "n_agents": int(len(dfr)),
+            "avg_skill_level": float(np.nanmean(dfr["build_payment"])) if len(dfr) else np.nan,
+            "avg_labor_used": float(np.nanmean(dfr["labor_used"])) if len(dfr) else np.nan,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def regional_environment_metrics_by_tax_period(log, period=100):
+    """
+    Environmental metrics measured over each tax period and physical region.
+
+    Prices are observed trade prices within the trade's logged region. Build
+    counts use the build event location. Skill and labor averages use agents'
+    physical region at the tax-period boundary.
+    """
+    states = log["states"]
+    aids = _numeric_agent_ids(log)
+    waterline = _infer_waterline(log)
+    tax_days = list(range(period - 1, len(states), period))
+
+    skill_by_agent = {
+        aid: float(states[0][str(aid)].get("build_payment", np.nan))
+        for aid in aids
+    }
+
+    rows = []
+    prev_idx = 0
+    for tax_period, t in enumerate(tax_days, start=1):
+        start_t = 0 if tax_period == 1 else prev_idx + 1
+        end_t = t + 1
+        state_t = states[t]
+        state_prev = states[prev_idx]
+
+        trades = _events_in_period(log.get("Trade", []), start_t, end_t, implicit_timeline=True)
+        builds = _events_in_period(log.get("Build", []), start_t, end_t, implicit_timeline=True)
+
+        for region in ["top", "bottom"]:
+            region_aids = [
+                aid for aid in aids
+                if _location_region_from_state(state_t[str(aid)], waterline=waterline) == region
+            ]
+
+            region_trades = [tr for tr in trades if tr.get("region") == region]
+            wood_prices = [
+                float(tr["price"]) for tr in region_trades
+                if tr.get("commodity") == "Wood" and "price" in tr
+            ]
+            stone_prices = [
+                float(tr["price"]) for tr in region_trades
+                if tr.get("commodity") == "Stone" and "price" in tr
+            ]
+
+            region_builds = [
+                b for b in builds
+                if "loc" in b and _region_from_loc(b["loc"], waterline) == region
+            ]
+
+            labor_used = []
+            for aid in region_aids:
+                labor_now = float(state_t[str(aid)].get("endogenous", {}).get("Labor", np.nan))
+                labor_prev = float(state_prev[str(aid)].get("endogenous", {}).get("Labor", np.nan))
+                if np.isfinite(labor_now) and np.isfinite(labor_prev):
+                    labor_used.append(labor_now - labor_prev)
+
+            rows.append({
+                "tax_period": tax_period,
+                "region": region,
+                "avg_wood_price": float(np.mean(wood_prices)) if wood_prices else np.nan,
+                "avg_stone_price": float(np.mean(stone_prices)) if stone_prices else np.nan,
+                "avg_skill_level": float(np.nanmean([skill_by_agent[aid] for aid in region_aids])) if region_aids else np.nan,
+                "n_builds": int(len(region_builds)),
+                "avg_builds_per_agent": len(region_builds) / max(1, len(region_aids)),
+                "avg_labor_used": float(np.mean(labor_used)) if labor_used else np.nan,
+                "n_agents": int(len(region_aids)),
+                "n_trades": int(len(region_trades)),
+            })
+
+        prev_idx = t
+
+    return pd.DataFrame(rows)
+
+
+def plot_tax_bracket_snapshots_with_environment_table(
+    log,
+    brackets,
+    period=100,
+    n_snapshots=10,
+    rate_disc=0.05,
+    figsize=None,
+):
+    """
+    Mobility-safe tax snapshot figure.
+
+    Each panel shows, for a physical region and tax period:
+    - bars: number of agents in each income tax bracket for that period
+    - line: current marginal tax schedule chosen at the start of that period
+    - text: production and equality computed from period incomes in that region
+
+    The top table gives period-level environmental metrics for the same periods.
+    """
+    df_income, counts, labels = _period_region_income_table(log, brackets, period=period)
+    df_outcomes = _regional_period_outcomes_from_income(df_income)
+    df_env = regional_environment_metrics_by_tax_period(log, period=period)
+    df_tax = _tax_policy_table(log, period=period, rate_disc=rate_disc)
+
+    tax_periods = sorted(df_income["tax_period"].unique())
+    if len(tax_periods) <= n_snapshots:
+        chosen_periods = tax_periods
+    else:
+        idx = np.linspace(0, len(tax_periods) - 1, n_snapshots).round().astype(int)
+        chosen_periods = [tax_periods[i] for i in idx]
+
+    if figsize is None:
+        figsize = (max(16, 2.4 * len(chosen_periods)), 11.0)
+
+    fig = plt.figure(figsize=figsize, constrained_layout=True)
+    gs = fig.add_gridspec(3, len(chosen_periods), height_ratios=[1.65, 2.2, 2.2])
+    ax_table = fig.add_subplot(gs[0, :])
+    axes = np.asarray([
+        [fig.add_subplot(gs[1, col]) for col in range(len(chosen_periods))],
+        [fig.add_subplot(gs[2, col]) for col in range(len(chosen_periods))],
+    ])
+
+    ax_table.axis("off")
+    metric_rows = [
+        ("top wood price", "top", "avg_wood_price", "{:.2f}"),
+        ("bottom wood price", "bottom", "avg_wood_price", "{:.2f}"),
+        ("top stone price", "top", "avg_stone_price", "{:.2f}"),
+        ("bottom stone price", "bottom", "avg_stone_price", "{:.2f}"),
+        ("top avg skill", "top", "avg_skill_level", "{:.2f}"),
+        ("bottom avg skill", "bottom", "avg_skill_level", "{:.2f}"),
+        ("top builds", "top", "n_builds", "{:.0f}"),
+        ("bottom builds", "bottom", "n_builds", "{:.0f}"),
+        ("top avg labor", "top", "avg_labor_used", "{:.2f}"),
+        ("bottom avg labor", "bottom", "avg_labor_used", "{:.2f}"),
+    ]
+    table_values = []
+    row_labels = []
+    for row_label, region, metric, fmt in metric_rows:
+        row_vals = []
+        for tax_period in chosen_periods:
+            match = df_env[
+                (df_env["tax_period"] == tax_period)
+                & (df_env["region"] == region)
+            ]
+            value = match.iloc[0][metric] if len(match) else np.nan
+            row_vals.append("" if pd.isna(value) else fmt.format(value))
+        row_labels.append(row_label)
+        table_values.append(row_vals)
+
+    table = ax_table.table(
+        cellText=table_values,
+        rowLabels=row_labels,
+        colLabels=[f"k={int(k)}" for k in chosen_periods],
+        cellLoc="center",
+        loc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1, 1.05)
+    ax_table.text(
+        0.5,
+        1.03,
+        "Environmental Metrics by Tax Period and Physical Region",
+        transform=ax_table.transAxes,
+        ha="center",
+        va="bottom",
+        fontsize=12,
+    )
+
+    bracket_x = np.arange(len(labels))
+    max_count = max(1, int(counts["n_agents"].max())) if len(counts) else 1
+    colors = {"top": "#1f77b4", "bottom": "#ff7f0e"}
+
+    for row, region in enumerate(["top", "bottom"]):
+        for col, tax_period in enumerate(chosen_periods):
+            ax = axes[row, col]
+            color = colors[region]
+
+            day_counts = (
+                counts[
+                    (counts["region"] == region)
+                    & (counts["tax_period"] == tax_period)
+                ]
+                .set_index("tax_bracket")["n_agents"]
+                .reindex(labels)
+                .fillna(0)
+            )
+
+            tax_row = df_tax[
+                (df_tax["planner_region"] == region)
+                & (df_tax["tax_period"] == tax_period)
+            ]
+            if len(tax_row):
+                rates = np.asarray(tax_row.iloc[0]["tax_schedule"], dtype=float)
+            else:
+                rates = np.full(len(labels), np.nan)
+
+            if len(rates) != len(labels):
+                padded = np.full(len(labels), np.nan)
+                padded[:min(len(labels), len(rates))] = rates[:len(labels)]
+                rates = padded
+
+            scaled_rates = rates * max_count
+            ax.bar(
+                bracket_x,
+                day_counts.values,
+                color=color,
+                alpha=0.32,
+                edgecolor=color,
+                linewidth=1.0,
+            )
+            ax.plot(
+                bracket_x,
+                scaled_rates,
+                color=color,
+                marker="o",
+                linewidth=2.0,
+            )
+
+            outcome = df_outcomes[
+                (df_outcomes["region"] == region)
+                & (df_outcomes["tax_period"] == tax_period)
+            ]
+            if len(outcome):
+                production = outcome.iloc[0]["production"]
+                equality = outcome.iloc[0]["equality"]
+                n_agents = int(outcome.iloc[0]["n_agents"])
+            else:
+                production = np.nan
+                equality = np.nan
+                n_agents = 0
+
+            ax.text(
+                0.03,
+                0.95,
+                f"prod: {production:.1f}\neq: {equality:.3f}\nagents: {n_agents}",
+                transform=ax.transAxes,
+                va="top",
+                ha="left",
+                fontsize=8,
+                bbox=dict(facecolor="white", edgecolor="none", alpha=0.82),
+            )
+
+            ax.set_ylim(0, max_count + 0.6)
+            ax.set_yticks(range(0, max_count + 1))
+            if col == 0:
+                ax.set_ylabel("agents")
+                ax.text(
+                    0.97,
+                    0.95,
+                    region,
+                    transform=ax.transAxes,
+                    va="top",
+                    ha="right",
+                    fontsize=10,
+                    color=color,
+                    fontweight="bold",
+                )
+            else:
+                ax.tick_params(axis="y", labelleft=False)
+
+            if row == 0:
+                ax.set_title(f"k={tax_period}", fontsize=10)
+
+            if row == 1:
+                ax.set_xticks(bracket_x)
+                ax.set_xticklabels([f"b{i}" for i in range(len(labels))], fontsize=8)
+            else:
+                ax.set_xticks(bracket_x)
+                ax.set_xticklabels([])
+
+            if col == len(chosen_periods) - 1:
+                axr = ax.secondary_yaxis(
+                    "right",
+                    functions=(lambda y: y / max_count, lambda y: y * max_count),
+                )
+                axr.set_ylabel("tax rate")
+
+            ax.grid(True, axis="y", alpha=0.25)
+
+    fig.suptitle(
+        "Tax Bracket Snapshots with Regional Environment Metrics",
+        fontsize=14,
+    )
+
+    return fig, df_income, counts, df_outcomes, df_env, df_tax
+
+
+def plot_tax_period_rows_with_environment_metrics(
+    log,
+    brackets,
+    period=100,
+    n_snapshots=10,
+    rate_disc=0.05,
+    figsize=None,
+):
+    """
+    Alternate layout for the same snapshot data.
+
+    Rows are tax periods. Columns show environmental metrics and regional
+    tax-bracket snapshots, which is less cramped when many periods are shown.
+    """
+    df_income, counts, labels = _period_region_income_table(log, brackets, period=period)
+    df_outcomes = _regional_period_outcomes_from_income(df_income)
+    df_env = regional_environment_metrics_by_tax_period(log, period=period)
+    df_tax = _tax_policy_table(log, period=period, rate_disc=rate_disc)
+
+    tax_periods = sorted(df_income["tax_period"].unique())
+    if len(tax_periods) <= n_snapshots:
+        chosen_periods = tax_periods
+    else:
+        idx = np.linspace(0, len(tax_periods) - 1, n_snapshots).round().astype(int)
+        chosen_periods = [tax_periods[i] for i in idx]
+
+    n_rows = len(chosen_periods)
+    if figsize is None:
+        figsize = (14, max(2.4 * n_rows, 10))
+
+    fig = plt.figure(figsize=figsize, constrained_layout=True)
+    gs = fig.add_gridspec(n_rows, 3, width_ratios=[1.45, 1.0, 1.0])
+
+    colors = {"top": "#1f77b4", "bottom": "#ff7f0e"}
+    bracket_x = np.arange(len(labels))
+    max_count = max(1, int(counts["n_agents"].max())) if len(counts) else 1
+
+    metric_labels = [
+        ("wood", "avg_wood_price", "{:.2f}"),
+        ("stone", "avg_stone_price", "{:.2f}"),
+        ("skill", "avg_skill_level", "{:.2f}"),
+        ("builds", "n_builds", "{:.0f}"),
+        ("labor", "avg_labor_used", "{:.2f}"),
+        ("agents", "n_agents", "{:.0f}"),
+    ]
+
+    for row, tax_period in enumerate(chosen_periods):
+        ax_metrics = fig.add_subplot(gs[row, 0])
+        ax_top = fig.add_subplot(gs[row, 1])
+        ax_bottom = fig.add_subplot(gs[row, 2])
+
+        ax_metrics.axis("off")
+        metric_rows = []
+        for label, metric, fmt in metric_labels:
+            row_vals = [label]
+            for region in ["top", "bottom"]:
+                match = df_env[
+                    (df_env["tax_period"] == tax_period)
+                    & (df_env["region"] == region)
+                ]
+                value = match.iloc[0][metric] if len(match) else np.nan
+                row_vals.append("" if pd.isna(value) else fmt.format(value))
+            metric_rows.append(row_vals)
+
+        table = ax_metrics.table(
+            cellText=metric_rows,
+            colLabels=["metric", "top", "bottom"],
+            cellLoc="center",
+            loc="center",
+            colWidths=[0.42, 0.29, 0.29],
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(8)
+        table.scale(1, 1.12)
+        ax_metrics.set_title(f"k={int(tax_period)}", loc="left", fontsize=11, fontweight="bold")
+
+        for region, ax in [("top", ax_top), ("bottom", ax_bottom)]:
+            color = colors[region]
+            day_counts = (
+                counts[
+                    (counts["region"] == region)
+                    & (counts["tax_period"] == tax_period)
+                ]
+                .set_index("tax_bracket")["n_agents"]
+                .reindex(labels)
+                .fillna(0)
+            )
+
+            tax_row = df_tax[
+                (df_tax["planner_region"] == region)
+                & (df_tax["tax_period"] == tax_period)
+            ]
+            if len(tax_row):
+                rates = np.asarray(tax_row.iloc[0]["tax_schedule"], dtype=float)
+            else:
+                rates = np.full(len(labels), np.nan)
+
+            if len(rates) != len(labels):
+                padded = np.full(len(labels), np.nan)
+                padded[:min(len(labels), len(rates))] = rates[:len(labels)]
+                rates = padded
+
+            ax.bar(
+                bracket_x,
+                day_counts.values,
+                color=color,
+                alpha=0.32,
+                edgecolor=color,
+                linewidth=1.0,
+            )
+            ax.plot(
+                bracket_x,
+                rates * max_count,
+                color=color,
+                marker="o",
+                linewidth=1.8,
+            )
+
+            outcome = df_outcomes[
+                (df_outcomes["region"] == region)
+                & (df_outcomes["tax_period"] == tax_period)
+            ]
+            if len(outcome):
+                production = outcome.iloc[0]["production"]
+                equality = outcome.iloc[0]["equality"]
+                n_agents = int(outcome.iloc[0]["n_agents"])
+            else:
+                production = np.nan
+                equality = np.nan
+                n_agents = 0
+
+            ax.text(
+                0.03,
+                0.95,
+                f"prod {production:.1f}\neq {equality:.3f}\nagents {n_agents}",
+                transform=ax.transAxes,
+                va="top",
+                ha="left",
+                fontsize=7.5,
+                bbox=dict(facecolor="white", edgecolor="none", alpha=0.82),
+            )
+
+            ax.set_ylim(0, max_count + 0.6)
+            ax.set_yticks(range(0, max_count + 1))
+            ax.grid(True, axis="y", alpha=0.25)
+            ax.set_xticks(bracket_x)
+            ax.set_xticklabels([f"b{i}" for i in range(len(labels))], fontsize=8)
+
+            if row == 0:
+                ax.set_title(f"{region}: bars agents, line tax schedule", color=color, fontsize=10)
+            if region == "top":
+                ax.set_ylabel("agents")
+            else:
+                ax.tick_params(axis="y", labelleft=False)
+                axr = ax.secondary_yaxis(
+                    "right",
+                    functions=(lambda y: y / max_count, lambda y: y * max_count),
+                )
+                axr.set_ylabel("tax rate")
+
+    fig.suptitle(
+        "Tax Period Rows: Environment Metrics, Tax Groups, Tax Schedule, Production, Equality",
+        fontsize=14,
+    )
+
+    return fig, df_income, counts, df_outcomes, df_env, df_tax
+
+
+def _tax_due_for_schedule(income, schedule, cutoffs):
+    income = float(income)
+    schedule = np.asarray(schedule, dtype=float)
+    cutoffs = np.asarray(cutoffs, dtype=float)
+    if len(schedule) != len(cutoffs):
+        n = min(len(schedule), len(cutoffs))
+        schedule = schedule[:n]
+        cutoffs = cutoffs[:n]
+
+    bracket_edges = np.concatenate([cutoffs, [np.inf]])
+    bracket_sizes = bracket_edges[1:] - bracket_edges[:-1]
+    past_cutoff = np.maximum(0.0, income - cutoffs)
+    bin_income = np.minimum(bracket_sizes, past_cutoff)
+    return float(np.sum(schedule * bin_income))
+
+
+def _planner_schedules_from_actions_at_period(log, tax_period, period=100, rate_disc=0.05):
+    actions = log.get("actions", [])
+    t = min(max(0, (int(tax_period) - 1) * period), max(0, len(actions) - 1))
+    action_t = actions[t] if t < len(actions) else {}
+    schedules = {}
+
+    for planner_id in ["p_top", "p_bottom"]:
+        planner_action = action_t.get(planner_id, {}) if isinstance(action_t, dict) else {}
+        pairs = []
+        for key, value in planner_action.items():
+            if "TaxIndexBracket" not in str(key):
+                continue
+            try:
+                cutoff = float(str(key).split("_")[-1])
+            except ValueError:
+                cutoff = float(len(pairs))
+            rate = np.clip((float(value) - 1.0) * float(rate_disc), 0.0, 1.0)
+            pairs.append((cutoff, float(rate)))
+
+        if pairs:
+            pairs = sorted(pairs, key=lambda x: x[0])
+            schedules[planner_id] = np.asarray([rate for _, rate in pairs], dtype=float)
+
+    return schedules
+
+
+def _all_current_planner_schedules_from_actions(log, period=100, rate_disc=0.05, cutoffs=None):
+    if cutoffs is None:
+        for tax_event in log.get("PeriodicTax", []):
+            if isinstance(tax_event, dict) and tax_event and "cutoffs" in tax_event:
+                cutoffs = np.asarray(tax_event["cutoffs"], dtype=float)
+                break
+    if cutoffs is None:
+        cutoffs = np.asarray([0.0, 9.7, 39.475, 84.2, 160.725, 204.1, 510.3], dtype=float)
+
+    cutoffs = np.asarray(cutoffs, dtype=float)
+    current = {
+        "p_top": np.zeros(len(cutoffs), dtype=float),
+        "p_bottom": np.zeros(len(cutoffs), dtype=float),
+    }
+    schedules = {}
+    n_periods = int(np.ceil((len(log.get("states", [])) - 1) / float(period)))
+
+    for tax_period in range(1, n_periods + 1):
+        t = min(max(0, (tax_period - 1) * period), max(0, len(log.get("actions", [])) - 1))
+        action_t = log.get("actions", [])[t] if log.get("actions", []) else {}
+        period_schedules = {}
+
+        for planner_id in ["p_top", "p_bottom"]:
+            planner_action = action_t.get(planner_id, {}) if isinstance(action_t, dict) else {}
+
+            for key, value in planner_action.items():
+                if "TaxIndexBracket" not in str(key):
+                    continue
+                try:
+                    cutoff = float(str(key).split("_")[-1])
+                except ValueError:
+                    continue
+
+                bracket_idx = int(np.argmin(np.abs(cutoffs - cutoff)))
+                # Planner action 0 is no-op, so the previous current rate remains active.
+                if float(value) > 0:
+                    current[planner_id][bracket_idx] = np.clip(
+                        (float(value) - 1.0) * float(rate_disc),
+                        0.0,
+                        1.0,
+                    )
+
+            period_schedules[planner_id] = current[planner_id].copy()
+
+        schedules[tax_period] = period_schedules
+
+    return schedules
+
+
+def _closest_schedule_id(schedule, candidates):
+    if not candidates:
+        return None
+    schedule = np.asarray(schedule, dtype=float)
+    best_key = None
+    best_dist = np.inf
+    for key, candidate in candidates.items():
+        candidate = np.asarray(candidate, dtype=float)
+        n = min(len(schedule), len(candidate))
+        if n == 0:
+            continue
+        dist = float(np.nanmean(np.abs(schedule[:n] - candidate[:n])))
+        if dist < best_dist:
+            best_dist = dist
+            best_key = key
+    return best_key
+
+
+def agent_tax_mobility_counterfactual_table(log, period=100, rate_disc=0.05, travel_cost_coin=10.0):
+    """
+    Reconstruct full regional taxes/redistribution and counterfactual taxes.
+
+    This is intentionally not limited to dense_log["PeriodicTax"], because both
+    regional tax components share that dense-log key in the current simulator.
+    Instead, per-period taxable income is reconstructed from dense event logs:
+    build income + trade sales - trade purchases - travel fees. Then each agent's
+    actual physical region at the tax boundary determines which current regional
+    planner schedule is applied.
+
+    Returns
+    -------
+    df_agent, df_period
+        df_agent has one row per agent, aggregated over the full episode.
+        df_period has one row per agent per tax event, useful for auditing.
+    """
+    states = log["states"]
+    aids = _numeric_agent_ids(log)
+    waterline = _infer_waterline(log)
+    skill_by_agent = {
+        aid: float(states[0][str(aid)].get("build_payment", np.nan))
+        for aid in aids
+    }
+    all_current_schedules = _all_current_planner_schedules_from_actions(
+        log,
+        period=period,
+        rate_disc=rate_disc,
+    )
+
+    cutoffs = None
+    for tax_event in log.get("PeriodicTax", []):
+        if isinstance(tax_event, dict) and tax_event and "cutoffs" in tax_event:
+            cutoffs = np.asarray(tax_event["cutoffs"], dtype=float)
+            break
+    if cutoffs is None:
+        cutoffs = np.asarray([0.0, 9.7, 39.475, 84.2, 160.725, 204.1, 510.3], dtype=float)
+
+    tax_days = list(range(period - 1, len(states), period))
+    period_rows = []
+
+    for tax_period, tax_t in enumerate(tax_days, start=1):
+        start_t = (tax_period - 1) * period
+        end_t = min(tax_period * period, len(states) - 1)
+        state_idx = min(tax_t, len(states) - 1)
+        schedules = all_current_schedules.get(tax_period, {})
+
+        travel_counts = {aid: 0 for aid in aids}
+        travel_revenue = {"top": 0.0, "bottom": 0.0}
+        for event in log.get("CrossWaterTravel", []):
+            if not isinstance(event, dict) or "t" not in event:
+                continue
+            if start_t <= int(event["t"]) < end_t:
+                aid = int(event.get("agent", -1))
+                if aid in travel_counts:
+                    travel_counts[aid] += 1
+                if "from" in event:
+                    origin_region = _region_from_loc(event["from"], waterline)
+                    travel_revenue[origin_region] += float(travel_cost_coin)
+
+        agent_period = []
+        region_tax_total = {"top": 0.0, "bottom": 0.0}
+        region_agents = {"top": [], "bottom": []}
+
+        for aid in aids:
+            builds = _events_in_period(log.get("Build", []), start_t, end_t, implicit_timeline=True)
+            trades = _events_in_period(log.get("Trade", []), start_t, end_t, implicit_timeline=True)
+            build_income = sum(float(b.get("income", 0.0)) for b in builds if int(b.get("builder", -1)) == aid)
+            sell_income = sum(float(tr.get("income", 0.0)) for tr in trades if int(tr.get("seller", -1)) == aid)
+            buy_cost = sum(float(tr.get("cost", 0.0)) for tr in trades if int(tr.get("buyer", -1)) == aid)
+            travel_cost = travel_counts[aid] * float(travel_cost_coin)
+
+            income = build_income + sell_income - buy_cost - travel_cost
+            agent_region = _location_region_from_state(states[state_idx][str(aid)], waterline=waterline)
+            actual_source = "p_top" if agent_region == "top" else "p_bottom"
+            other_region = "bottom" if agent_region == "top" else "top"
+            counterfactual_source = "p_bottom" if actual_source == "p_top" else "p_top"
+
+            actual_schedule = schedules.get(actual_source, np.zeros(len(cutoffs)))
+            counterfactual_schedule = schedules.get(counterfactual_source, np.zeros(len(cutoffs)))
+            actual_tax_paid = _tax_due_for_schedule(income, actual_schedule, cutoffs)
+            counterfactual_tax_due = _tax_due_for_schedule(income, counterfactual_schedule, cutoffs)
+
+            region_tax_total[agent_region] += actual_tax_paid
+            region_agents[agent_region].append(aid)
+
+            agent_period.append({
+                "tax_period": tax_period,
+                "tax_timestep": tax_t,
+                "agent": aid,
+                "skill_level": skill_by_agent.get(aid, np.nan),
+                "agent_physical_region": agent_region,
+                "taxed_region": agent_region,
+                "other_region": other_region,
+                "income": income,
+                "build_income": build_income,
+                "sell_income": sell_income,
+                "buy_cost": buy_cost,
+                "travel_cost": travel_cost,
+                "actual_tax_paid": actual_tax_paid,
+                "counterfactual_tax_due_if_other_region": counterfactual_tax_due,
+                "actual_minus_counterfactual_tax": actual_tax_paid - counterfactual_tax_due,
+                "actual_schedule_source": actual_source,
+                "counterfactual_schedule_source": counterfactual_source,
+            })
+
+        lump_sum = {
+            region: (
+                (region_tax_total[region] + travel_revenue[region])
+                / max(1, len(region_agents[region]))
+            )
+            for region in ["top", "bottom"]
+        }
+
+        logged_event = log.get("PeriodicTax", [None] * (tax_t + 1))[tax_t]
+        logged_schedule_source = None
+        if isinstance(logged_event, dict) and logged_event and "schedule" in logged_event:
+            logged_schedule_source = _closest_schedule_id(
+                logged_event["schedule"],
+                schedules,
+            )
+
+        for row in agent_period:
+            reconstructed_redistribution = lump_sum[row["agent_physical_region"]]
+            row["redistribution_received"] = reconstructed_redistribution
+            row["region_travel_revenue"] = travel_revenue[row["agent_physical_region"]]
+            row["logged_tax_paid"] = np.nan
+            row["logged_redistribution_received"] = np.nan
+            row["logged_schedule_source"] = logged_schedule_source
+
+            if isinstance(logged_event, dict) and str(row["agent"]) in logged_event:
+                entry = logged_event[str(row["agent"])]
+                if isinstance(entry, dict):
+                    row["logged_tax_paid"] = float(entry.get("tax_paid", np.nan))
+                    row["logged_redistribution_received"] = float(entry.get("lump_sum", np.nan))
+                    if row["actual_schedule_source"] == logged_schedule_source:
+                        row["actual_tax_paid"] = row["logged_tax_paid"]
+                        row["redistribution_received"] = row["logged_redistribution_received"]
+                        row["actual_minus_counterfactual_tax"] = (
+                            row["actual_tax_paid"]
+                            - row["counterfactual_tax_due_if_other_region"]
+                        )
+            row["reconstructed_redistribution_received"] = reconstructed_redistribution
+
+            period_rows.append(row)
+
+    df_period = pd.DataFrame(period_rows)
+    if df_period.empty:
+        empty_agent = pd.DataFrame({"agent": aids})
+        return empty_agent, df_period
+
+    rows = []
+    for aid, dfa in df_period.groupby("agent"):
+        top_mask = dfa["taxed_region"] == "top"
+        bottom_mask = dfa["taxed_region"] == "bottom"
+
+        rows.append({
+            "agent": int(aid),
+            "skill_level": skill_by_agent.get(int(aid), np.nan),
+            "total_tax_paid_top_region": float(dfa.loc[top_mask, "actual_tax_paid"].sum()),
+            "total_tax_paid_bottom_region": float(dfa.loc[bottom_mask, "actual_tax_paid"].sum()),
+            "total_redistribution_top_region": float(dfa.loc[top_mask, "redistribution_received"].sum()),
+            "total_redistribution_bottom_region": float(dfa.loc[bottom_mask, "redistribution_received"].sum()),
+            "total_actual_tax_paid": float(dfa["actual_tax_paid"].sum()),
+            "total_counterfactual_tax_due_if_other_region": float(
+                dfa["counterfactual_tax_due_if_other_region"].sum()
+            ),
+            "total_actual_minus_counterfactual_tax": float(
+                dfa["actual_minus_counterfactual_tax"].sum()
+            ),
+            "net_tax_after_redistribution": float(
+                dfa["actual_tax_paid"].sum() - dfa["redistribution_received"].sum()
+            ),
+            "n_tax_events_with_top_region": int(top_mask.sum()),
+            "n_tax_events_with_bottom_region": int(bottom_mask.sum()),
+        })
+
+    return pd.DataFrame(rows).sort_values("agent").reset_index(drop=True), df_period
+
+
+def _events_in_period(events, start_t, end_t, implicit_timeline=False):
+    out = []
+    for idx, item in enumerate(events):
+        if not item:
+            continue
+        step_items = item if isinstance(item, list) else item.get("events", item.get("trades", item.get("builds", []))) if isinstance(item, dict) else []
+        if isinstance(step_items, dict):
+            step_items = [step_items]
+        if not isinstance(step_items, list):
+            continue
+        for event in step_items:
+            if not isinstance(event, dict):
+                continue
+            t = int(event.get("t", idx if implicit_timeline else -1))
+            if start_t <= t < end_t:
+                out.append(event)
+    return out
+
+
+def _regional_feedback_table(log, period=100, rate_disc=0.05, high_skill_quantile=0.5):
+    tax_df = _extract_tax_policy_from_actions(log, period=period, rate_disc=rate_disc)
+    if tax_df.empty:
+        raise ValueError("No regional tax policy could be extracted from the dense log.")
+
+    states = log["states"]
+    aids = _numeric_agent_ids(log)
+    waterline = _infer_waterline(log)
+    skills = {
+        aid: float(states[0][str(aid)].get("build_payment", np.nan))
+        for aid in aids
+    }
+    finite_skills = np.asarray([v for v in skills.values() if np.isfinite(v)], dtype=float)
+    high_skill_cutoff = (
+        float(np.nanquantile(finite_skills, high_skill_quantile))
+        if len(finite_skills)
+        else np.nan
+    )
+
+    rewards = {
+        "top": np.asarray(log.get("planner_rewards", {}).get("p_top", []), dtype=float),
+        "bottom": np.asarray(log.get("planner_rewards", {}).get("p_bottom", []), dtype=float),
+    }
+
+    rows = []
+    n_periods = int(tax_df["tax_period"].max())
+    for tax_period in range(1, n_periods + 1):
+        start_t = (tax_period - 1) * period
+        end_t = min(tax_period * period, len(states) - 1)
+        state_t = states[end_t]
+
+        builds = _events_in_period(log.get("Build", []), start_t, end_t, implicit_timeline=True)
+        trades = _events_in_period(log.get("Trade", []), start_t, end_t, implicit_timeline=True)
+        travels = _events_in_period(log.get("CrossWaterTravel", []), start_t, end_t, implicit_timeline=False)
+
+        for region, planner_id in [("top", "p_top"), ("bottom", "p_bottom")]:
+            region_aids = [
+                aid for aid in aids
+                if _location_region_from_state(state_t[str(aid)], waterline=waterline) == region
+            ]
+            assigned_aids = [
+                aid for aid in aids
+                if _planner_region_from_initial_state(log, aid, waterline=waterline) == region
+            ]
+
+            region_builds = [
+                b for b in builds
+                if int(b.get("builder", -1)) in region_aids
+            ]
+            region_trades = [
+                tr for tr in trades
+                if tr.get("region") == region
+                or int(tr.get("buyer", -1)) in region_aids
+                or int(tr.get("seller", -1)) in region_aids
+            ]
+            region_travels = [
+                ev for ev in travels
+                if int(ev.get("agent", -1)) in region_aids
+            ]
+
+            coins = np.asarray([_coin(state_t[str(aid)]) for aid in assigned_aids], dtype=float)
+            utilities = np.asarray(
+                [float(state_t[str(aid)].get("utility", np.nan)) for aid in assigned_aids],
+                dtype=float,
+            )
+            skill_vals = [skills[aid] for aid in region_aids]
+            high_skill = [
+                v for v in skill_vals
+                if np.isfinite(v) and np.isfinite(high_skill_cutoff) and v >= high_skill_cutoff
+            ]
+
+            reward_arr = rewards[region]
+            reward_slice = reward_arr[start_t:min(end_t, len(reward_arr))]
+            reward_slice = reward_slice[np.isfinite(reward_slice)]
+
+            rows.append({
+                "tax_period": tax_period,
+                "start_timestep": start_t,
+                "end_timestep": end_t,
+                "planner_region": region,
+                "planner_id": planner_id,
+                "population": len(region_aids),
+                "population_share": len(region_aids) / max(1, len(aids)),
+                "share_high_skill": len(high_skill) / max(1, len(region_aids)),
+                "build_count": len(region_builds),
+                "build_income": float(np.sum([b.get("income", 0.0) for b in region_builds])),
+                "trade_count": len(region_trades),
+                "trade_volume": float(np.sum([tr.get("price", tr.get("income", 0.0)) for tr in region_trades])),
+                "travel_count": len(region_travels),
+                "mean_labor": float(np.nanmean([
+                    state_t[str(aid)].get("endogenous", {}).get("Labor", np.nan)
+                    for aid in region_aids
+                ])) if region_aids else np.nan,
+                "production": float(np.nansum(coins)) if len(coins) else np.nan,
+                "equality": _equality_from_values(coins) if len(coins) else np.nan,
+                "swf_proxy": float(np.nansum(coins) * _equality_from_values(coins)) if len(coins) else np.nan,
+                "mean_utility": float(np.nanmean(utilities)) if len(utilities) else np.nan,
+                "planner_reward_sum": float(np.sum(reward_slice)) if len(reward_slice) else np.nan,
+                "planner_reward_mean": float(np.mean(reward_slice)) if len(reward_slice) else np.nan,
+            })
+
+    behavior_df = pd.DataFrame(rows)
+    df = behavior_df.merge(
+        tax_df.drop(columns=["planner_id"]),
+        on=["tax_period", "planner_region"],
+        how="left",
+    )
+
+    next_tax = tax_df[["tax_period", "planner_region", "top_marginal_rate", "avg_marginal_rate", "progressivity"]].copy()
+    next_tax["tax_period"] = next_tax["tax_period"] - 1
+    next_tax = next_tax.rename(columns={
+        "top_marginal_rate": "next_top_marginal_rate",
+        "avg_marginal_rate": "next_avg_marginal_rate",
+        "progressivity": "next_progressivity",
+    })
+
+    df = df.merge(next_tax, on=["tax_period", "planner_region"], how="left")
+    return df
+
+
+def plot_lagged_agent_planner_response_panel(
+    log,
+    period=100,
+    rate_disc=0.05,
+    policy_metric="top_marginal_rate",
+    behavior_metric="build_count",
+    composition_metric="share_high_skill",
+    welfare_metric="planner_reward_sum",
+    high_skill_quantile=0.5,
+    figsize=(12, 9),
+):
+    """
+    Plot tax-period timing: tax policy_k, behavior_k, composition_k, welfare_k.
+
+    Returns
+    -------
+    fig, df
+        df includes the lagged next-period tax columns used by the phase plot.
+    """
+    df = _regional_feedback_table(
+        log,
+        period=period,
+        rate_disc=rate_disc,
+        high_skill_quantile=high_skill_quantile,
+    )
+
+    labels = {
+        "top_marginal_rate": "top marginal tax rate",
+        "avg_marginal_rate": "average marginal tax rate",
+        "progressivity": "tax progressivity",
+        "build_count": "builds",
+        "build_income": "build income",
+        "trade_count": "trades",
+        "trade_volume": "trade volume",
+        "travel_count": "travel events",
+        "mean_labor": "mean labor",
+        "share_high_skill": "high-skill share",
+        "population_share": "population share",
+        "planner_reward_sum": "planner reward, period sum",
+        "planner_reward_mean": "planner reward, period mean",
+        "swf_proxy": "welfare proxy",
+        "production": "production",
+        "equality": "equality",
+    }
+
+    metrics = [
+        (policy_metric, f"Planner policy at start of k: {labels.get(policy_metric, policy_metric)}"),
+        (behavior_metric, f"Agent behavior during k: {labels.get(behavior_metric, behavior_metric)}"),
+        (composition_metric, f"Regional composition at end of k: {labels.get(composition_metric, composition_metric)}"),
+        (welfare_metric, f"Planner outcome over k: {labels.get(welfare_metric, welfare_metric)}"),
+    ]
+
+    colors = {"top": "#1f77b4", "bottom": "#ff7f0e"}
+    fig, axes = plt.subplots(4, 1, figsize=figsize, sharex=True, constrained_layout=True)
+
+    for ax, (metric, title) in zip(axes, metrics):
+        if metric not in df.columns:
+            raise ValueError(f"Unknown metric {metric!r}. Available columns: {sorted(df.columns)}")
+
+        for region in ["top", "bottom"]:
+            dfr = df[df["planner_region"] == region].sort_values("tax_period")
+            ax.plot(
+                dfr["tax_period"],
+                dfr[metric],
+                marker="o",
+                linewidth=2,
+                color=colors[region],
+                label=region,
+            )
+        ax.set_title(title)
+        ax.set_ylabel(labels.get(metric, metric))
+        ax.grid(True, alpha=0.3)
+
+    axes[0].legend(title="region", ncol=2, loc="best")
+    axes[-1].set_xlabel("tax period k")
+    fig.suptitle("Lagged Agent-Planner Response Panel", fontsize=14)
+    return fig, df
+
+
+def plot_regional_composition_tax_phase(
+    feedback_df,
+    composition_metric="share_high_skill",
+    next_policy_metric="next_top_marginal_rate",
+    figsize=(8, 6),
+):
+    """
+    Phase plot with x_{r,k} on the x-axis and tax policy_{r,k+1} on the y-axis.
+    """
+    if composition_metric not in feedback_df.columns:
+        raise ValueError(f"Unknown composition_metric {composition_metric!r}.")
+    if next_policy_metric not in feedback_df.columns:
+        raise ValueError(f"Unknown next_policy_metric {next_policy_metric!r}.")
+
+    labels = {
+        "share_high_skill": "share high-skill agents in region r during k",
+        "population_share": "population share in region r during k",
+        "production": "tax base / production in region r during k",
+        "equality": "equality in region r during k",
+        "next_top_marginal_rate": "top marginal tax rate in k+1",
+        "next_avg_marginal_rate": "average marginal tax rate in k+1",
+        "next_progressivity": "tax progressivity in k+1",
+    }
+    colors = {"top": "#1f77b4", "bottom": "#ff7f0e"}
+
+    df = feedback_df.dropna(subset=[composition_metric, next_policy_metric]).copy()
+    if df.empty:
+        raise ValueError("No non-missing lagged composition/policy pairs are available.")
+
+    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+    max_period = max(1, int(df["tax_period"].max()))
+
+    for region in ["top", "bottom"]:
+        dfr = df[df["planner_region"] == region].sort_values("tax_period")
+        if dfr.empty:
+            continue
+
+        x = dfr[composition_metric].to_numpy(dtype=float)
+        y = dfr[next_policy_metric].to_numpy(dtype=float)
+        c = dfr["tax_period"].to_numpy(dtype=float)
+
+        ax.plot(x, y, color=colors[region], alpha=0.35, linewidth=1.5)
+        sc = ax.scatter(
+            x,
+            y,
+            c=c,
+            cmap="viridis",
+            vmin=1,
+            vmax=max_period,
+            s=65,
+            edgecolor=colors[region],
+            linewidth=1.4,
+            label=region,
+            zorder=3,
+        )
+
+        for i in range(len(x) - 1):
+            ax.annotate(
+                "",
+                xy=(x[i + 1], y[i + 1]),
+                xytext=(x[i], y[i]),
+                arrowprops=dict(arrowstyle="->", color=colors[region], lw=1.4, alpha=0.75),
+            )
+
+    ax.set_xlabel(labels.get(composition_metric, composition_metric))
+    ax.set_ylabel(labels.get(next_policy_metric, next_policy_metric))
+    ax.set_title("Co-Evolution of Regional Composition and Tax Policy")
+    ax.grid(True, alpha=0.3)
+    ax.legend(title="region")
+    cbar = fig.colorbar(sc, ax=ax, pad=0.02)
+    cbar.set_label("tax period k")
+    return fig
