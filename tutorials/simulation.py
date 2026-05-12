@@ -499,7 +499,7 @@ def build_policies(
         "entropy_coeff": 0.02,
         "model": {
             "custom_model": "keras_linear",
-            "custom_options": {
+            "custom_model_config": {
                 "fully_connected_value": True,
                 "fc_dim": 128,
                 "num_fc": 2,

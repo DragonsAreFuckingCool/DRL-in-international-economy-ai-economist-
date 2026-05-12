@@ -28,6 +28,17 @@ _WORLD_IDX_MAP_NAME = "world-idx_map"
 _MASK_NAME = "action_mask"
 
 
+def get_custom_model_options(model_config, kwargs=None):
+    """Support both old custom_options and RLlib custom_model_config styles."""
+    if kwargs:
+        return dict(kwargs)
+    options = model_config.get("custom_model_config", None)
+    if options:
+        return dict(options)
+    options = model_config.get("custom_options", None)
+    return dict(options) if isinstance(options, dict) else {}
+
+
 def get_flat_obs_size(obs_space):
     if isinstance(obs_space, Box):
         return np.prod(obs_space.shape)
@@ -68,16 +79,28 @@ class KerasConvLSTM(RecurrentTFModelV2):
 
     custom_name = "keras_conv_lstm"
 
-    def __init__(self, obs_space, action_space, num_outputs, model_config, name):
+    def __init__(
+        self,
+        obs_space,
+        action_space,
+        num_outputs,
+        model_config,
+        name,
+        **custom_model_config
+    ):
         super().__init__(obs_space, action_space, num_outputs, model_config, name)
 
-        input_emb_vocab = self.model_config["custom_options"]["input_emb_vocab"]
-        emb_dim = self.model_config["custom_options"]["idx_emb_dim"]
-        num_conv = self.model_config["custom_options"]["num_conv"]
-        num_fc = self.model_config["custom_options"]["num_fc"]
-        fc_dim = self.model_config["custom_options"]["fc_dim"]
-        cell_size = self.model_config["custom_options"]["lstm_cell_size"]
-        generic_name = self.model_config["custom_options"].get("generic_name", None)
+        custom_options = get_custom_model_options(
+            self.model_config,
+            custom_model_config,
+        )
+        input_emb_vocab = custom_options["input_emb_vocab"]
+        emb_dim = custom_options["idx_emb_dim"]
+        num_conv = custom_options["num_conv"]
+        num_fc = custom_options["num_fc"]
+        fc_dim = custom_options["fc_dim"]
+        cell_size = custom_options["lstm_cell_size"]
+        generic_name = custom_options.get("generic_name", None)
 
         self.cell_size = cell_size
 
@@ -324,13 +347,26 @@ class KerasLinear(TFModelV2):
 
     custom_name = "keras_linear"
 
-    def __init__(self, obs_space, action_space, num_outputs, model_config, name):
+    def __init__(
+        self,
+        obs_space,
+        action_space,
+        num_outputs,
+        model_config,
+        name,
+        **custom_model_config
+    ):
         super().__init__(obs_space, action_space, num_outputs, model_config, name)
         self.MASK_NAME = "action_mask"
-        mask = obs_space.original_space.spaces[self.MASK_NAME]
+        original_space = (
+            obs_space.original_space
+            if hasattr(obs_space, "original_space")
+            else obs_space
+        )
+        mask = original_space.spaces[self.MASK_NAME]
         mask_input = tf.keras.layers.Input(shape=mask.shape, name=self.MASK_NAME)
 
-        custom_options = model_config["custom_options"]
+        custom_options = get_custom_model_options(model_config, custom_model_config)
         if custom_options.get('fully_connected_value', False):
             self.fc_dim = int(custom_options["fc_dim"])
             self.num_fc = int(custom_options["num_fc"])
@@ -392,7 +428,15 @@ class RandomAction(TFModelV2):
     """
     custom_name = "random"
 
-    def __init__(self, obs_space, action_space, num_outputs, model_config, name):
+    def __init__(
+        self,
+        obs_space,
+        action_space,
+        num_outputs,
+        model_config,
+        name,
+        **custom_model_config
+    ):
         super().__init__(obs_space, action_space, num_outputs, model_config, name)
 
         if hasattr(obs_space, "original_space"):
