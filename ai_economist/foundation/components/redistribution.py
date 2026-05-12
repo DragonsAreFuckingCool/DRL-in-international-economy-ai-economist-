@@ -1330,6 +1330,16 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
     # Select correct planner actions
     # ---------------------------------------------------------------------
 
+    @property
+    def curr_marginal_rates(self):
+        """Return exact fixed rates when this regional planner is fixed."""
+        if self._fixed_planner_bracket_rates is not None:
+            return np.minimum(
+                np.array(self._fixed_planner_bracket_rates, dtype=float),
+                self.curr_rate_max,
+            )
+        return super().curr_marginal_rates
+
     def set_new_period_rates_model(self):
         """Use ONLY the bound planner's actions."""
         if self.disable_taxes:
@@ -1609,3 +1619,9 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
 
         # Return per-planner dict
         return {str(planner.idx): masks}
+
+    def get_dense_log(self):
+        """Keep top and bottom regional tax logs from overwriting each other."""
+        if self.disable_taxes:
+            return None
+        return {str(self._planner_id): self.taxes}
