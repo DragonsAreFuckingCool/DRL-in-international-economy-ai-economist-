@@ -1575,6 +1575,18 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
         if str(planner.idx) != str(self._planner_id):
             return {}
 
+        if (
+            completions != self._last_completions
+            and self.tax_annealing_schedule is not None
+        ):
+            self._last_completions = int(completions)
+            self._annealed_rate_max = annealed_tax_limit(
+                completions,
+                self._annealing_warmup,
+                self._annealing_slope,
+                self.rate_max,
+            )
+
         # All bracket keys (full set from both components, 14 total in your setup)
         all_keys = [f"TaxIndexBracket_{int(r):03d}" for r in self.bracket_cutoffs]
 
@@ -1592,7 +1604,7 @@ class RegionalPeriodicBracketTax(PeriodicBracketTax):
         # Apply annealing cap if present
         if getattr(self, "tax_annealing_schedule", None) is not None:
             cap = float(getattr(self, "_annealed_rate_max", disc[-1]))
-            allowed_idx = np.where(disc <= cap)[0]
+            allowed_idx = np.where(disc <= cap + 1e-8)[0]
 
         # Guarantee a minimum band size to avoid single-choice collapse
         # e.g., allow at least the first 4 choices (0%, 5%, 10%, 15%) early on.

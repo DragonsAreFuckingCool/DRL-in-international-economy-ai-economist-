@@ -34,7 +34,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 from ai_economist import foundation 
+from ai_economist.foundation.components.utils import annealed_tax_limit
 from ai_economist.foundation.scenarios.utils.rewards import coin_eq_times_productivity
+from rllib import tf_models as _tf_models  # Registers masking-aware custom RLlib models.
 from rllib.env_wrapper import RLlibEnvWrapper
 
 # -----------------------------------------------------------------------------
@@ -285,6 +287,7 @@ def regional_tax_component(
     disable_taxes: bool,
     period: int,
     fixed_bracket_rates: Optional[Sequence[float]] = None,
+    tax_annealing_schedule: Optional[Sequence[float]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     cfg: Dict[str, Any] = {
         "region": region,
@@ -301,7 +304,8 @@ def regional_tax_component(
             }
         )
         if fixed_bracket_rates is None:
-            cfg["tax_annealing_schedule"] = [-100, 0.001]
+            if tax_annealing_schedule is not None:
+                cfg["tax_annealing_schedule"] = list(tax_annealing_schedule)
         else:
             cfg["fixed_planner_bracket_rates"] = list(fixed_bracket_rates)
     return ("RegionalPeriodicBracketTax", cfg)
@@ -336,6 +340,7 @@ def make_phase_env_config(
     travel_cost_labor: float,
     travel_cooldown: int,
     restrict_trade_to_region: bool,
+    tax_annealing_schedule: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
     cfg = deepcopy(base_env_config(settings))
     fixed_tax_planner_ids = fixed_tax_planner_ids_from_settings(settings)
@@ -353,6 +358,7 @@ def make_phase_env_config(
                 if "p_top" in fixed_tax_planner_ids
                 else None
             ),
+            tax_annealing_schedule=tax_annealing_schedule,
         ),
         regional_tax_component(
             region="bottom",
@@ -364,6 +370,7 @@ def make_phase_env_config(
                 if "p_bottom" in fixed_tax_planner_ids
                 else None
             ),
+            tax_annealing_schedule=tax_annealing_schedule,
         ),
         travel_component_config(
             enabled=travel_enabled,
@@ -432,6 +439,7 @@ def build_all_phase_env_configs(settings: ExperimentSettings) -> Dict[str, Dict[
             travel_cost_labor=settings.travel_cost_labor_phase1,
             travel_cooldown=settings.travel_cooldown_phase1,
             restrict_trade_to_region=settings.restrict_trade_to_region,
+            tax_annealing_schedule=None,
         ),
         "phase2": make_phase_env_config(
             settings,
@@ -441,6 +449,9 @@ def build_all_phase_env_configs(settings: ExperimentSettings) -> Dict[str, Dict[
             travel_cost_labor=settings.travel_cost_labor_phase2,
             travel_cooldown=settings.travel_cooldown_phase2,
             restrict_trade_to_region=settings.restrict_trade_to_region,
+            #tax_annealing_schedule=(0, 0.01),
+            tax_annealing_schedule=(0, 0.0125)
+
         ),
         "phase3a": make_phase_env_config(
             settings,
@@ -450,6 +461,7 @@ def build_all_phase_env_configs(settings: ExperimentSettings) -> Dict[str, Dict[
             travel_cost_labor=settings.travel_cost_labor_phase3a,
             travel_cooldown=settings.travel_cooldown_phase3a,
             restrict_trade_to_region=settings.restrict_trade_to_region,
+            tax_annealing_schedule=None,
         ),
         "phase3b": make_phase_env_config(
             settings,
@@ -459,6 +471,7 @@ def build_all_phase_env_configs(settings: ExperimentSettings) -> Dict[str, Dict[
             travel_cost_labor=settings.travel_cost_labor_phase3b,
             travel_cooldown=settings.travel_cooldown_phase3b,
             restrict_trade_to_region=settings.restrict_trade_to_region,
+            tax_annealing_schedule=None,
         ),
     }
 
@@ -481,8 +494,20 @@ def build_policies(
     act_space_bottom = env_obj.action_space_pl["p_bottom"]
 
     agent_policy_config = agent_policy_config or {"lr": 3e-4}
-    p_top_config = p_top_config or {"lr": 1e-4, "entropy_coeff": 0.02}
-    p_bottom_config = p_bottom_config or {"lr": 1e-4, "entropy_coeff": 0.02}
+    default_planner_config = {
+        "lr": 1e-4,
+        "entropy_coeff": 0.02,
+        "model": {
+            "custom_model": "keras_linear",
+            "custom_options": {
+                "fully_connected_value": True,
+                "fc_dim": 128,
+                "num_fc": 2,
+            },
+        },
+    }
+    p_top_config = {**default_planner_config, **(p_top_config or {})}
+    p_bottom_config = {**default_planner_config, **(p_bottom_config or {})}
 
     return {
         "a": (None, obs_space_a, act_space_a, agent_policy_config),
@@ -613,6 +638,18 @@ def patch_regional_tax_masks(env_obj: RLlibEnvWrapper, min_band: int = 4) -> Non
                 if planner is None or str(planner.idx) != str(self._planner_id):
                     return {}
 
+                if (
+                    completions != self._last_completions
+                    and self.tax_annealing_schedule is not None
+                ):
+                    self._last_completions = int(completions)
+                    self._annealed_rate_max = annealed_tax_limit(
+                        completions,
+                        self._annealing_warmup,
+                        self._annealing_slope,
+                        self.rate_max,
+                    )
+
                 all_keys = [f"TaxIndexBracket_{int(r):03d}" for r in self.bracket_cutoffs]
                 my_keys = [f"TaxIndexBracket_{int(r):03d}" for r in self.regional_brackets]
 
@@ -621,7 +658,7 @@ def patch_regional_tax_masks(env_obj: RLlibEnvWrapper, min_band: int = 4) -> Non
 
                 if getattr(self, "tax_annealing_schedule", None) is not None:
                     cap = float(getattr(self, "_annealed_rate_max", disc[-1]))
-                    allowed_idx = np.where(disc <= cap)[0]
+                    allowed_idx = np.where(disc <= cap + 1e-8)[0]
                 else:
                     allowed_idx = np.arange(n_rates)
 

@@ -9,10 +9,12 @@ import os
 import numpy as np
 from gym.spaces import Box, Dict
 from ray.rllib.models import ModelCatalog
-from ray.rllib.models.tf.recurrent_tf_modelv2 import (
-    RecurrentTFModelV2,
-    add_time_dimension,
-)
+try:
+    from ray.rllib.models.tf.recurrent_tf_modelv2 import RecurrentTFModelV2
+    from ray.rllib.models.tf.recurrent_tf_modelv2 import add_time_dimension
+except (ImportError, ModuleNotFoundError):
+    from ray.rllib.models.tf.recurrent_tf_model_v2 import RecurrentTFModelV2
+    from ray.rllib.policy.rnn_sequencing import add_time_dimension
 from ray.rllib.models.tf.tf_modelv2 import TFModelV2
 from ray.rllib.utils import try_import_tf
 from tensorflow import keras
