@@ -63,7 +63,7 @@ class ExperimentSettings:
     sgd_minibatch_size: int = 128
     num_sgd_iter: int = 2
 
-    min_band: int = 4
+    min_band: int = 3
     period: int = 100
     episode_length: int = 1000
     world_size: Tuple[int, int] = (51, 25)
@@ -957,6 +957,66 @@ def generate_rollout_with_planner_actions(
     return dense_logs
 
 
+def _mean_tax_rates_for_env(env_obj: Any) -> Dict[str, float]:
+    base_env = getattr(env_obj, "env", env_obj)
+    values: Dict[str, List[float]] = {"p_top": [], "p_bottom": []}
+
+    for component in getattr(base_env, "components", []):
+        if getattr(component, "name", "") != "RegionalPeriodicBracketTax":
+            continue
+
+        planner_id = str(getattr(component, "_planner_id", ""))
+        if planner_id not in values:
+            continue
+
+        rates = getattr(component, "curr_marginal_rates", None)
+        if callable(rates):
+            rates = rates()
+
+        arr = np.asarray(rates, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size:
+            values[planner_id].append(float(np.mean(arr)))
+
+    return {
+        planner_id: float(np.mean(planner_values)) if planner_values else np.nan
+        for planner_id, planner_values in values.items()
+    }
+
+
+def collect_mean_tax_rates(trainer) -> Dict[str, float]:
+    """Average the current marginal tax schedules across rollout envs."""
+    values: Dict[str, List[float]] = {"p_top": [], "p_bottom": []}
+
+    def _collect(worker):
+        try:
+            return worker.foreach_env(_mean_tax_rates_for_env)
+        except Exception:
+            env_obj = getattr(worker, "env", None)
+            return [_mean_tax_rates_for_env(env_obj)] if env_obj is not None else []
+
+    try:
+        worker_results = trainer.workers.foreach_worker(_collect)
+    except Exception as exc:
+        print(f"DEBUG mean tax collection error: {exc!r}")
+        worker_results = []
+
+    for worker_result in worker_results:
+        env_results = worker_result if isinstance(worker_result, list) else [worker_result]
+        for env_result in env_results:
+            if not isinstance(env_result, dict):
+                continue
+            for planner_id in values:
+                rate = env_result.get(planner_id, np.nan)
+                if np.isfinite(rate):
+                    values[planner_id].append(float(rate))
+
+    return {
+        planner_id: float(np.mean(planner_values)) if planner_values else np.nan
+        for planner_id, planner_values in values.items()
+    }
+
+
 def train_phase(
     trainer,
     *,
@@ -986,6 +1046,10 @@ def train_phase(
         row["policy_reward_mean/p_bottom"] = policy_reward_mean.get("p_bottom", np.nan)
         row["policy_reward_mean/a"] = policy_reward_mean.get("a", np.nan)
 
+        mean_tax = collect_mean_tax_rates(trainer)
+        row["mean_tax/p_top"] = mean_tax.get("p_top", np.nan)
+        row["mean_tax/p_bottom"] = mean_tax.get("p_bottom", np.nan)
+
         try:
             env = trainer.workers.local_worker().env
             coins = np.array(
@@ -1008,6 +1072,10 @@ def train_phase(
             print(
                 f"   p_top reward: {row['policy_reward_mean/p_top']}, "
                 f"p_bottom reward: {row['policy_reward_mean/p_bottom']}"
+            )
+            print(
+                f"   mean tax: p_top={row['mean_tax/p_top']}, "
+                f"p_bottom={row['mean_tax/p_bottom']}"
             )
             print(f"   social welfare (coin_eq_times_prod): {row['social_welfare_coin_eq_times_prod']}")
 
@@ -1125,6 +1193,42 @@ def run_experiment(settings: ExperimentSettings) -> Dict[str, Any]:
     # -------------------------------------------------------------------------
     # PHASE 2: freeze agents, train planners
     # -------------------------------------------------------------------------
+    # env_phase2 = create_env(phase_env_configs["phase2"])
+    # patch_regional_tax_masks(env_phase2, min_band=settings.min_band)
+
+    # trainer_phase2 = create_trainer(
+    #     settings=settings,
+    #     env_config_dict=phase_env_configs["phase2"],
+    #     env_obj=env_phase2,
+    #     policies_to_train=trainable_planners,
+    # )
+    # patch_trainer_envs(trainer_phase2, min_band=settings.min_band)
+    # set_policy_weights_and_sync(trainer_phase2, {"a": agent_weights_phase1})
+
+    # ckpt_phase2 = train_phase(
+    #     trainer_phase2,
+    #     phase_name="PHASE 2",
+    #     iterations=settings.phase2_iters,
+    #     metrics_store=all_metrics,
+    #     run_dir=run_dir,
+    #     save_results=settings.save_results,
+    # )
+
+    # planner_top_weights_phase2 = trainer_phase2.get_policy("p_top").get_weights()
+    # planner_bottom_weights_phase2 = trainer_phase2.get_policy("p_bottom").get_weights()
+
+    # dense_logs_phase2 = generate_rollout_with_planner_actions(
+    #     trainer_phase2,
+    #     env_phase2,
+    #     num_dense_logs=1,
+    #     explore=False,
+    #     log_only_tax_days=False,
+    # )
+    # maybe_save_pickle(dense_logs_phase2, run_dir, "dense_logs_phase2.pkl")
+
+    # -------------------------------------------------------------------------
+    # PHASE 2: Train together with annealing
+    # -------------------------------------------------------------------------
     env_phase2 = create_env(phase_env_configs["phase2"])
     patch_regional_tax_masks(env_phase2, min_band=settings.min_band)
 
@@ -1132,9 +1236,10 @@ def run_experiment(settings: ExperimentSettings) -> Dict[str, Any]:
         settings=settings,
         env_config_dict=phase_env_configs["phase2"],
         env_obj=env_phase2,
-        policies_to_train=trainable_planners,
+        policies_to_train=["a", *trainable_planners],
     )
     patch_trainer_envs(trainer_phase2, min_band=settings.min_band)
+
     set_policy_weights_and_sync(trainer_phase2, {"a": agent_weights_phase1})
 
     ckpt_phase2 = train_phase(
@@ -1146,6 +1251,7 @@ def run_experiment(settings: ExperimentSettings) -> Dict[str, Any]:
         save_results=settings.save_results,
     )
 
+    agent_weights_phase2 = trainer_phase2.get_policy("a").get_weights()
     planner_top_weights_phase2 = trainer_phase2.get_policy("p_top").get_weights()
     planner_bottom_weights_phase2 = trainer_phase2.get_policy("p_bottom").get_weights()
 
@@ -1157,6 +1263,8 @@ def run_experiment(settings: ExperimentSettings) -> Dict[str, Any]:
         log_only_tax_days=False,
     )
     maybe_save_pickle(dense_logs_phase2, run_dir, "dense_logs_phase2.pkl")
+
+
 
     # -------------------------------------------------------------------------
     # PHASE 3A: train agents against fixed planners
@@ -1176,7 +1284,7 @@ def run_experiment(settings: ExperimentSettings) -> Dict[str, Any]:
     set_policy_weights_and_sync(
         trainer_phase3a,
         {
-            "a": agent_weights_phase1,
+            "a": agent_weights_phase2,
             "p_top": planner_top_weights_phase2,
             "p_bottom": planner_bottom_weights_phase2,
         },

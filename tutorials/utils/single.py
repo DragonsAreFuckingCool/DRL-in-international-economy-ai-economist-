@@ -354,12 +354,20 @@ def plot_forced_move_timeseries(log, window=100):
 
     fig, axes = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
 
-    axes[0].plot(df["relative_t"], df["coin"], label="Coin")
-    axes[0].plot(df["relative_t"], df["utility"], label="Utility")
+    ax_coin = axes[0]
+    ax_utility = ax_coin.twinx()
+    coin_line = ax_coin.plot(df["relative_t"], df["coin"], color="#1f77b4", label="Coin")
+    utility_line = ax_utility.plot(df["relative_t"], df["utility"], color="#d62728", label="Utility")
     axes[0].axvline(0, linestyle="--")
+    ax_utility.axvline(0, linestyle="--", color="0.5", alpha=0.4)
     axes[0].set_title(f"Agent {agent_id}: coin and utility around forced move")
-    axes[0].legend()
-    axes[0].grid(True)
+    ax_coin.set_ylabel("Coin", color="#1f77b4")
+    ax_utility.set_ylabel("Utility", color="#d62728")
+    ax_coin.tick_params(axis="y", labelcolor="#1f77b4")
+    ax_utility.tick_params(axis="y", labelcolor="#d62728")
+    lines = coin_line + utility_line
+    ax_coin.legend(lines, [line.get_label() for line in lines], loc="best")
+    ax_coin.grid(True)
 
     axes[1].plot(df["relative_t"], df["wood"], label="Wood")
     axes[1].plot(df["relative_t"], df["stone"], label="Stone")

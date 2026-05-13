@@ -1815,6 +1815,12 @@ def load_experiment_run(run_dir):
     with open(os.path.join(run_dir, "summary.json"), "r") as f:
         summary = json.load(f)
 
+    config_path = os.path.join(run_dir, "config.json")
+    config = {}
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            config = json.load(f)
+
         
     with open(os.path.join(run_dir, "dense_logs_final.pkl"), "rb") as f:
         dense_logs = pickle.load(f)
@@ -1832,6 +1838,7 @@ def load_experiment_run(run_dir):
         "run_dir": run_dir,
         "name": summary.get("experiment_name", os.path.basename(run_dir)),
         "summary": summary,
+        "config": config,
         "metrics": metrics,
         "dense_logs": dense_logs,
         "dense_log": dense_log,
@@ -1843,6 +1850,69 @@ def load_experiment_runs(run_dirs):
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
+
+def _regional_tax_component_config(config, phase_name, planner_id):
+    phase_key = phase_name.lower().replace(" ", "")
+    env_config = config.get(f"env_config_dict_{phase_key}", {})
+
+    for component in env_config.get("components", []):
+        if not isinstance(component, (list, tuple)) or len(component) != 2:
+            continue
+        component_name, component_config = component
+        if component_name != "RegionalPeriodicBracketTax":
+            continue
+        if str(component_config.get("planner_id")) == str(planner_id):
+            return component_config
+
+    return None
+
+
+def _reconstruct_tax_annealing_cap(metrics, config):
+    metrics = metrics.copy()
+    episode_length = float(config.get("episode_length", 1000))
+    fragment_length = float(config.get("rollout_fragment_length", 1))
+    min_band = int(config.get("min_band", 4))
+    rate_disc = 0.05
+
+    for planner_id in ["p_top", "p_bottom"]:
+        values = []
+        for _, row in metrics.iterrows():
+            phase_name = str(row.get("phase", ""))
+            component = _regional_tax_component_config(config, phase_name, planner_id)
+
+            if component is None:
+                values.append(np.nan)
+                continue
+
+            if bool(component.get("disable_taxes", False)):
+                values.append(0.0)
+                continue
+
+            fixed_rates = component.get("fixed_bracket_rates")
+            if fixed_rates is not None:
+                arr = np.asarray(fixed_rates, dtype=float)
+                values.append(float(np.nanmean(arr)) if arr.size else np.nan)
+                continue
+
+            schedule = component.get("tax_annealing_schedule")
+            if schedule is None:
+                values.append(float(component.get("rate_max", 1.0)))
+                continue
+
+            warmup, slope = float(schedule[0]), float(schedule[1])
+            completions = np.floor((float(row.get("iter", 0)) + 1.0) * fragment_length / episode_length)
+            cap = np.maximum(0.0, np.minimum(1.0, slope * (completions - warmup)))
+            cap *= float(component.get("rate_max", 1.0))
+
+            # The component also keeps the first min_band discrete rates open.
+            min_band_cap = max(0, min_band - 1) * rate_disc
+            values.append(float(max(cap, min_band_cap)))
+
+        metrics[f"tax_annealing_cap/{planner_id}"] = values
+
+    return metrics
+
 
 def compare_training_curves(
     runs,
@@ -1884,6 +1954,21 @@ def compare_training_curves(
     """
 
     phase_order = ["PHASE 1", "PHASE 2", "PHASE 3A", "PHASE 3B"]
+    metric_key = str(metric).lower().replace(" ", "_")
+    metric_series = [(metric, None)]
+    metric_title = metric.replace("_", " ").title()
+    if metric_key == "tax_annealing_cap":
+        metric_series = [
+            ("tax_annealing_cap/p_top", "top planner"),
+            ("tax_annealing_cap/p_bottom", "bottom planner"),
+        ]
+        metric_title = "Tax Annealing Cap"
+    elif metric_key == "mean_tax":
+        metric_series = [
+            ("mean_tax/p_top", "top planner"),
+            ("mean_tax/p_bottom", "bottom planner"),
+        ]
+        metric_title = "Mean Tax"
 
     # Build labels
     run_names = [run["name"] for run in runs]
@@ -1902,6 +1987,7 @@ def compare_training_curves(
         "#8c564b",  # brown
     ]
     linestyles = ["-", "--", "-.", ":", (0, (5, 2)), (0, (3, 1, 1, 1))]
+    metric_linestyles = ["-", "--", "-.", ":"]
 
     fig, ax = plt.subplots(figsize=figsize)
 
@@ -1910,9 +1996,19 @@ def compare_training_curves(
 
     for i, run in enumerate(runs):
         df = run["metrics"].copy()
+        run_metric_series = list(metric_series)
+        if metric_key == "tax_annealing_cap":
+            df = _reconstruct_tax_annealing_cap(df, run.get("config", {}))
 
-        if metric not in df.columns:
-            print(f"Skipping {run['name']}: metric '{metric}' not found.")
+        missing = [column for column, _ in run_metric_series if column not in df.columns]
+        if missing:
+            if metric_key == "mean_tax":
+                print(
+                    f"{run['name']}: mean_tax was not logged in training_metrics.csv; "
+                    "cannot plot the actual applied mean tax for this run."
+                )
+            else:
+                print(f"Skipping {run['name']}: metric '{metric}' needs missing column(s): {missing}.")
             continue
 
         df["phase"] = pd.Categorical(df["phase"], categories=phase_order, ordered=True)
@@ -1920,62 +2016,78 @@ def compare_training_curves(
 
         color = colors[i % len(colors)]
         linestyle = linestyles[i % len(linestyles)]
-        label = short_labels[run["name"]]
+        run_label = short_labels[run["name"]]
 
-        cumulative_offset = 0
-        x_all = []
-        y_all = []
-        boundaries = []
-
-        for phase in phase_order:
-            sdf = df[df["phase"] == phase].copy()
-            if sdf.empty:
-                continue
-
-            y_phase = sdf[metric].astype(float).to_numpy()
-
-            if smooth_window > 1 and len(y_phase) >= smooth_window:
-                y_phase = (
-                    pd.Series(y_phase)
-                    .rolling(window=smooth_window, min_periods=1, center=False)
-                    .mean()
-                    .to_numpy()
-                )
-
-            x_phase = np.arange(len(sdf)) + cumulative_offset
-
-            if by_phase:
-                ax.plot(
-                    x_phase,
-                    y_phase,
-                    color=color,
-                    linestyle=linestyle,
-                    linewidth=2,
-                    alpha=0.95,
-                    label=f"{label} | {phase}",
-                )
-            else:
-                x_all.extend(x_phase.tolist())
-                y_all.extend(y_phase.tolist())
-
-            cumulative_offset = x_phase[-1] + 1
-            boundaries.append(cumulative_offset)
-
-        if not by_phase and len(x_all) > 0:
-            ax.plot(
-                x_all,
-                y_all,
-                color=color,
-                linestyle=linestyle,
-                linewidth=2,
-                alpha=0.95,
-                label=label,
+        for series_idx, (metric_column, series_label) in enumerate(run_metric_series):
+            cumulative_offset = 0
+            x_all = []
+            y_all = []
+            boundaries = []
+            series_linestyle = (
+                metric_linestyles[series_idx % len(metric_linestyles)]
+                if len(run_metric_series) > 1
+                else linestyle
+            )
+            label = (
+                f"{run_label} | {series_label}"
+                if series_label is not None and len(runs) > 1
+                else (series_label or run_label)
             )
 
-        max_x = max(max_x, cumulative_offset)
+            for phase in phase_order:
+                sdf = df[df["phase"] == phase].copy()
+                if sdf.empty:
+                    continue
 
-        if all_boundaries is None:
-            all_boundaries = boundaries
+                y_phase = sdf[metric_column].astype(float).to_numpy()
+
+                if smooth_window > 1 and len(y_phase) >= smooth_window:
+                    y_phase = (
+                        pd.Series(y_phase)
+                        .rolling(window=smooth_window, min_periods=1, center=False)
+                        .mean()
+                        .to_numpy()
+                    )
+
+                x_phase = np.arange(len(sdf)) + cumulative_offset
+
+                if by_phase:
+                    ax.plot(
+                        x_phase,
+                        y_phase,
+                        color=color,
+                        linestyle=series_linestyle,
+                        linewidth=2,
+                        alpha=0.95,
+                        label=f"{label} | {phase}",
+                    )
+                else:
+                    x_all.extend(x_phase.tolist())
+                    y_all.extend(y_phase.tolist())
+
+                cumulative_offset = x_phase[-1] + 1
+                boundaries.append(cumulative_offset)
+
+            if not by_phase and len(x_all) > 0:
+                y_all_arr = np.asarray(y_all, dtype=float)
+                if not np.any(np.isfinite(y_all_arr)):
+                    print(f"Skipping {run['name']} {label}: no finite values for '{metric_column}'.")
+                    continue
+
+                ax.plot(
+                    x_all,
+                    y_all_arr,
+                    color=color,
+                    linestyle=series_linestyle,
+                    linewidth=2,
+                    alpha=0.95,
+                    label=label,
+                )
+
+            max_x = max(max_x, cumulative_offset)
+
+            if all_boundaries is None:
+                all_boundaries = boundaries
 
     # Draw phase boundaries once
     if show_phase_boundaries and all_boundaries is not None:
@@ -1983,7 +2095,7 @@ def compare_training_curves(
             ax.axvline(b, linestyle="--", alpha=0.35, color="gray", linewidth=1)
 
     # Nicer labels
-    pretty_title = metric.replace("_", " ").title()
+    pretty_title = metric_title
     ax.set_title(pretty_title)
     ax.set_xlabel("Training iteration (cumulative across phases)")
     ax.set_ylabel(pretty_title)
@@ -2006,6 +2118,16 @@ def compare_training_curves(
         )
         fig.tight_layout(rect=[0, 0.08, 1, 1])
     else:
+        ax.text(
+            0.5,
+            0.5,
+            f"No finite values found for {metric!r}",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=11,
+            color="0.35",
+        )
         fig.tight_layout()
 
     return fig
