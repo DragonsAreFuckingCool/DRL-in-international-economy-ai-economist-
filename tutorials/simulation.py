@@ -1263,6 +1263,9 @@ def run_experiment(settings: ExperimentSettings) -> Dict[str, Any]:
         log_only_tax_days=False,
     )
     maybe_save_pickle(dense_logs_phase2, run_dir, "dense_logs_phase2.pkl")
+    trainer_phase2.stop()
+    del trainer_phase2
+    gc.collect()
 
 
 
@@ -1309,6 +1312,9 @@ def run_experiment(settings: ExperimentSettings) -> Dict[str, Any]:
         log_only_tax_days=False,
     )
     maybe_save_pickle(dense_logs_phase3a, run_dir, "dense_logs_phase3a.pkl")
+    trainer_phase3a.stop()
+    del trainer_phase3a
+    gc.collect()
 
     # -------------------------------------------------------------------------
     # PHASE 3B: joint training
@@ -1410,8 +1416,6 @@ def run_experiment(settings: ExperimentSettings) -> Dict[str, Any]:
         "dense_logs": dense_logs_final,
         "phase_checkpoints": portable_checkpoints,
         "trainers": {
-            "phase2": trainer_phase2,
-            "phase3a": trainer_phase3a,
             "phase3b": trainer_phase3b,
         },
         "envs": {
