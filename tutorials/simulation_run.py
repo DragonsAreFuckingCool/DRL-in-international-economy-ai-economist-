@@ -20,8 +20,8 @@ settings = exp.ExperimentSettings(
     phase3a_iters = 500,
     phase3b_iters = 1500,
     save_results=True,
-    travel_enabled_phase3a=False,
-    travel_enabled_phase3b=False,
+    travel_enabled_phase3a=True,
+    travel_enabled_phase3b=True,
     restrict_trade_to_region = False,
 
     fixed_tax_planner_id=None, #("p_top", "p_bottom"),
@@ -29,14 +29,14 @@ settings = exp.ExperimentSettings(
     #fixed_tax_bracket_rates_top=(0.05, 0.07, 0.17, 0.19, 0.27, 0.30, 0.32), #lux-old
     #fixed_tax_bracket_rates_top=(0.09, 0.123, 0.18, 0.24, 0.30, 0.36, 0.405),
     fixed_tax_bracket_rates_bottom=(0.1, 0.12, 0.22, 0.24, 0.32, 0.35, 0.37), #US
-    experiment_extra_tag="final_Trade",
+    experiment_extra_tag="final_trade_10_12",
     layout_file = "stacked_51x25_symetric_original.txt",
 
     travel_cost_coin_phase3a = 10,
-    travel_cost_labor_phase3a = 10,
+    travel_cost_labor_phase3a = 12,
 
     travel_cost_coin_phase3b = 10,
-    travel_cost_labor_phase3b = 10,
+    travel_cost_labor_phase3b = 12,
 
 # same as AI economist original 
     # num_workers=15,
