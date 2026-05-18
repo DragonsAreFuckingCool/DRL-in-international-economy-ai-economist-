@@ -1986,8 +1986,7 @@ def compare_training_curves(
         "#ff7f0e",  # orange
         "#8c564b",  # brown
     ]
-    linestyles = ["-", "--", "-.", ":", (0, (5, 2)), (0, (3, 1, 1, 1))]
-    metric_linestyles = ["-", "--", "-.", ":"]
+    linestyles = ["-"]
 
     fig, ax = plt.subplots(figsize=figsize)
 
@@ -2023,11 +2022,12 @@ def compare_training_curves(
             x_all = []
             y_all = []
             boundaries = []
-            series_linestyle = (
-                metric_linestyles[series_idx % len(metric_linestyles)]
+            series_color = (
+                colors[(i * len(run_metric_series) + series_idx) % len(colors)]
                 if len(run_metric_series) > 1
-                else linestyle
+                else color
             )
+            series_linestyle = linestyle
             label = (
                 f"{run_label} | {series_label}"
                 if series_label is not None and len(runs) > 1
@@ -2055,7 +2055,7 @@ def compare_training_curves(
                     ax.plot(
                         x_phase,
                         y_phase,
-                        color=color,
+                        color=series_color,
                         linestyle=series_linestyle,
                         linewidth=2,
                         alpha=0.95,
@@ -2077,7 +2077,7 @@ def compare_training_curves(
                 ax.plot(
                     x_all,
                     y_all_arr,
-                    color=color,
+                    color=series_color,
                     linestyle=series_linestyle,
                     linewidth=2,
                     alpha=0.95,
@@ -2132,6 +2132,27 @@ def compare_training_curves(
 
     return fig
 
+def plot_planner_rewards(run, smooth_window=25):
+    df = run["metrics"].copy()
+    df = df.reset_index(drop=True)
+    x = range(len(df))
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    for col in ["policy_reward_mean/p_top", "policy_reward_mean/p_bottom"]:
+        y = df[col].astype(float)
+        if smooth_window > 1:
+            y = y.rolling(smooth_window, min_periods=1).mean()
+        ax.plot(x, y, label=col)
+
+    ax.set_title("Planner policy rewards")
+    ax.set_xlabel("Training row")
+    ax.set_ylabel("Mean policy reward")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
 def compare_summary_bars(
     runs,
     metrics=None,
@@ -2148,6 +2169,7 @@ def compare_summary_bars(
         metrics = [
             "mean_final_coin",
             "gini_final_coin",
+            "avg_social_welfare",
             "mean_final_labor",
             "n_trades",
             "n_builds",
@@ -2184,6 +2206,31 @@ def compare_summary_bars(
             final_coin.append(float(coin))
             final_labor.append(float(labor))
 
+        def social_welfare_from_coins(coins):
+            coins = np.asarray(coins, dtype=float)
+            coins = coins[np.isfinite(coins)]
+            if len(coins) == 0:
+                return np.nan
+            return float(np.sum(coins) * (1.0 - gini(coins)))
+
+        social_welfare_by_timestep = []
+        for state in states:
+            coins_t = []
+            for aid in agent_ids:
+                agent_state = state.get(str(aid), {})
+                inventory = agent_state.get("inventory", {})
+                escrow = agent_state.get("escrow", {})
+                coins_t.append(
+                    float(inventory.get("Coin", 0.0)) + float(escrow.get("Coin", 0.0))
+                )
+            social_welfare_by_timestep.append(social_welfare_from_coins(coins_t))
+
+        mean_social_welfare = (
+            float(np.nanmean(social_welfare_by_timestep))
+            if len(social_welfare_by_timestep) else np.nan
+        )
+        final_social_welfare = social_welfare_from_coins(final_coin)
+
         n_trades = 0
         if "Trade" in log:
             for t in log["Trade"]:
@@ -2200,6 +2247,9 @@ def compare_summary_bars(
             "mean_final_coin": float(np.mean(final_coin)) if final_coin else np.nan,
             "std_final_coin": float(np.std(final_coin)) if final_coin else np.nan,
             "gini_final_coin": gini(final_coin),
+            "avg_social_welfare": mean_social_welfare,
+            "mean_social_welfare": mean_social_welfare,
+            "final_social_welfare": final_social_welfare,
             "mean_final_labor": float(np.mean(final_labor)) if final_labor else np.nan,
             "n_trades": float(n_trades),
             "n_builds": float(n_builds),
@@ -2301,6 +2351,14 @@ def compare_summary_bars(
 
     fig_width = max(8, 1.25 * len(metrics))
     fig, ax = plt.subplots(1, 1, figsize=(fig_width, 4.8), constrained_layout=False)
+    welfare_metrics = {
+        "avg_social_welfare",
+        "mean_social_welfare",
+        "final_social_welfare",
+        "social_welfare_coin_eq_times_prod",
+    }
+    social_metrics = [m for m in metrics if m in welfare_metrics]
+    ax_social = ax.twinx() if social_metrics else None
 
     x = np.arange(len(metrics))
     group_width = 0.62
@@ -2308,30 +2366,41 @@ def compare_summary_bars(
     offsets = (np.arange(len(run_names)) - (len(run_names) - 1) / 2) * bar_width
 
     for run_i, name in enumerate(run_names):
-        vals = summary_df.loc[name, metrics].to_numpy(dtype=float)
-        yerr = np.array(
-            [err_lookup[name].get(metric, np.nan) for metric in metrics],
-            dtype=float,
-        )
-        yerr = np.where(np.isfinite(yerr), yerr, 0.0)
+        for target_ax, target_metrics, alpha in [
+            (ax, [m for m in metrics if m not in welfare_metrics], 0.9),
+            (ax_social, social_metrics, 0.72),
+        ]:
+            if target_ax is None or not target_metrics:
+                continue
+            positions = np.array([metrics.index(metric) for metric in target_metrics], dtype=float)
+            vals = summary_df.loc[name, target_metrics].to_numpy(dtype=float)
+            yerr = np.array(
+                [err_lookup[name].get(metric, np.nan) for metric in target_metrics],
+                dtype=float,
+            )
+            yerr = np.where(np.isfinite(yerr), yerr, 0.0)
 
-        ax.bar(
-            x + offsets[run_i],
-            vals,
-            color=colors[name],
-            width=bar_width * 0.82,
-            alpha=0.9,
-            yerr=None if errorbar is None else yerr,
-            capsize=3 if errorbar is not None else 0,
-            ecolor="black",
-            linewidth=0,
-            label=short_labels[name],
-        )
+            target_ax.bar(
+                positions + offsets[run_i],
+                vals,
+                color=colors[name],
+                width=bar_width * 0.82,
+                alpha=alpha,
+                yerr=None if errorbar is None else yerr,
+                capsize=3 if errorbar is not None else 0,
+                ecolor="black",
+                linewidth=0,
+                label=short_labels[name],
+            )
 
     ax.set_title("Summary Metrics")
     ax.set_xticks(x)
     ax.set_xticklabels([metric.replace("_", " ").title() for metric in metrics], rotation=20, ha="right")
+    ax.set_ylabel("Summary metrics")
     ax.grid(True, axis="y", alpha=0.3)
+    if ax_social is not None:
+        ax_social.set_ylabel("Social welfare")
+        ax_social.grid(False)
 
     if show_legend:
         legend_handles = [
@@ -2572,6 +2641,7 @@ def compare_market_size_prices_trade_activity(
     mode="single",
     smooth_window=1,
     price_fill_method="interpolate",
+    show_std=True,
     show_legend=True,
     figsize=(12, 10),
 ):
@@ -2628,6 +2698,10 @@ def compare_market_size_prices_trade_activity(
         means = np.full_like(sums, np.nan, dtype=float)
         np.divide(sums, valid, out=means, where=valid > 0)
         out = pd.DataFrame(means, columns=numeric_cols)
+        stds = np.nanstd(stacked, axis=0, ddof=1) if len(frames) > 1 else np.zeros_like(means)
+        stds = np.where(valid > 1, stds, 0.0)
+        for col_idx, col in enumerate(numeric_cols):
+            out[f"{col}_std"] = stds[:, col_idx]
         out["timestep"] = np.arange(min_len)
         return out
 
@@ -2683,27 +2757,60 @@ def compare_market_size_prices_trade_activity(
         x = df["timestep"]
         color = colors[name]
 
+        market_size_y = smooth_series(df["market_size"], smooth_window)
         axes[0].plot(
             x,
-            smooth_series(df["market_size"], smooth_window),
+            market_size_y,
             color=color,
             linewidth=2.2,
             label=label,
         )
+        if show_std and mode == "average" and "market_size_std" in df:
+            market_size_sd = smooth_series(df["market_size_std"], smooth_window).fillna(0.0)
+            axes[0].fill_between(
+                x,
+                market_size_y - market_size_sd,
+                market_size_y + market_size_sd,
+                color=color,
+                alpha=0.16,
+                linewidth=0,
+            )
+        price_y = display_price_series(df["mean_price"])
         axes[1].plot(
             x,
-            display_price_series(df["mean_price"]),
+            price_y,
             color=color,
             linewidth=2.2,
             label=label,
         )
+        if show_std and mode == "average" and "mean_price_std" in df:
+            price_sd = display_price_series(df["mean_price_std"]).fillna(0.0)
+            axes[1].fill_between(
+                x,
+                price_y - price_sd,
+                price_y + price_sd,
+                color=color,
+                alpha=0.16,
+                linewidth=0,
+            )
+        trade_count_y = smooth_series(df["trade_count"], smooth_window)
         axes[2].plot(
             x,
-            smooth_series(df["trade_count"], smooth_window),
+            trade_count_y,
             color=color,
             linewidth=2.2,
             label=label,
         )
+        if show_std and mode == "average" and "trade_count_std" in df:
+            trade_count_sd = smooth_series(df["trade_count_std"], smooth_window).fillna(0.0)
+            axes[2].fill_between(
+                x,
+                trade_count_y - trade_count_sd,
+                trade_count_y + trade_count_sd,
+                color=color,
+                alpha=0.16,
+                linewidth=0,
+            )
 
     title_suffix = "Single Rollout" if mode == "single" else "Mean Across Dense Logs"
     axes[0].set_title(f"Market Size: Escrowed Resources ({title_suffix})")
@@ -2928,7 +3035,7 @@ def extract_planner_redistribution_table(log, period=100, rate_disc=0.05):
 
     return df
 
-def extract_planner_redistribution_by_period(log, period=100, rate_disc=0.05):
+def extract_planner_redistribution_by_period(log, period=100, rate_disc=0.05, travel_cost_coin=0.0):
     """Return planner redistribution and income-tax contribution by tax period."""
     import numpy as np
     import pandas as pd
@@ -2968,6 +3075,7 @@ def extract_planner_redistribution_by_period(log, period=100, rate_disc=0.05):
         start_t = 0 if tax_period == 1 else prev_t + 1
 
         tariff_by_region = {"top": 0.0, "bottom": 0.0}
+        travel_by_region = {"top": 0.0, "bottom": 0.0}
         for trade_t in range(start_t, tax_t + 1):
             if trade_t >= len(log.get("Trade", [])):
                 continue
@@ -2987,6 +3095,21 @@ def extract_planner_redistribution_by_period(log, period=100, rate_disc=0.05):
                 if region in tariff_by_region:
                     tariff_by_region[region] += float(trade.get("tariff", 0.0) or 0.0)
 
+        for event in _iter_travel_events(log):
+            event_t = int(event.get("t", -1))
+            if event_t < start_t or event_t > tax_t:
+                continue
+            origin = event.get("from", None)
+            if origin is None:
+                continue
+            origin_region = "top" if int(origin[0]) < waterline else "bottom"
+            travel_amount = event.get(
+                "travel_cost_coin",
+                event.get("cost", event.get("tax", travel_cost_coin)),
+            )
+            if origin_region in travel_by_region:
+                travel_by_region[origin_region] += float(travel_amount or 0.0)
+
         for region, planner_id in planner_id_by_region.items():
             schedule = schedules.get(planner_id, np.zeros(len(cutoffs), dtype=float))
             region_aids = [
@@ -3005,16 +3128,19 @@ def extract_planner_redistribution_by_period(log, period=100, rate_disc=0.05):
                 )
                 income_tax_total += float(np.minimum(inventory_coin, tax_due))
 
-            redistributed = income_tax_total + tariff_by_region[region]
+            redistributed = income_tax_total + tariff_by_region[region] + travel_by_region[region]
             rows.append({
                 "tax_period": tax_period,
                 "timestep": tax_t,
                 "planner_region": region,
                 "income": income_total,
                 "income_tax_collected": income_tax_total,
+                "travel_tax_revenue": travel_by_region[region],
                 "tariff_revenue": tariff_by_region[region],
                 "redistributed": redistributed,
                 "income_tax_funded_redistribution": income_tax_total,
+                "travel_tax_funded_redistribution": travel_by_region[region],
+                "trade_tariff_funded_redistribution": tariff_by_region[region],
                 "non_income_tax_redistribution": max(0.0, redistributed - income_tax_total),
                 "n_agents": len(region_aids),
             })
@@ -3029,6 +3155,7 @@ def plot_trade_enabled_run_trade_and_redistribution(
     period=100,
     rate_disc=0.05,
     dense_log_key=None,
+    show_std=True,
     figsize=(14, 10),
 ):
     """
@@ -3068,6 +3195,30 @@ def plot_trade_enabled_run_trade_and_redistribution(
             with open(config_path, "r") as f:
                 run_config = json.load(f)
 
+    def infer_travel_cost_coin(config):
+        if not isinstance(config, dict):
+            return 0.0
+        for key in ["travel_cost_coin_phase3b", "travel_cost_coin_phase3a", "travel_cost_coin"]:
+            if key in config:
+                return float(config[key])
+        phase_configs = [
+            value for key, value in config.items()
+            if isinstance(value, dict) and "components" in value
+        ]
+        for phase_config in reversed(phase_configs):
+            for component in phase_config.get("components", []):
+                if (
+                    isinstance(component, (list, tuple))
+                    and len(component) >= 2
+                    and component[0] == "CrossWaterTravel"
+                    and isinstance(component[1], dict)
+                    and "travel_cost_coin" in component[1]
+                ):
+                    return float(component[1]["travel_cost_coin"])
+        return 0.0
+
+    travel_cost_coin = infer_travel_cost_coin(run_config)
+
     trade_frames = []
     redistrib_frames = []
     for rollout_id, log in logs:
@@ -3086,6 +3237,7 @@ def plot_trade_enabled_run_trade_and_redistribution(
             log,
             period=period,
             rate_disc=rate_disc,
+            travel_cost_coin=travel_cost_coin,
         )
         if not redist_df.empty:
             redist_df = redist_df.copy()
@@ -3105,7 +3257,7 @@ def plot_trade_enabled_run_trade_and_redistribution(
 
     if trade_raw.empty:
         trade_units = pd.DataFrame(columns=["tax_period", "commodity", "route_group", "units", "units_std"])
-        price_summary = pd.DataFrame(columns=["commodity", "route_group", "avg_price"])
+        price_summary = pd.DataFrame(columns=["commodity", "route_group", "avg_price", "avg_price_std"])
     elif mode == "average":
         per_rollout_units = (
             trade_raw
@@ -3126,8 +3278,9 @@ def plot_trade_enabled_run_trade_and_redistribution(
         price_summary = (
             per_rollout_prices
             .groupby(["commodity", "route_group"], as_index=False)
-            .agg(avg_price=("avg_price", "mean"))
+            .agg(avg_price=("avg_price", "mean"), avg_price_std=("avg_price", "std"))
         )
+        price_summary["avg_price_std"] = price_summary["avg_price_std"].fillna(0.0)
     else:
         trade_units = (
             trade_raw
@@ -3140,11 +3293,13 @@ def plot_trade_enabled_run_trade_and_redistribution(
             .groupby(["commodity", "route_group"], as_index=False)
             .agg(avg_price=("price", "mean"))
         )
+        price_summary["avg_price_std"] = 0.0
 
     if redist_raw.empty:
         redist = pd.DataFrame(columns=[
             "tax_period", "planner_region", "income_tax_funded_redistribution",
-            "non_income_tax_redistribution", "redistributed"
+            "travel_tax_funded_redistribution", "trade_tariff_funded_redistribution",
+            "non_income_tax_redistribution", "redistributed", "redistributed_std"
         ])
     elif mode == "average":
         redist = (
@@ -3155,23 +3310,47 @@ def plot_trade_enabled_run_trade_and_redistribution(
                 income_tax_collected=("income_tax_collected", "mean"),
                 tariff_revenue=("tariff_revenue", "mean"),
                 redistributed=("redistributed", "mean"),
+                redistributed_std=("redistributed", "std"),
                 income_tax_funded_redistribution=("income_tax_funded_redistribution", "mean"),
+                income_tax_funded_redistribution_std=("income_tax_funded_redistribution", "std"),
+                travel_tax_funded_redistribution=("travel_tax_funded_redistribution", "mean"),
+                travel_tax_funded_redistribution_std=("travel_tax_funded_redistribution", "std"),
+                trade_tariff_funded_redistribution=("trade_tariff_funded_redistribution", "mean"),
+                trade_tariff_funded_redistribution_std=("trade_tariff_funded_redistribution", "std"),
                 non_income_tax_redistribution=("non_income_tax_redistribution", "mean"),
+                non_income_tax_redistribution_std=("non_income_tax_redistribution", "std"),
             )
         )
+        redist[[
+            "redistributed_std",
+            "income_tax_funded_redistribution_std",
+            "travel_tax_funded_redistribution_std",
+            "trade_tariff_funded_redistribution_std",
+            "non_income_tax_redistribution_std",
+        ]] = redist[[
+            "redistributed_std",
+            "income_tax_funded_redistribution_std",
+            "travel_tax_funded_redistribution_std",
+            "trade_tariff_funded_redistribution_std",
+            "non_income_tax_redistribution_std",
+        ]].fillna(0.0)
     else:
         redist = redist_raw.copy()
+        redist["redistributed_std"] = 0.0
+        redist["income_tax_funded_redistribution_std"] = 0.0
+        redist["travel_tax_funded_redistribution_std"] = 0.0
+        redist["trade_tariff_funded_redistribution_std"] = 0.0
+        redist["non_income_tax_redistribution_std"] = 0.0
 
-    fig = plt.figure(figsize=figsize, constrained_layout=True)
+    fig = plt.figure(figsize=(figsize[0], max(6, figsize[1] * 0.68)), constrained_layout=True)
     gs = fig.add_gridspec(
-        3,
+        2,
         2,
         width_ratios=[1.0, 1.0],
-        height_ratios=[1.25, 0.9, 1.35],
+        height_ratios=[1.25, 0.9],
     )
     ax_trade = fig.add_subplot(gs[0, :])
     ax_pies = [fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[1, 1])]
-    ax_redist = fig.add_subplot(gs[2, :])
 
     commodities = ["Wood", "Stone"]
     route_groups = ["within region", "cross region"]
@@ -3217,7 +3396,7 @@ def plot_trade_enabled_run_trade_and_redistribution(
             edgecolor="0.25",
             linewidth=0.5,
             label=f"{commodity}: within",
-            yerr=within_err if mode == "average" else None,
+            yerr=within_err if mode == "average" and show_std else None,
             error_kw=dict(ecolor="0.25", elinewidth=0.8, capsize=2, capthick=0.8),
         )
         ax_trade.bar(
@@ -3231,7 +3410,7 @@ def plot_trade_enabled_run_trade_and_redistribution(
             linewidth=0.5,
             hatch="//",
             label=f"{commodity}: cross",
-            yerr=cross_err if mode == "average" else None,
+            yerr=cross_err if mode == "average" and show_std else None,
             error_kw=dict(ecolor="0.25", elinewidth=0.8, capsize=2, capthick=0.8),
         )
 
@@ -3258,8 +3437,19 @@ def plot_trade_enabled_run_trade_and_redistribution(
                 & (price_summary["route_group"] == route_group)
             ]
             price = float(price_match["avg_price"].mean()) if len(price_match) else np.nan
+            price_std = (
+                float(price_match["avg_price_std"].mean())
+                if len(price_match) and "avg_price_std" in price_match
+                else np.nan
+            )
             price_label = "within" if route_group == "within region" else "cross"
-            price_lines.append(f"{price_label} avg seller price: {'n/a' if pd.isna(price) else f'{price:.2f}'}")
+            if pd.isna(price):
+                price_text = "n/a"
+            elif show_std and mode == "average" and not pd.isna(price_std):
+                price_text = f"{price:.2f} +/- {price_std:.2f}"
+            else:
+                price_text = f"{price:.2f}"
+            price_lines.append(f"{price_label} avg seller price: {price_text}")
 
         if sum(values) > 0:
             ax.pie(
@@ -3288,78 +3478,84 @@ def plot_trade_enabled_run_trade_and_redistribution(
             fontsize=9,
         )
 
+    fig_redist, redist_axes = plt.subplots(
+        1,
+        2,
+        figsize=(figsize[0], max(4.8, figsize[1] * 0.48)),
+        sharey=True,
+        constrained_layout=True,
+    )
+
     tax_periods = sorted(redist["tax_period"].dropna().unique()) if not redist.empty else []
     planners = ["top", "bottom"]
-    bar_width = 0.36
+    source_specs = [
+        ("income_tax_funded_redistribution", "income tax", "#4c78a8"),
+        ("travel_tax_funded_redistribution", "travel tax", "#f58518"),
+        ("trade_tariff_funded_redistribution", "trade tariff", "#54a24b"),
+    ]
+    bar_width = 0.68
     period_x = np.arange(len(tax_periods))
-    planner_offsets = {"top": -bar_width / 2, "bottom": bar_width / 2}
-    planner_colors = {"top": "#ff7f0e", "bottom": "#9467bd"}
 
-    for planner in planners:
-        income_vals = []
-        other_vals = []
-        tariff_vals = []
-        for tax_period in tax_periods:
-            match = redist[
-                (redist["tax_period"] == tax_period)
-                & (redist["planner_region"] == planner)
-            ]
-            income_vals.append(
-                float(match["income_tax_funded_redistribution"].sum())
-                if len(match) else 0.0
+    for ax_redist, planner in zip(redist_axes, planners):
+        planner_df = redist[redist["planner_region"] == planner] if not redist.empty else redist
+        bottoms = np.zeros(len(tax_periods), dtype=float)
+
+        for source_col, label, color in source_specs:
+            vals = []
+            for tax_period in tax_periods:
+                match = planner_df[planner_df["tax_period"] == tax_period]
+                vals.append(float(match[source_col].sum()) if len(match) else 0.0)
+            vals = np.asarray(vals, dtype=float)
+            ax_redist.bar(
+                period_x,
+                vals,
+                bottom=bottoms,
+                width=bar_width,
+                label=label,
+                color=color,
+                edgecolor="white",
+                linewidth=0.8,
             )
-            other_vals.append(
-                float(match["non_income_tax_redistribution"].sum())
-                if len(match) else 0.0
-            )
-            tariff_vals.append(
-                float(match["tariff_revenue"].sum())
-                if len(match) and "tariff_revenue" in match else 0.0
-            )
-        pos = period_x + planner_offsets[planner]
-        ax_redist.bar(
-            pos,
-            income_vals,
-            width=bar_width,
-            label=f"{planner}: from income tax",
-            color=planner_colors[planner],
-            edgecolor="white",
-            linewidth=0.8,
-        )
-        ax_redist.bar(
-            pos,
-            other_vals,
-            bottom=income_vals,
-            width=bar_width,
-            label=f"{planner}: import/travel tax",
-            color=planner_colors[planner],
-            alpha=0.35,
-            edgecolor="white",
-            linewidth=0.8,
-        )
-        totals = np.asarray(income_vals, dtype=float) + np.asarray(other_vals, dtype=float)
-        for xpos, total, tariff in zip(pos, totals, tariff_vals):
-            if tariff <= 0:
-                continue
-            ax_redist.text(
-                xpos,
-                total,
-                f"{tariff:.1f}",
-                ha="center",
-                va="bottom",
-                fontsize=7,
-                rotation=90,
-                color="0.2",
+            bottoms += vals
+
+        if show_std and mode == "average" and "redistributed_std" in planner_df:
+            total_err = []
+            for tax_period in tax_periods:
+                match = planner_df[planner_df["tax_period"] == tax_period]
+                total_err.append(float(match["redistributed_std"].sum()) if len(match) else 0.0)
+            ax_redist.errorbar(
+                period_x,
+                bottoms,
+                yerr=np.asarray(total_err, dtype=float),
+                fmt="none",
+                ecolor="0.25",
+                elinewidth=1.0,
+                capsize=3,
+                capthick=1.0,
+                zorder=5,
             )
 
-    ax_redist.set_title("Redistribution by Planner and Tax Period")
-    ax_redist.set_xlabel("Tax period")
-    ax_redist.set_ylabel("Coin redistributed")
-    ax_redist.set_xticks(period_x)
-    ax_redist.set_xticklabels([str(int(k)) for k in tax_periods])
-    ax_redist.legend(ncol=2, frameon=True)
-    ax_redist.grid(True, axis="y", alpha=0.3)
+        ax_redist.set_title(f"{planner.capitalize()} Planner")
+        ax_redist.set_xlabel("Tax period")
+        ax_redist.set_xticks(period_x)
+        ax_redist.set_xticklabels([str(int(k)) for k in tax_periods], fontsize=8)
+        ax_redist.grid(True, axis="y", alpha=0.25)
 
+    redist_axes[0].set_ylabel("Coin redistributed")
+    handles, labels = redist_axes[0].get_legend_handles_labels()
+    fig_redist.suptitle(f"Redistribution by Planner and Tax Period ({title_suffix})", fontsize=13, fontweight="bold")
+    fig_redist.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.90),
+        ncol=3,
+        frameon=True,
+        fontsize=9,
+    )
+    fig_redist.subplots_adjust(top=0.78)
+
+    fig.redistribution_figure = fig_redist
     return fig, trade_units, price_summary, redist
 
 def plot_regional_trade_and_planner_redistribution(
@@ -4652,6 +4848,129 @@ def breakdown_all_agents_from_result_folder(result_dir, episode_key=0, remap_key
     dense_log, dense_logs = get_dense_log_from_result_folder(result_dir, episode_key=episode_key)
     breakdown = breakdown_all_agents(dense_log, remap_key=remap_key, n_cols=n_cols)
     return breakdown, dense_log, dense_logs
+
+
+def extract_periodic_tax_streams(log, tax_keys=("PeriodicTax-p_top", "PeriodicTax-p_bottom")):
+    """Summarize sparse PeriodicTax component logs into one row per tax event."""
+    import numpy as np
+    import pandas as pd
+
+    rows = []
+    for tax_key in tax_keys:
+        stream = log.get(tax_key, [])
+        if stream is None:
+            continue
+
+        planner = tax_key.replace("PeriodicTax-", "")
+        tax_period = 0
+        for timestep, event in enumerate(stream):
+            if not isinstance(event, dict) or not event:
+                continue
+
+            agent_rows = [
+                value for key, value in event.items()
+                if str(key).isdigit() and isinstance(value, dict)
+            ]
+            tax_period += 1
+            schedule = np.asarray(event.get("schedule", []), dtype=float)
+
+            rows.append({
+                "planner": planner,
+                "tax_key": tax_key,
+                "tax_period": tax_period,
+                "timestep": timestep,
+                "total_income": float(np.nansum([r.get("income", 0.0) for r in agent_rows])),
+                "total_tax_paid": float(np.nansum([r.get("tax_paid", 0.0) for r in agent_rows])),
+                "mean_lump_sum": float(np.nanmean([r.get("lump_sum", np.nan) for r in agent_rows])) if agent_rows else np.nan,
+                "top_marginal_rate": float(schedule[-1]) if len(schedule) else np.nan,
+                "mean_marginal_rate": float(np.nanmean(schedule)) if len(schedule) else np.nan,
+            })
+
+    return pd.DataFrame(rows)
+
+
+def plot_periodic_tax_streams_from_result_folder(result_dir, episode_key=0, figsize=(10, 8)):
+    """
+    Simple plot for dense_log["PeriodicTax-p_top"] and
+    dense_log["PeriodicTax-p_bottom"] from one result folder.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    dense_log, dense_logs = get_dense_log_from_result_folder(result_dir, episode_key=episode_key)
+    df = extract_periodic_tax_streams(dense_log)
+    if df.empty:
+        raise ValueError(
+            "No PeriodicTax-p_top or PeriodicTax-p_bottom events found in the selected dense log."
+        )
+
+    colors = {"p_top": "#1f77b4", "p_bottom": "#ff7f0e"}
+    fig = plt.figure(figsize=figsize, constrained_layout=True)
+    gs = fig.add_gridspec(3, 2, height_ratios=[1.0, 1.0, 1.25])
+    ax_tax_paid = fig.add_subplot(gs[0, :])
+    ax_lump_sum = fig.add_subplot(gs[1, :], sharex=ax_tax_paid)
+    ax_top_schedule = fig.add_subplot(gs[2, 0])
+    ax_bottom_schedule = fig.add_subplot(gs[2, 1], sharey=ax_top_schedule)
+    axes = [ax_tax_paid, ax_lump_sum, ax_top_schedule, ax_bottom_schedule]
+
+    for planner, dfr in df.groupby("planner"):
+        dfr = dfr.sort_values("tax_period")
+        color = colors.get(planner, None)
+        ax_tax_paid.plot(dfr["tax_period"], dfr["total_tax_paid"], marker="o", color=color, label=planner)
+        ax_lump_sum.plot(dfr["tax_period"], dfr["mean_lump_sum"], marker="o", color=color, label=planner)
+
+    def last_tax_event(tax_key):
+        stream = dense_log.get(tax_key, []) or []
+        for event in reversed(stream):
+            if isinstance(event, dict) and event:
+                return event
+        return None
+
+    def plot_schedule(ax, tax_key, title, color):
+        event = last_tax_event(tax_key)
+        if event is None:
+            ax.text(0.5, 0.5, "no tax events", transform=ax.transAxes, ha="center", va="center")
+            ax.set_title(title)
+            return
+
+        rates = np.asarray(event.get("schedule", []), dtype=float)
+        cutoffs = np.asarray(event.get("cutoffs", np.arange(len(rates))), dtype=float)
+        if len(rates) == 0:
+            ax.text(0.5, 0.5, "no schedule", transform=ax.transAxes, ha="center", va="center")
+            ax.set_title(title)
+            return
+
+        if len(cutoffs) != len(rates):
+            cutoffs = np.arange(len(rates), dtype=float)
+        last_bin_width = cutoffs[-1] - cutoffs[-2] if len(cutoffs) > 1 else 1.0
+        right_edge = cutoffs[-1] + last_bin_width
+        step_x = np.append(cutoffs, right_edge)
+        step_y = np.append(rates, rates[-1])
+
+        ax.step(step_x, step_y, where="post", color=color, linewidth=2)
+        ax.fill_between(step_x, step_y, step="post", alpha=0.22, color=color)
+        ax.set_title(title)
+        ax.set_xlabel("Income (k USD)")
+        ax.set_ylabel("Marginal rate")
+        ax.set_xlim(cutoffs[0], right_edge)
+        ax.set_ylim(0, max(1.0, float(np.nanmax(rates)) * 1.05))
+
+    plot_schedule(ax_top_schedule, "PeriodicTax-p_top", "p_top (Top Region)", colors["p_top"])
+    plot_schedule(ax_bottom_schedule, "PeriodicTax-p_bottom", "p_bottom (Bottom Region)", colors["p_bottom"])
+
+    ax_tax_paid.set_title("Total Income Tax Paid")
+    ax_tax_paid.set_ylabel("coin")
+    ax_lump_sum.set_title("Average Lump-Sum Redistribution")
+    ax_lump_sum.set_ylabel("coin / agent")
+    ax_lump_sum.set_xlabel("Tax period")
+
+    for ax in axes:
+        ax.grid(True, alpha=0.3)
+
+    ax_tax_paid.legend(frameon=True)
+    ax_lump_sum.legend(frameon=True)
+
+    return fig, df, dense_log, dense_logs
 
 
 
@@ -7922,6 +8241,1841 @@ def plot_lagged_agent_planner_response_panel(
     axes[-1].set_xlabel("tax period k")
     fig.suptitle("Lagged Agent-Planner Response Panel", fontsize=14)
     return fig, df
+
+
+def extract_travel_context_table(
+    log,
+    visible_radius=5,
+    income_window=100,
+    include_all_agent_steps=True,
+):
+    """
+    Build agent-timestep rows describing the context around travel decisions.
+
+    Travel events are evaluated at the state immediately before the logged travel
+    timestep when possible. Non-travel rows are included so travel contexts can be
+    compared against ordinary agent-timesteps from the same dense log.
+    """
+    import numpy as np
+    import pandas as pd
+
+    states = log.get("states", [])
+    worlds = log.get("world", [])
+    if not states:
+        raise ValueError("Dense log has no states.")
+
+    aids = _numeric_agent_ids(log)
+    travel_events = list(_iter_travel_events(log))
+    travel_lookup = {}
+    for event in travel_events:
+        if "agent" not in event:
+            continue
+        t = int(event.get("t", 0))
+        aid = int(event["agent"])
+        context_t = max(0, min(t - 1, len(states) - 1))
+        travel_lookup.setdefault((aid, context_t), []).append(event)
+
+    if include_all_agent_steps:
+        pairs = [(aid, t) for t in range(len(states)) for aid in aids]
+    else:
+        pairs = sorted(travel_lookup.keys(), key=lambda x: (x[1], x[0]))
+
+    def world_at(t):
+        if not worlds:
+            return {}
+        t = min(max(0, int(t)), len(worlds) - 1)
+        if worlds[t]:
+            return worlds[t]
+        for j in range(t, -1, -1):
+            if worlds[j]:
+                return worlds[j]
+        for item in worlds:
+            if item:
+                return item
+        return {}
+
+    def map_array(world, key):
+        value = world.get(key, None) if isinstance(world, dict) else None
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            return value
+        return np.asarray(value)
+
+    def visible_bounds(loc, shape):
+        r, c = int(loc[0]), int(loc[1])
+        r0 = max(0, r - visible_radius)
+        r1 = min(shape[0], r + visible_radius + 1)
+        c0 = max(0, c - visible_radius)
+        c1 = min(shape[1], c + visible_radius + 1)
+        return r0, r1, c0, c1
+
+    def visible_sum(world, key, loc):
+        arr = map_array(world, key)
+        if arr is None or isinstance(arr, dict):
+            return np.nan
+        r0, r1, c0, c1 = visible_bounds(loc, arr.shape)
+        return float(np.nansum(arr[r0:r1, c0:c1]))
+
+    def visible_houses(world, loc, aid):
+        house = map_array(world, "House")
+        if not isinstance(house, dict):
+            return np.nan, np.nan
+        owner = np.asarray(house.get("owner", []))
+        health = np.asarray(house.get("health", []), dtype=float)
+        if owner.size == 0 or health.size == 0:
+            return np.nan, np.nan
+        r0, r1, c0, c1 = visible_bounds(loc, health.shape)
+        owner_v = owner[r0:r1, c0:c1]
+        health_v = health[r0:r1, c0:c1]
+        active = health_v > 0
+        own = float(np.sum(active & (owner_v == int(aid))))
+        other = float(np.sum(active & (owner_v >= 0) & (owner_v != int(aid))))
+        return own, other
+
+    def total_own_houses(world, aid):
+        house = map_array(world, "House")
+        if not isinstance(house, dict):
+            return np.nan
+        owner = np.asarray(house.get("owner", []))
+        health = np.asarray(house.get("health", []), dtype=float)
+        if owner.size == 0 or health.size == 0:
+            return np.nan
+        return float(np.sum((health > 0) & (owner == int(aid))))
+
+    waterline = _infer_waterline(log)
+    rows = []
+    for aid, t in pairs:
+        if str(aid) not in states[t]:
+            continue
+        state = states[t][str(aid)]
+        world = world_at(t)
+        loc = state["loc"]
+        event_list = travel_lookup.get((aid, t), [])
+        did_travel = len(event_list) > 0
+        event = event_list[0] if did_travel else {}
+
+        prev_t = max(0, t - int(income_window))
+        prev_state = states[prev_t][str(aid)]
+        coin_now = _coin(state)
+        recent_income = coin_now - _coin(prev_state)
+        own_houses, other_houses = visible_houses(world, loc, aid)
+        visible_wood = visible_sum(world, "Wood", loc)
+        visible_stone = visible_sum(world, "Stone", loc)
+        visible_wood_source = visible_sum(world, "WoodSourceBlock", loc)
+        visible_stone_source = visible_sum(world, "StoneSourceBlock", loc)
+
+        rows.append({
+            "agent": int(aid),
+            "timestep": int(t),
+            "event_timestep": int(event.get("t", t)) if did_travel else np.nan,
+            "did_travel": bool(did_travel),
+            "location_region": _location_region_from_state(state, waterline=waterline),
+            "planner_region": _planner_region_from_initial_state(log, aid, waterline=waterline),
+            "row": int(loc[0]),
+            "col": int(loc[1]),
+            "to_row": event.get("to", [np.nan, np.nan])[0] if did_travel else np.nan,
+            "to_col": event.get("to", [np.nan, np.nan])[1] if did_travel else np.nan,
+            "current_coin": coin_now,
+            "recent_income": float(recent_income),
+            "skill_build_payment": float(states[0][str(aid)].get("build_payment", np.nan)),
+            "final_travel_count": len(_travel_events_by_agent(log).get(aid, [])),
+            "visible_wood": visible_wood,
+            "visible_stone": visible_stone,
+            "visible_resources": float(np.nansum([visible_wood, visible_stone])),
+            "visible_wood_source": visible_wood_source,
+            "visible_stone_source": visible_stone_source,
+            "visible_resource_sources": float(np.nansum([visible_wood_source, visible_stone_source])),
+            "visible_own_houses": own_houses,
+            "visible_other_houses": other_houses,
+            "own_houses_total": total_own_houses(world, aid),
+            "labor": float(state.get("endogenous", {}).get("Labor", np.nan)),
+            "utility": float(state.get("utility", np.nan)),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def plot_travel_context_dashboard(
+    log,
+    comparison_log=None,
+    visible_radius=5,
+    income_window=100,
+    nontravel_sample=1200,
+    random_state=0,
+    figsize=(18, 14),
+):
+    """
+    Large diagnostic dashboard for who travels and what their local situation
+    looked like before travel.
+
+    Usage:
+        log = plotting._extract_logs_from_run(runs[2])[0]
+        baseline_log = plotting._extract_logs_from_run(runs[0])[0]
+        fig, context_df, agent_df = plotting.plot_travel_context_dashboard(
+            log, comparison_log=baseline_log
+        )
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
+    focal_context_df = extract_travel_context_table(
+        log,
+        visible_radius=visible_radius,
+        income_window=income_window,
+        include_all_agent_steps=True,
+    )
+    if focal_context_df.empty:
+        raise ValueError("No agent context rows could be constructed.")
+
+    if comparison_log is None:
+        baseline_context_df = focal_context_df.copy()
+        baseline_label = "same log non-travel"
+    else:
+        baseline_context_df = extract_travel_context_table(
+            comparison_log,
+            visible_radius=visible_radius,
+            income_window=income_window,
+            include_all_agent_steps=True,
+        )
+        baseline_label = "comparison log non-travel"
+
+    agent_df = _agent_behavior_table(log)
+    travel_df = focal_context_df[focal_context_df["did_travel"]].copy()
+    nontravel_df = baseline_context_df[~baseline_context_df["did_travel"]].copy()
+    if len(nontravel_df) > nontravel_sample:
+        nontravel_plot = nontravel_df.sample(nontravel_sample, random_state=random_state)
+    else:
+        nontravel_plot = nontravel_df
+
+    focal_context_df = focal_context_df.copy()
+    baseline_context_df = baseline_context_df.copy()
+    focal_context_df["context_source"] = "travel_log"
+    baseline_context_df["context_source"] = "comparison_log"
+    context_df = pd.concat([focal_context_df, baseline_context_df], ignore_index=True)
+
+    features = [
+        "current_coin",
+        "recent_income",
+        "skill_build_payment",
+        "visible_resources",
+        "visible_resource_sources",
+        "visible_other_houses",
+        "visible_own_houses",
+        "labor",
+    ]
+    feature_labels = {
+        "current_coin": "coin",
+        "recent_income": f"income, last {income_window}",
+        "skill_build_payment": "skill",
+        "visible_resources": "visible wood+stone",
+        "visible_resource_sources": "visible source tiles",
+        "visible_other_houses": "visible other houses",
+        "visible_own_houses": "visible own houses",
+        "labor": "labor",
+    }
+
+    def standardized_difference(feature):
+        a = travel_df[feature].dropna().to_numpy(dtype=float)
+        b = nontravel_df[feature].dropna().to_numpy(dtype=float)
+        if len(a) == 0 or len(b) == 0:
+            return np.nan
+        pooled = np.sqrt((np.nanvar(a) + np.nanvar(b)) / 2.0)
+        if pooled <= 1e-12:
+            return 0.0
+        return float((np.nanmean(a) - np.nanmean(b)) / pooled)
+
+    smd = pd.DataFrame({
+        "feature": features,
+        "label": [feature_labels[f] for f in features],
+        "standardized_difference": [standardized_difference(f) for f in features],
+    }).sort_values("standardized_difference")
+
+    agent_colors = _make_agent_colors(_numeric_agent_ids(log))
+    region_colors = {"top": "#1f77b4", "bottom": "#ff7f0e"}
+    travel_color = "#c92a2a"
+    nontravel_color = "0.75"
+
+    fig = plt.figure(figsize=figsize, constrained_layout=True)
+    gs = fig.add_gridspec(
+        4,
+        3,
+        height_ratios=[1.0, 1.15, 1.15, 1.2],
+        width_ratios=[1.1, 1.1, 1.0],
+    )
+
+    ax_timeline = fig.add_subplot(gs[0, :2])
+    ax_counts = fig.add_subplot(gs[0, 2])
+    ax_smd = fig.add_subplot(gs[1, 0])
+    ax_coin = fig.add_subplot(gs[1, 1])
+    ax_resources = fig.add_subplot(gs[1, 2])
+    ax_scatter = fig.add_subplot(gs[2, 0])
+    ax_houses = fig.add_subplot(gs[2, 1])
+    ax_other_houses = fig.add_subplot(gs[2, 2])
+    ax_heat = fig.add_subplot(gs[3, :2])
+    ax_table = fig.add_subplot(gs[3, 2])
+
+    # 1. Timeline heatmap: where travel happens in time by agent.
+    aids = sorted(context_df["agent"].unique())
+    aid_to_y = {aid: i for i, aid in enumerate(aids)}
+    for aid in aids:
+        dfa = focal_context_df[focal_context_df["agent"] == aid]
+        color = agent_colors.get(int(aid), "0.5")
+        ax_timeline.hlines(
+            aid_to_y[aid],
+            dfa["timestep"].min(),
+            dfa["timestep"].max(),
+            color=color,
+            alpha=0.35,
+            linewidth=5,
+        )
+    if not travel_df.empty:
+        ax_timeline.scatter(
+            travel_df["event_timestep"],
+            [aid_to_y[a] for a in travel_df["agent"]],
+            marker="|",
+            s=220,
+            linewidths=2.2,
+            color=travel_color,
+            label="travel",
+            zorder=3,
+        )
+    ax_timeline.set_yticks(range(len(aids)))
+    ax_timeline.set_yticklabels([str(a) for a in aids])
+    ax_timeline.set_title("Who Travels, and When")
+    ax_timeline.set_xlabel("timestep")
+    ax_timeline.set_ylabel("agent")
+    ax_timeline.grid(True, axis="x", alpha=0.25)
+
+    # 2. Counts by agent.
+    counts = agent_df.sort_values(["travel_events", "agent"], ascending=[False, True]).copy()
+    bar_colors = [agent_colors.get(int(a), "0.5") for a in counts["agent"]]
+    ax_counts.bar(counts["agent"].astype(str), counts["travel_events"], color=bar_colors, edgecolor="white")
+    ax_counts.set_title("Travel Events by Agent")
+    ax_counts.set_xlabel("agent")
+    ax_counts.set_ylabel("events")
+    ax_counts.grid(True, axis="y", alpha=0.25)
+
+    # 3. Common-denominator effect sizes.
+    ax_smd.barh(
+        smd["label"],
+        smd["standardized_difference"],
+        color=[travel_color if v > 0 else "#2b8a3e" for v in smd["standardized_difference"]],
+        alpha=0.85,
+    )
+    ax_smd.axvline(0, color="0.2", linewidth=1)
+    ax_smd.set_title(f"Travel Context vs {baseline_label}\nstandardized mean difference")
+    ax_smd.set_xlabel("higher at travel  ->")
+    ax_smd.grid(True, axis="x", alpha=0.25)
+
+    def grouped_box(ax, feature, title, ylabel):
+        data = [
+            nontravel_df[feature].dropna().to_numpy(dtype=float),
+            travel_df[feature].dropna().to_numpy(dtype=float),
+        ]
+        bp = ax.boxplot(data, labels=["non-travel", "travel"], patch_artist=True, showfliers=False)
+        for patch, color in zip(bp["boxes"], [nontravel_color, travel_color]):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.55)
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, axis="y", alpha=0.25)
+
+    grouped_box(ax_coin, "current_coin", "Coin Holdings Before Decision", "coin")
+    grouped_box(ax_resources, "visible_resources", "Visible Loose Resources", "wood + stone")
+    grouped_box(ax_houses, "visible_own_houses", "Own Houses in Visible Area", "count")
+    grouped_box(
+        ax_other_houses,
+        "visible_other_houses",
+        "Other Agents' Houses Visible Before Decision",
+        "count",
+    )
+
+    # 4. Scatter: travel points against background of ordinary contexts.
+    ax_scatter.scatter(
+        nontravel_plot["current_coin"],
+        nontravel_plot["visible_resources"],
+        s=18,
+        color=nontravel_color,
+        alpha=0.22,
+        label="non-travel sampled",
+    )
+    if not travel_df.empty:
+        sizes = 45 + 20 * travel_df["skill_build_payment"].rank(pct=True).fillna(0.5)
+        ax_scatter.scatter(
+            travel_df["current_coin"],
+            travel_df["visible_resources"],
+            s=sizes,
+            color=[agent_colors.get(int(a), travel_color) for a in travel_df["agent"]],
+            edgecolor="white",
+            linewidth=0.8,
+            alpha=0.9,
+            label="travel",
+        )
+        for _, row in travel_df.iterrows():
+            ax_scatter.annotate(
+                str(int(row["agent"])),
+                (row["current_coin"], row["visible_resources"]),
+                fontsize=8,
+                xytext=(3, 3),
+                textcoords="offset points",
+            )
+    ax_scatter.set_title("Coin vs Visible Resources")
+    ax_scatter.set_xlabel("current coin")
+    ax_scatter.set_ylabel("visible wood + stone")
+    ax_scatter.grid(True, alpha=0.25)
+
+    # 5. Aggregated traveler heatmap: one row per traveler, readable even with many events.
+    heat_features = [
+        "current_coin",
+        "recent_income",
+        "visible_resources",
+        "visible_other_houses",
+        "visible_own_houses",
+        "skill_build_payment",
+    ]
+    if travel_df.empty:
+        ax_heat.text(0.5, 0.5, "No travel events in this log", ha="center", va="center")
+        ax_heat.set_axis_off()
+    else:
+        traveler_profiles = (
+            travel_df
+            .groupby("agent", as_index=False)[heat_features]
+            .mean()
+            .sort_values("agent")
+        )
+        mat = traveler_profiles[heat_features].to_numpy(dtype=float)
+        col_mean = np.nanmean(nontravel_df[heat_features].to_numpy(dtype=float), axis=0)
+        col_std = np.nanstd(nontravel_df[heat_features].to_numpy(dtype=float), axis=0)
+        col_std[col_std <= 1e-12] = 1.0
+        zmat = (mat - col_mean) / col_std
+        im = ax_heat.imshow(zmat, aspect="auto", cmap="coolwarm", vmin=-2, vmax=2)
+        ax_heat.set_yticks(np.arange(len(traveler_profiles)))
+        ax_heat.set_yticklabels([f"agent {int(a)}" for a in traveler_profiles["agent"]], fontsize=9)
+        ax_heat.set_xticks(np.arange(len(heat_features)))
+        ax_heat.set_xticklabels([feature_labels[f] for f in heat_features], rotation=15, ha="right")
+        ax_heat.set_title(f"Traveler Profiles at Travel Moments\nz-score relative to {baseline_label}")
+        fig.colorbar(im, ax=ax_heat, fraction=0.025, pad=0.01, label="z-score")
+
+    # 6. Compact readout.
+    ax_table.axis("off")
+    n_events = int(len(travel_df))
+    travelers = sorted(travel_df["agent"].unique()) if n_events else []
+    top_agents = agent_df.sort_values("travel_events", ascending=False).head(4)
+    if n_events:
+        summary_text = (
+            f"Travel events: {n_events}\n"
+            f"Travelers: {', '.join(str(int(a)) for a in travelers)}\n"
+            f"Baseline: {baseline_label}\n\n"
+            f"Travel mean coin: {travel_df['current_coin'].mean():.1f}\n"
+            f"Travel mean visible resources: {travel_df['visible_resources'].mean():.1f}\n"
+            f"Travel mean own houses visible: {travel_df['visible_own_houses'].mean():.1f}\n\n"
+            "Top travelers\n"
+            + "\n".join(
+                f"a{int(r.agent)}: {int(r.travel_events)} events, skill {r.skill_build_payment:.0f}"
+                for _, r in top_agents.iterrows()
+            )
+        )
+    else:
+        summary_text = (
+            "No travel events in focal log.\n"
+            f"Baseline: {baseline_label}\n"
+            f"visible radius: {visible_radius}\n"
+            f"income window: {income_window}"
+        )
+    ax_table.set_title("Readout")
+    ax_table.text(
+        0.02,
+        0.95,
+        summary_text,
+        transform=ax_table.transAxes,
+        ha="left",
+        va="top",
+        fontsize=10,
+        linespacing=1.35,
+    )
+
+    legend_handles = [
+        Line2D([0], [0], marker="|", color=travel_color, linestyle="None", markersize=13, markeredgewidth=2, label="travel event"),
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="#1f77b4", markeredgecolor="white", label="travel context, agent-colored"),
+        Line2D([0], [0], marker="o", color="w", markerfacecolor=nontravel_color, label="non-travel sample"),
+    ]
+    fig.legend(handles=legend_handles, loc="lower center", ncol=3, frameon=True)
+    fig.suptitle(
+        "Travel Decision Context Dashboard",
+        fontsize=16,
+        fontweight="bold",
+    )
+
+    return fig, context_df, agent_df
+
+
+def extract_tax_period_travel_context_table(
+    log,
+    period=100,
+    visible_radius=5,
+    income_window=100,
+):
+    """Aggregate travel context to one row per agent per tax period."""
+    import numpy as np
+    import pandas as pd
+
+    step_df = extract_travel_context_table(
+        log,
+        visible_radius=visible_radius,
+        income_window=income_window,
+        include_all_agent_steps=True,
+    )
+    if step_df.empty:
+        return step_df
+
+    step_df = step_df.copy()
+    step_df["tax_period"] = (step_df["timestep"].astype(int) // int(period)) + 1
+    step_df["travel_count"] = step_df["did_travel"].astype(int)
+
+    agg = (
+        step_df
+        .sort_values(["agent", "tax_period", "timestep"])
+        .groupby(["agent", "tax_period"], as_index=False)
+        .agg(
+            did_travel=("did_travel", "max"),
+            travel_count=("travel_count", "sum"),
+            period_start_timestep=("timestep", "min"),
+            period_end_timestep=("timestep", "max"),
+            planner_region=("planner_region", "first"),
+            location_region_start=("location_region", "first"),
+            location_region_end=("location_region", "last"),
+            skill_build_payment=("skill_build_payment", "first"),
+            period_start_coin=("current_coin", "first"),
+            period_end_coin=("current_coin", "last"),
+            mean_coin=("current_coin", "mean"),
+            mean_recent_income=("recent_income", "mean"),
+            mean_visible_resources=("visible_resources", "mean"),
+            mean_visible_resource_sources=("visible_resource_sources", "mean"),
+            mean_visible_own_houses=("visible_own_houses", "mean"),
+            mean_visible_other_houses=("visible_other_houses", "mean"),
+            own_houses_total=("own_houses_total", "mean"),
+            mean_labor=("labor", "mean"),
+            final_labor=("labor", "last"),
+            mean_utility=("utility", "mean"),
+        )
+    )
+    agg["period_coin_change"] = agg["period_end_coin"] - agg["period_start_coin"]
+    agg["did_travel"] = agg["did_travel"].astype(bool)
+    return agg
+
+
+def _dense_log_items(log_or_run):
+    """Return ``(rollout_id, dense_log)`` pairs for a single log or many logs."""
+    if isinstance(log_or_run, dict) and "states" in log_or_run:
+        return [(0, log_or_run)]
+
+    if isinstance(log_or_run, dict):
+        logs = _extract_logs_from_run(log_or_run)
+        if logs:
+            return [(k, v) for k, v in logs.items() if isinstance(v, dict)]
+        return [
+            (k, v)
+            for k, v in log_or_run.items()
+            if isinstance(v, dict) and ("states" in v or "planner_actions" in v)
+        ]
+
+    if isinstance(log_or_run, (list, tuple)):
+        return [(i, v) for i, v in enumerate(log_or_run) if isinstance(v, dict)]
+
+    return []
+
+
+def tax_period_travel_context_table_from_dense_logs(
+    log_or_run,
+    period=100,
+    visible_radius=5,
+    income_window=100,
+):
+    """Pool the tax-period travel context table across one or more dense logs."""
+    import pandas as pd
+
+    frames = []
+    for rollout_id, dense_log in _dense_log_items(log_or_run):
+        df = extract_tax_period_travel_context_table(
+            dense_log,
+            period=period,
+            visible_radius=visible_radius,
+            income_window=income_window,
+        ).copy()
+        if df.empty:
+            continue
+        df["rollout_id"] = rollout_id
+        frames.append(df)
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def plot_tax_period_travel_context_dashboard(
+    log,
+    period=100,
+    visible_radius=5,
+    income_window=100,
+    figsize=(18, 13),
+):
+    """
+    Compare agents who travel vs agents who do not within each tax period.
+
+    Usage:
+        log = plotting._extract_logs_from_run(runs[2])[0]
+        fig, period_df = plotting.plot_tax_period_travel_context_dashboard(log)
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    period_df = tax_period_travel_context_table_from_dense_logs(
+        log,
+        period=period,
+        visible_radius=visible_radius,
+        income_window=income_window,
+    )
+    if period_df.empty:
+        raise ValueError("No agent-period context rows could be constructed.")
+
+    features = [
+        "mean_coin",
+        "period_coin_change",
+        "mean_visible_resources",
+        "mean_visible_other_houses",
+        "mean_visible_own_houses",
+        "skill_build_payment",
+    ]
+    feature_labels = {
+        "mean_coin": "mean coin",
+        "period_coin_change": "coin change in period",
+        "mean_visible_resources": "visible wood+stone",
+        "mean_visible_other_houses": "visible other houses",
+        "mean_visible_own_houses": "visible own houses",
+        "skill_build_payment": "skill",
+    }
+
+    def smd_for_period(dfp, feature):
+        travelers = dfp[dfp["did_travel"]][feature].dropna().to_numpy(dtype=float)
+        stayers = dfp[~dfp["did_travel"]][feature].dropna().to_numpy(dtype=float)
+        if len(travelers) == 0 or len(stayers) == 0:
+            return np.nan
+        pooled = np.sqrt((np.nanvar(travelers) + np.nanvar(stayers)) / 2.0)
+        if pooled <= 1e-12:
+            return 0.0
+        return float((np.nanmean(travelers) - np.nanmean(stayers)) / pooled)
+
+    smd_rows = []
+    for group_key, dfp in period_df.groupby(["rollout_id", "tax_period"]):
+        rollout_id, tax_period = group_key
+        for feature in features:
+            smd_rows.append({
+                "rollout_id": rollout_id,
+                "tax_period": tax_period,
+                "feature": feature,
+                "label": feature_labels[feature],
+                "standardized_difference": smd_for_period(dfp, feature),
+            })
+    smd_df = pd.DataFrame(smd_rows)
+
+    agent_colors = _make_agent_colors(period_df["agent"].unique())
+    travel_color = "#c92a2a"
+    nontravel_color = "0.72"
+
+    if figsize == (18, 13):
+        figsize = (18, 8)
+
+    fig = plt.figure(figsize=figsize, constrained_layout=True)
+    gs = fig.add_gridspec(
+        2,
+        4,
+        height_ratios=[1.1, 1.1],
+        width_ratios=[1.0, 1.0, 1.0, 1.0],
+    )
+
+    ax_coin = fig.add_subplot(gs[0, 0])
+    ax_resources = fig.add_subplot(gs[0, 1])
+    ax_houses = fig.add_subplot(gs[0, 2])
+    ax_other_houses = fig.add_subplot(gs[0, 3])
+    ax_smd = fig.add_subplot(gs[1, :2])
+    ax_scatter = fig.add_subplot(gs[1, 2:])
+
+    agents = sorted(period_df["agent"].unique())
+    tax_periods = sorted(period_df["tax_period"].unique())
+    agent_to_y = {aid: i for i, aid in enumerate(agents)}
+    period_to_x = {tp: i for i, tp in enumerate(tax_periods)}
+
+    counts = (
+        period_df.groupby("tax_period", as_index=False)
+        .agg(
+            traveling_agents=("did_travel", "sum"),
+            travel_events=("travel_count", "sum"),
+        )
+    )
+
+    avg_smd = (
+        smd_df.groupby(["feature", "label"], as_index=False)["standardized_difference"]
+        .mean()
+        .sort_values("standardized_difference")
+    )
+    ax_smd.barh(
+        avg_smd["label"],
+        avg_smd["standardized_difference"],
+        color=[travel_color if v > 0 else "#2b8a3e" for v in avg_smd["standardized_difference"]],
+        alpha=0.85,
+    )
+    ax_smd.axvline(0, color="0.2", linewidth=1)
+    ax_smd.set_title("Average Difference Across Tax Periods\ntravelers vs non-travelers")
+    ax_smd.set_xlabel("Higher among travelers (measured in std from mean)")
+    ax_smd.grid(True, axis="x", alpha=0.25)
+
+    n_rollouts = period_df["rollout_id"].nunique()
+    box_df = period_df
+    if n_rollouts > 1:
+        box_df = (
+            period_df.groupby(["rollout_id", "did_travel"], as_index=False)[features]
+            .mean()
+        )
+
+    def grouped_box(ax, feature, title, ylabel):
+        data = [
+            box_df.loc[~box_df["did_travel"], feature].dropna().to_numpy(dtype=float),
+            box_df.loc[box_df["did_travel"], feature].dropna().to_numpy(dtype=float),
+        ]
+        bp = ax.boxplot(
+            data,
+            labels=["no travel\nin period", "travel\nin period"],
+            patch_artist=True,
+            showfliers=False,
+            showmeans=True,
+            meanline=True,
+            meanprops=dict(color="black", linewidth=2.4, linestyle="-"),
+            medianprops=dict(linewidth=0),
+        )
+        for patch, color in zip(bp["boxes"], [nontravel_color, travel_color]):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.55)
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, axis="y", alpha=0.25)
+
+    title_suffix = " (rollout averages)" if n_rollouts > 1 else ""
+    grouped_box(ax_coin, "mean_coin", f"Coin During Period{title_suffix}", "coin")
+    grouped_box(ax_resources, "mean_visible_resources", f"Visible Resources During Period{title_suffix}", "wood + stone")
+    grouped_box(ax_houses, "mean_visible_own_houses", f"Own Houses Visible During Period{title_suffix}", "count")
+    grouped_box(
+        ax_other_houses,
+        "mean_visible_other_houses",
+        f"Other Agents' Houses Visible During Period{title_suffix}",
+        "count",
+    )
+
+    ax_scatter.scatter(
+        period_df.loc[~period_df["did_travel"], "mean_coin"],
+        period_df.loc[~period_df["did_travel"], "mean_visible_other_houses"],
+        s=28,
+        color=nontravel_color,
+        alpha=0.35,
+        label="no travel in period",
+    )
+    travel_periods = period_df[period_df["did_travel"]]
+    ax_scatter.scatter(
+        travel_periods["mean_coin"],
+        travel_periods["mean_visible_other_houses"],
+        s=55,
+        color=[agent_colors.get(int(a), travel_color) for a in travel_periods["agent"]],
+        edgecolor="white",
+        linewidth=0.8,
+        alpha=0.9,
+        label="travel in period",
+    )
+    trend = period_df[["mean_coin", "mean_visible_other_houses"]].dropna()
+    if len(trend) >= 2 and trend["mean_coin"].nunique() >= 2:
+        xfit = trend["mean_coin"].to_numpy(dtype=float)
+        yfit = trend["mean_visible_other_houses"].to_numpy(dtype=float)
+        slope, intercept = np.polyfit(xfit, yfit, 1)
+        xs = np.linspace(float(np.min(xfit)), float(np.max(xfit)), 100)
+        ax_scatter.plot(
+            xs,
+            slope * xs + intercept,
+            color="0.15",
+            linewidth=2.2,
+            alpha=0.9,
+            label="pooled trend",
+        )
+    ax_scatter.set_title("Agent-Period Contexts")
+    ax_scatter.set_xlabel("mean coin")
+    ax_scatter.set_ylabel("mean visible other agents' houses")
+    ax_scatter.grid(True, alpha=0.25)
+    fig.suptitle("Tax-Period Travel Context: Travelers vs Non-Travelers", fontsize=16, fontweight="bold")
+
+    return fig, period_df
+
+
+def plot_travel_timeline_by_agent(log, figsize=(12, 3.5)):
+    """
+    Plot travel events by agent over time using the same stable agent colors as
+    breakdown_all_agents.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    aids = _numeric_agent_ids(log)
+    agent_colors = _make_agent_colors(aids)
+    travel_by_agent = _travel_events_by_agent(log)
+    n_steps = max(0, len(log.get("states", [])) - 1)
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize, constrained_layout=True)
+
+    for y, aid in enumerate(aids):
+        color = agent_colors.get(int(aid), "0.5")
+        ax.hlines(y, 0, n_steps, color=color, alpha=0.28, linewidth=5)
+        ts = [
+            int(event["t"])
+            for event in travel_by_agent.get(int(aid), [])
+            if "t" in event
+        ]
+        if ts:
+            ax.scatter(
+                ts,
+                np.full(len(ts), y),
+                marker="|",
+                s=220,
+                linewidths=2.4,
+                color=color,
+                alpha=0.98,
+                zorder=3,
+            )
+
+    ax.set_title("Who Travels, and When")
+    ax.set_xlabel("timestep")
+    ax.set_ylabel("agent")
+    ax.set_yticks(np.arange(len(aids)))
+    ax.set_yticklabels([str(int(aid)) for aid in aids])
+    ax.set_xlim(0, n_steps)
+    ax.grid(True, axis="x", alpha=0.25)
+
+    return fig
+
+
+def _tax_schedules_by_region_period(log, period=100, rate_disc=0.05):
+    """Return regional schedules keyed by tax period using tax logs when present."""
+    import numpy as np
+
+    schedules = {}
+    cutoffs = None
+    period_counts = {"top": 0, "bottom": 0}
+    found_periodic = False
+
+    for region, key in [("top", "PeriodicTax-p_top"), ("bottom", "PeriodicTax-p_bottom")]:
+        for event in log.get(key, []) or []:
+            if not isinstance(event, dict) or not event:
+                continue
+            schedule = np.asarray(event.get("schedule", []), dtype=float)
+            if len(schedule) == 0:
+                continue
+            if cutoffs is None and "cutoffs" in event:
+                cutoffs = np.asarray(event["cutoffs"], dtype=float)
+            period_counts[region] += 1
+            schedules.setdefault(period_counts[region], {})[region] = schedule
+            found_periodic = True
+
+    if cutoffs is None:
+        cutoffs = np.asarray([0.0, 9.7, 39.475, 84.2, 160.725, 204.1, 510.3], dtype=float)
+
+    if found_periodic:
+        return schedules, cutoffs
+
+    action_schedules = _all_current_planner_schedules_from_actions(
+        log,
+        period=period,
+        rate_disc=rate_disc,
+        cutoffs=cutoffs,
+    )
+    for tax_period, planner_schedules in action_schedules.items():
+        schedules[tax_period] = {
+            "top": planner_schedules.get("p_top", np.zeros(len(cutoffs), dtype=float)),
+            "bottom": planner_schedules.get("p_bottom", np.zeros(len(cutoffs), dtype=float)),
+        }
+    return schedules, cutoffs
+
+
+def tax_period_travel_counterfactual_table(
+    log,
+    period=100,
+    visible_radius=5,
+    income_window=100,
+    rate_disc=0.05,
+):
+    """
+    Agent-period table with current-region and other-region tax comparisons.
+    """
+    import numpy as np
+
+    df = extract_tax_period_travel_context_table(
+        log,
+        period=period,
+        visible_radius=visible_radius,
+        income_window=income_window,
+    ).copy()
+    schedules, cutoffs = _tax_schedules_by_region_period(
+        log,
+        period=period,
+        rate_disc=rate_disc,
+    )
+
+    def schedule_for(tax_period, region):
+        return np.asarray(
+            schedules.get(int(tax_period), {}).get(region, np.zeros(len(cutoffs), dtype=float)),
+            dtype=float,
+        )
+
+    current_avg = []
+    other_avg = []
+    current_top = []
+    other_top = []
+    current_due = []
+    other_due = []
+    taxable_income = []
+
+    for _, row in df.iterrows():
+        current_region = row["location_region_start"]
+        other_region = "bottom" if current_region == "top" else "top"
+        current_schedule = schedule_for(row["tax_period"], current_region)
+        other_schedule = schedule_for(row["tax_period"], other_region)
+        income = max(0.0, float(row["period_coin_change"]))
+
+        taxable_income.append(income)
+        current_avg.append(float(np.nanmean(current_schedule)) if len(current_schedule) else np.nan)
+        other_avg.append(float(np.nanmean(other_schedule)) if len(other_schedule) else np.nan)
+        current_top.append(float(current_schedule[-1]) if len(current_schedule) else np.nan)
+        other_top.append(float(other_schedule[-1]) if len(other_schedule) else np.nan)
+        current_due.append(_tax_due_for_schedule(income, current_schedule, cutoffs))
+        other_due.append(_tax_due_for_schedule(income, other_schedule, cutoffs))
+
+    df["taxable_period_income"] = taxable_income
+    df["current_region_avg_tax"] = current_avg
+    df["other_region_avg_tax"] = other_avg
+    df["current_region_top_tax"] = current_top
+    df["other_region_top_tax"] = other_top
+    df["current_region_tax_due"] = current_due
+    df["other_region_tax_due"] = other_due
+    df["other_minus_current_avg_tax"] = df["other_region_avg_tax"] - df["current_region_avg_tax"]
+    df["other_minus_current_tax_due"] = df["other_region_tax_due"] - df["current_region_tax_due"]
+    return df
+
+
+def tax_period_travel_counterfactual_table_from_dense_logs(
+    log_or_run,
+    period=100,
+    visible_radius=5,
+    income_window=100,
+    rate_disc=0.05,
+):
+    """Pool the travel counterfactual tax table across one or more dense logs."""
+    import pandas as pd
+
+    frames = []
+    for rollout_id, dense_log in _dense_log_items(log_or_run):
+        df = tax_period_travel_counterfactual_table(
+            dense_log,
+            period=period,
+            visible_radius=visible_radius,
+            income_window=income_window,
+            rate_disc=rate_disc,
+        ).copy()
+        if df.empty:
+            continue
+        df["rollout_id"] = rollout_id
+        frames.append(df)
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def plot_tax_travel_counterfactuals(
+    log,
+    period=100,
+    visible_radius=5,
+    income_window=100,
+    rate_disc=0.05,
+    figsize=(16, 11),
+):
+    """
+    Separate tax-focused figure comparing tax faced by travel vs non-travel
+    agent-periods and current-region versus other-region counterfactual taxes.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    df = tax_period_travel_counterfactual_table_from_dense_logs(
+        log,
+        period=period,
+        visible_radius=visible_radius,
+        income_window=income_window,
+        rate_disc=rate_disc,
+    )
+    if df.empty:
+        raise ValueError("No agent-period counterfactual tax rows could be constructed.")
+
+    travel_color = "#c92a2a"
+    nontravel_color = "0.72"
+    if figsize == (16, 11):
+        figsize = (13, 5.5)
+
+    fig, axes = plt.subplots(1, 2, figsize=figsize, constrained_layout=True)
+    ax_box, ax_scatter = axes
+
+    # 1. Boxplot: average regional tax faced.
+    n_rollouts = df["rollout_id"].nunique()
+    box_df = df
+    if n_rollouts > 1:
+        box_df = (
+            df.groupby(["rollout_id", "did_travel"], as_index=False)
+            .agg(current_region_avg_tax=("current_region_avg_tax", "mean"))
+        )
+    data = [
+        box_df.loc[~box_df["did_travel"], "current_region_avg_tax"].dropna().to_numpy(dtype=float),
+        box_df.loc[box_df["did_travel"], "current_region_avg_tax"].dropna().to_numpy(dtype=float),
+    ]
+    bp = ax_box.boxplot(
+        data,
+        labels=["no travel\nin period", "travel\nin period"],
+        patch_artist=True,
+        showfliers=False,
+        showmeans=True,
+        meanline=True,
+        meanprops=dict(color="black", linewidth=2.4, linestyle="-"),
+        medianprops=dict(linewidth=0),
+    )
+    for patch, color in zip(bp["boxes"], [nontravel_color, travel_color]):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.55)
+    title_suffix = " (rollout averages)" if n_rollouts > 1 else ""
+    ax_box.set_title(f"Average Tax Faced{title_suffix}")
+    ax_box.set_ylabel("average marginal tax rate")
+    ax_box.grid(True, axis="y", alpha=0.25)
+
+    # 2. Scatter: current vs other tax due, colored by income.
+    plot_df = df.dropna(subset=["current_region_tax_due", "other_region_tax_due", "taxable_period_income"])
+    if not plot_df.empty:
+        sc = None
+        for did_travel, size, edgecolor, linewidth, alpha in [
+            (False, 32, "white", 0.5, 0.35),
+            (True, 70, travel_color, 1.5, 0.9),
+        ]:
+            dfr = plot_df[plot_df["did_travel"] == did_travel]
+            if dfr.empty:
+                continue
+            sc = ax_scatter.scatter(
+                dfr["current_region_tax_due"],
+                dfr["other_region_tax_due"],
+                c=dfr["taxable_period_income"],
+                cmap="viridis",
+                s=size,
+                marker="o",
+                edgecolor=edgecolor,
+                linewidth=linewidth,
+                alpha=alpha,
+            )
+        lo = float(np.nanmin([plot_df["current_region_tax_due"].min(), plot_df["other_region_tax_due"].min()]))
+        hi = float(np.nanmax([plot_df["current_region_tax_due"].max(), plot_df["other_region_tax_due"].max()]))
+        pad = max(1.0, 0.05 * (hi - lo))
+        ax_scatter.plot([lo - pad, hi + pad], [lo - pad, hi + pad], color="0.35", linestyle="--", linewidth=1)
+        ax_scatter.set_xlim(lo - pad, hi + pad)
+        ax_scatter.set_ylim(lo - pad, hi + pad)
+        trend = plot_df[["current_region_tax_due", "other_region_tax_due"]].dropna()
+        if len(trend) >= 2 and trend["current_region_tax_due"].nunique() >= 2:
+            xfit = trend["current_region_tax_due"].to_numpy(dtype=float)
+            yfit = trend["other_region_tax_due"].to_numpy(dtype=float)
+            slope, intercept = np.polyfit(xfit, yfit, 1)
+            xs = np.linspace(float(np.min(xfit)), float(np.max(xfit)), 100)
+            ax_scatter.plot(
+                xs,
+                slope * xs + intercept,
+                color="0.15",
+                linewidth=2.2,
+                alpha=0.9,
+                label="pooled trend",
+            )
+            ax_scatter.legend(loc="best", frameon=True)
+        if sc is not None:
+            fig.colorbar(sc, ax=ax_scatter, label="money made in period")
+    ax_scatter.set_title("Current-Region Tax Due vs Other-Region Tax Due")
+    ax_scatter.set_xlabel("tax due in current region")
+    ax_scatter.set_ylabel("tax due in other region")
+    ax_scatter.grid(True, alpha=0.25)
+
+    fig.suptitle("Tax Context of Travel Decisions", fontsize=16, fontweight="bold")
+    return fig, df
+
+
+def travel_regression_table_for_run(
+    run,
+    period=100,
+    visible_radius=5,
+    income_window=100,
+    cluster_by="agent",
+):
+    """Build the pooled agent-period regression table for all dense logs in a run."""
+    import pandas as pd
+
+    logs = _extract_logs_from_run(run)
+    if not logs:
+        raise ValueError("No dense logs found in run.")
+
+    frames = []
+    for log_key, log in logs.items():
+        df = extract_tax_period_travel_context_table(
+            log,
+            period=period,
+            visible_radius=visible_radius,
+            income_window=income_window,
+        ).copy()
+        if df.empty:
+            continue
+        df["rollout_id"] = log_key
+        df["agent_cluster"] = df["agent"].astype(str)
+        df["rollout_agent_cluster"] = df["rollout_id"].astype(str) + "_a" + df["agent"].astype(str)
+        frames.append(df)
+
+    if not frames:
+        raise ValueError("No agent-period rows could be constructed from this run.")
+
+    out = pd.concat(frames, ignore_index=True)
+    out["did_travel_int"] = out["did_travel"].astype(int)
+    if cluster_by == "agent":
+        out["cluster_id"] = out["agent_cluster"]
+    elif cluster_by == "rollout_agent":
+        out["cluster_id"] = out["rollout_agent_cluster"]
+    else:
+        raise ValueError("cluster_by must be 'agent' or 'rollout_agent'.")
+    return out
+
+
+def plot_travel_probability_regression(
+    run,
+    period=100,
+    visible_radius=5,
+    income_window=100,
+    cluster_by="agent",
+    include_tax_period_fixed_effects=True,
+    include_agent_fixed_effects=False,
+    figsize=(16, 11),
+):
+    """
+    Fit logistic regressions for travel probability across all dense logs in a run.
+
+    Returns
+    -------
+    fig, model_tables, regression_df, results
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    try:
+        import statsmodels.api as sm
+    except ModuleNotFoundError:
+        sm = None
+
+    df = travel_regression_table_for_run(
+        run,
+        period=period,
+        visible_radius=visible_radius,
+        income_window=income_window,
+        cluster_by=cluster_by,
+    )
+
+    base_features = [
+        "mean_coin",
+        "period_coin_change",
+        "mean_visible_resources",
+        "mean_visible_other_houses",
+        "mean_visible_own_houses",
+        "skill_build_payment",
+    ]
+    within_agent_features = [
+        "mean_coin",
+        "period_coin_change",
+        "mean_visible_resources",
+        "mean_visible_other_houses",
+        "mean_visible_own_houses",
+    ]
+    feature_labels = {
+        "mean_coin": "Mean coin",
+        "period_coin_change": "Period income / coin change",
+        "mean_visible_resources": "Visible resources",
+        "mean_visible_other_houses": "Visible other houses",
+        "mean_visible_own_houses": "Visible own houses",
+        "skill_build_payment": "Skill",
+    }
+
+    model_features = within_agent_features if include_agent_fixed_effects else base_features
+    model_cols = [
+        "did_travel_int",
+        "tax_period",
+        "agent",
+        "cluster_id",
+        *model_features,
+    ]
+    model_df = df[model_cols].copy()
+    model_df["did_travel_int"] = pd.to_numeric(model_df["did_travel_int"], errors="coerce")
+    for feature in model_features:
+        model_df[feature] = pd.to_numeric(model_df[feature], errors="coerce")
+    model_df = model_df.dropna(subset=model_cols).copy()
+    if model_df["did_travel_int"].nunique() < 2:
+        event_rate = float(model_df["did_travel_int"].mean()) if len(model_df) else np.nan
+        coef_df = pd.DataFrame([{
+            "feature": feature,
+            "label": feature_labels[feature],
+            "coef": np.nan,
+            "std_error": np.nan,
+            "p_value": np.nan,
+            "odds_ratio": np.nan,
+            "ci_low": np.nan,
+            "ci_high": np.nan,
+        } for feature in model_features])
+        fit_df = pd.DataFrame([{
+            "n_obs": int(len(model_df)),
+            "n_events": int(model_df["did_travel_int"].sum()) if len(model_df) else 0,
+            "event_rate": event_rate,
+            "n_clusters": int(model_df["cluster_id"].nunique()) if len(model_df) else 0,
+            "mcfadden_pseudo_r2": np.nan,
+            "log_likelihood": np.nan,
+            "ll_null": np.nan,
+            "aic": np.nan,
+            "bic": np.nan,
+            "auc": np.nan,
+            "tax_period_fixed_effects": bool(include_tax_period_fixed_effects),
+            "agent_fixed_effects": bool(include_agent_fixed_effects),
+            "clustered_se_by": cluster_by,
+            "note": "not estimated: did_travel has no variation after filtering",
+        }])
+
+        fig, ax = plt.subplots(figsize=(9, 4), constrained_layout=True)
+        ax.axis("off")
+        message = (
+            "Logistic regression was not estimated.\n\n"
+            "The dependent variable did_travel has no variation after filtering:\n"
+            f"observations = {fit_df.at[0, 'n_obs']}, "
+            f"travel events = {fit_df.at[0, 'n_events']}, "
+            f"event rate = {event_rate:.3f}.\n\n"
+            "A logistic model needs both travel and non-travel rows to estimate coefficients."
+        )
+        ax.text(0.02, 0.72, message, va="top", ha="left", fontsize=12)
+        fig.suptitle("Logistic Regression: Probability of Travel", fontsize=14, fontweight="bold")
+        fit_summary = pd.DataFrame([
+            ["Observations", f"{fit_df.at[0, 'n_obs']}"],
+            ["Travel events", f"{fit_df.at[0, 'n_events']}"],
+            ["Event rate", f"{fit_df.at[0, 'event_rate']:.3f}"],
+            ["Clusters", f"{fit_df.at[0, 'n_clusters']} ({cluster_by})"],
+            ["Pseudo-R2 (McFadden)", "not estimated"],
+            ["AUC", "not estimated"],
+            ["Tax-period FE", "yes" if include_tax_period_fixed_effects else "no"],
+            ["Agent FE", "yes" if include_agent_fixed_effects else "no"],
+        ], columns=["statistic", "value"])
+        model_tables = {"coefficients": coef_df, "fit": fit_df, "fit_summary": fit_summary}
+        results = {"main": None, "X": None, "y": None, "model_df": model_df}
+        return fig, model_tables, df, results
+
+    for feature in model_features:
+        std = float(model_df[feature].std())
+        mean = float(model_df[feature].mean())
+        model_df[f"z_{feature}"] = 0.0 if std <= 1e-12 else (model_df[feature] - mean) / std
+
+    x_parts = [model_df[[f"z_{feature}" for feature in model_features]]]
+    if include_tax_period_fixed_effects:
+        x_parts.append(pd.get_dummies(model_df["tax_period"].astype(int), prefix="period", drop_first=True, dtype=float))
+    if include_agent_fixed_effects:
+        x_parts.append(pd.get_dummies(model_df["agent"].astype(int), prefix="agent", drop_first=True, dtype=float))
+    X = pd.concat(x_parts, axis=1)
+    if sm is not None:
+        X = sm.add_constant(X, has_constant="add")
+    else:
+        X.insert(0, "const", 1.0)
+    y = model_df["did_travel_int"].astype(float)
+
+    if sm is not None:
+        model = sm.Logit(y, X)
+        try:
+            result = model.fit(
+                disp=False,
+                maxiter=300,
+                cov_type="cluster",
+                cov_kwds={"groups": model_df["cluster_id"]},
+            )
+        except Exception:
+            result = model.fit(disp=False, maxiter=300)
+        params = result.params
+        pvalues = result.pvalues
+        conf = result.conf_int()
+        pred = np.asarray(result.predict(X), dtype=float)
+        llf = float(result.llf)
+        llnull = float(result.llnull) if hasattr(result, "llnull") else np.nan
+        pseudo_r2 = float(getattr(result, "prsquared", np.nan))
+        aic = float(result.aic)
+        bic = float(result.bic)
+        result_obj = result
+    else:
+        import math
+
+        def normal_cdf(x):
+            return 0.5 * (1.0 + math.erf(float(x) / math.sqrt(2.0)))
+
+        def sigmoid(z):
+            z = np.clip(z, -35, 35)
+            return 1.0 / (1.0 + np.exp(-z))
+
+        X_np = X.to_numpy(dtype=float)
+        y_np = y.to_numpy(dtype=float)
+        beta = np.zeros(X_np.shape[1], dtype=float)
+        ridge = 1e-8
+
+        for _ in range(300):
+            eta = X_np @ beta
+            prob = sigmoid(eta)
+            w = np.clip(prob * (1.0 - prob), 1e-8, None)
+            hessian = X_np.T @ (X_np * w[:, None])
+            grad = X_np.T @ (y_np - prob)
+            step = np.linalg.solve(
+                hessian + ridge * np.eye(hessian.shape[0]),
+                grad,
+            )
+            beta_new = beta + step
+            if np.max(np.abs(step)) < 1e-8:
+                beta = beta_new
+                break
+            beta = beta_new
+
+        pred = sigmoid(X_np @ beta)
+        w = np.clip(pred * (1.0 - pred), 1e-8, None)
+        bread = np.linalg.pinv(X_np.T @ (X_np * w[:, None]))
+        scores = X_np * (y_np - pred)[:, None]
+        meat = np.zeros((X_np.shape[1], X_np.shape[1]), dtype=float)
+        groups = model_df["cluster_id"].to_numpy()
+        unique_groups = pd.unique(groups)
+        for group in unique_groups:
+            sg = scores[groups == group].sum(axis=0)
+            meat += np.outer(sg, sg)
+        cov = bread @ meat @ bread
+        n_obs = X_np.shape[0]
+        n_params = X_np.shape[1]
+        n_clusters = len(unique_groups)
+        if n_clusters > 1 and n_obs > n_params:
+            cov *= (n_clusters / (n_clusters - 1.0)) * ((n_obs - 1.0) / (n_obs - n_params))
+        se = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+        z_vals = np.divide(beta, se, out=np.zeros_like(beta), where=se > 0)
+        p_vals = np.asarray([2.0 * (1.0 - normal_cdf(abs(z))) for z in z_vals])
+        ci_low = beta - 1.96 * se
+        ci_high = beta + 1.96 * se
+
+        params = pd.Series(beta, index=X.columns)
+        pvalues = pd.Series(p_vals, index=X.columns)
+        conf = pd.DataFrame({0: ci_low, 1: ci_high}, index=X.columns)
+        eps = 1e-12
+        llf = float(np.sum(y_np * np.log(pred + eps) + (1.0 - y_np) * np.log(1.0 - pred + eps)))
+        mean_y = np.clip(float(np.mean(y_np)), eps, 1.0 - eps)
+        llnull = float(np.sum(y_np * np.log(mean_y) + (1.0 - y_np) * np.log(1.0 - mean_y)))
+        pseudo_r2 = float(1.0 - llf / llnull) if llnull != 0 else np.nan
+        aic = float(2 * n_params - 2 * llf)
+        bic = float(np.log(n_obs) * n_params - 2 * llf)
+        result_obj = {
+            "params": params,
+            "pvalues": pvalues,
+            "conf_int": conf,
+            "cov_cluster": cov,
+            "method": "numpy_logit_cluster_fallback",
+        }
+
+    def predict_from_X(X_like):
+        if sm is not None:
+            return np.asarray(result_obj.predict(X_like), dtype=float)
+        values = X_like.to_numpy(dtype=float) if hasattr(X_like, "to_numpy") else np.asarray(X_like, dtype=float)
+        beta = params.reindex(X.columns).to_numpy(dtype=float)
+        z = np.clip(values @ beta, -35, 35)
+        return 1.0 / (1.0 + np.exp(-z))
+
+    coef_rows = []
+    for feature in model_features:
+        name = f"z_{feature}"
+        coef = float(params[name])
+        ci_low, ci_high = conf.loc[name].astype(float).tolist()
+        coef_rows.append({
+            "feature": feature,
+            "label": feature_labels[feature],
+            "coef": coef,
+            "odds_ratio": float(np.exp(coef)),
+            "ci_low": float(np.exp(ci_low)),
+            "ci_high": float(np.exp(ci_high)),
+            "p_value": float(pvalues[name]),
+        })
+    coef_df = pd.DataFrame(coef_rows).sort_values("odds_ratio")
+
+    y_arr = y.to_numpy(dtype=float)
+    # AUC via rank statistic, avoiding a hard dependency on sklearn.
+    pos = pred[y_arr == 1]
+    neg = pred[y_arr == 0]
+    if len(pos) and len(neg):
+        ranks = pd.Series(pred).rank(method="average").to_numpy(dtype=float)
+        auc = float((np.sum(ranks[y_arr == 1]) - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg)))
+    else:
+        auc = np.nan
+
+    fit_df = pd.DataFrame([{
+        "n_obs": int(len(model_df)),
+        "n_events": int(y.sum()),
+        "event_rate": float(y.mean()),
+        "n_clusters": int(model_df["cluster_id"].nunique()),
+        "mcfadden_pseudo_r2": pseudo_r2,
+        "log_likelihood": llf,
+        "ll_null": llnull,
+        "aic": aic,
+        "bic": bic,
+        "auc": auc,
+        "tax_period_fixed_effects": bool(include_tax_period_fixed_effects),
+        "agent_fixed_effects": bool(include_agent_fixed_effects),
+        "clustered_se_by": cluster_by,
+    }])
+
+    if figsize == (16, 11):
+        figsize = (14, 5.5)
+    fig, (ax_or, ax_p) = plt.subplots(1, 2, figsize=figsize, constrained_layout=True)
+
+    # Plot 1: odds ratios with clustered confidence intervals.
+    y_pos = np.arange(len(coef_df))
+    ax_or.errorbar(
+        coef_df["odds_ratio"],
+        y_pos,
+        xerr=[
+            coef_df["odds_ratio"] - coef_df["ci_low"],
+            coef_df["ci_high"] - coef_df["odds_ratio"],
+        ],
+        fmt="o",
+        color="#1f77b4",
+        ecolor="0.35",
+        capsize=4,
+    )
+    ax_or.axvline(1.0, color="0.25", linestyle="--", linewidth=1)
+    ax_or.set_yticks(y_pos)
+    ax_or.set_yticklabels(coef_df["label"])
+    ax_or.set_xscale("log")
+    ax_or.set_xlabel("Odds ratio for +1 std increase")
+    ax_or.set_title("Variable Significance: Odds Ratios")
+    ax_or.grid(True, axis="x", alpha=0.25)
+
+    # Plot 2: p-values.
+    p_df = coef_df.sort_values("p_value", ascending=False)
+    colors = ["#c92a2a" if p < 0.05 else "0.65" for p in p_df["p_value"]]
+    ax_p.barh(p_df["label"], p_df["p_value"], color=colors, alpha=0.85)
+    ax_p.axvline(0.05, color="0.2", linestyle="--", linewidth=1, label="p = 0.05")
+    ax_p.set_xlim(0, min(1.0, max(0.1, float(np.nanmax(p_df["p_value"])) * 1.15)))
+    ax_p.set_xlabel("Cluster-robust p-value")
+    ax_p.set_title("Statistical Significance")
+    ax_p.legend(frameon=True)
+    ax_p.grid(True, axis="x", alpha=0.25)
+
+    fit_summary = pd.DataFrame([
+        ["Observations", f"{fit_df.at[0, 'n_obs']}"],
+        ["Travel events", f"{fit_df.at[0, 'n_events']}"],
+        ["Event rate", f"{fit_df.at[0, 'event_rate']:.3f}"],
+        ["Clusters", f"{fit_df.at[0, 'n_clusters']} ({cluster_by})"],
+        ["Pseudo-R2 (McFadden)", f"{fit_df.at[0, 'mcfadden_pseudo_r2']:.3f}"],
+        ["AUC", f"{fit_df.at[0, 'auc']:.3f}"],
+        ["Tax-period FE", "yes" if include_tax_period_fixed_effects else "no"],
+        ["Agent FE", "yes" if include_agent_fixed_effects else "no"],
+    ], columns=["statistic", "value"])
+
+    fig.suptitle("Logistic Regression: Probability of Travel", fontsize=16, fontweight="bold")
+    model_tables = {"coefficients": coef_df, "fit": fit_df, "fit_summary": fit_summary}
+    results = {"main": result_obj, "X": X, "y": y, "model_df": model_df}
+    return fig, model_tables, df, results
+
+
+def _simple_logit_slope_table(df, features, group_col=None):
+    """Small no-dependency univariate logit slopes for actual travel probability."""
+    import math
+    import numpy as np
+    import pandas as pd
+
+    def normal_cdf(x):
+        return 0.5 * (1.0 + math.erf(float(x) / math.sqrt(2.0)))
+
+    def sigmoid(z):
+        z = np.clip(z, -35, 35)
+        return 1.0 / (1.0 + np.exp(-z))
+
+    groups = [("all", df)] if group_col is None else list(df.groupby(group_col, dropna=False))
+    rows = []
+    for group_name, dfg in groups:
+        y = dfg["did_travel_int"].to_numpy(dtype=float)
+        if len(y) < 4 or len(np.unique(y)) < 2:
+            for feature in features:
+                rows.append({
+                    "group": group_name,
+                    "feature": feature,
+                    "coef": np.nan,
+                    "odds_ratio": np.nan,
+                    "p_value": np.nan,
+                    "n_obs": int(len(y)),
+                    "event_rate": float(np.mean(y)) if len(y) else np.nan,
+                })
+            continue
+
+        for feature in features:
+            x_raw = dfg[feature].to_numpy(dtype=float)
+            ok = np.isfinite(x_raw) & np.isfinite(y)
+            x_raw = x_raw[ok]
+            yy = y[ok]
+            feature_n = int(len(yy))
+            feature_event_rate = float(np.mean(yy)) if feature_n else np.nan
+            if len(yy) < 4 or len(np.unique(yy)) < 2 or float(np.std(x_raw)) <= 1e-12:
+                coef = odds = p_value = np.nan
+            else:
+                x = (x_raw - np.mean(x_raw)) / np.std(x_raw)
+                X = np.column_stack([np.ones(len(x)), x])
+                beta = np.zeros(2, dtype=float)
+                for _ in range(100):
+                    p = sigmoid(X @ beta)
+                    w = np.clip(p * (1.0 - p), 1e-8, None)
+                    h = X.T @ (X * w[:, None])
+                    g = X.T @ (yy - p)
+                    step = np.linalg.solve(h + 1e-8 * np.eye(2), g)
+                    beta_new = beta + step
+                    if np.max(np.abs(step)) < 1e-8:
+                        beta = beta_new
+                        break
+                    beta = beta_new
+                p = sigmoid(X @ beta)
+                w = np.clip(p * (1.0 - p), 1e-8, None)
+                cov = np.linalg.pinv(X.T @ (X * w[:, None]))
+                se = float(np.sqrt(max(cov[1, 1], 0.0)))
+                coef = float(beta[1])
+                odds = float(np.exp(coef))
+                z = 0.0 if se <= 0 else coef / se
+                p_value = float(2.0 * (1.0 - normal_cdf(abs(z))))
+
+            rows.append({
+                "group": group_name,
+                "feature": feature,
+                "coef": coef,
+                "odds_ratio": odds,
+                "p_value": p_value,
+                "n_obs": feature_n,
+                "event_rate": feature_event_rate,
+            })
+
+    return pd.DataFrame(rows)
+
+
+def plot_travel_probability_by_skill(
+    run,
+    period=100,
+    visible_radius=5,
+    income_window=100,
+    n_bins=5,
+    figsize=(16, 10),
+):
+    """
+    Plot actual observed travel probability by variable, grouped by skill level.
+
+    Returns
+    -------
+    fig, coefficient_table, probability_table, regression_df
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    df = travel_regression_table_for_run(
+        run,
+        period=period,
+        visible_radius=visible_radius,
+        income_window=income_window,
+        cluster_by="agent",
+    )
+    features = [
+        "mean_coin",
+        "period_coin_change",
+        "mean_visible_resources",
+        "mean_visible_other_houses",
+        "mean_visible_own_houses",
+    ]
+    labels = {
+        "mean_coin": "Mean coin",
+        "period_coin_change": "Period income / coin change",
+        "mean_visible_resources": "Visible resources",
+        "mean_visible_other_houses": "Visible other houses",
+        "mean_visible_own_houses": "Visible own houses",
+    }
+
+    skill_values = sorted(v for v in df["skill_build_payment"].dropna().unique())
+    skill_rank = {v: i + 1 for i, v in enumerate(skill_values)}
+    df["skill_group"] = df["skill_build_payment"].map(
+        lambda v: f"skill {skill_rank.get(v, '?')} ({v:.0f})" if pd.notna(v) else "skill ?"
+    )
+
+    prob_rows = []
+    for feature in features:
+        valid = df[[feature, "did_travel_int", "skill_group"]].dropna().copy()
+        if valid.empty:
+            continue
+        valid["did_travel_int"] = pd.to_numeric(valid["did_travel_int"], errors="coerce")
+        valid[feature] = pd.to_numeric(valid[feature], errors="coerce")
+        valid = valid.dropna(subset=[feature, "did_travel_int"])
+        if valid.empty:
+            continue
+        if valid[feature].nunique() <= n_bins:
+            valid["_bin"] = valid[feature]
+            valid["_bin_mid"] = valid[feature].astype(float)
+        else:
+            valid["_bin"] = pd.qcut(valid[feature], q=min(n_bins, valid[feature].nunique()), duplicates="drop")
+            valid["_bin_mid"] = valid["_bin"].apply(lambda interval: float(interval.mid))
+        valid["_bin_mid"] = pd.to_numeric(valid["_bin_mid"], errors="coerce")
+
+        grouped = (
+            valid
+            .groupby(["skill_group", "_bin"], observed=False, as_index=False)
+            .agg(
+                bin_mid=("_bin_mid", "mean"),
+                travel_probability=("did_travel_int", "mean"),
+                n=("did_travel_int", "size"),
+                n_travel=("did_travel_int", "sum"),
+            )
+        )
+        grouped["feature"] = feature
+        grouped["feature_label"] = labels[feature]
+        prob_rows.append(grouped)
+
+    probability_table = pd.concat(prob_rows, ignore_index=True) if prob_rows else pd.DataFrame()
+    coefficient_table = _simple_logit_slope_table(df, features, group_col="skill_group")
+    coefficient_table["feature_label"] = coefficient_table["feature"].map(labels)
+
+    n_cols = 3
+    n_rows = int(np.ceil(len(features) / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False, constrained_layout=True)
+    axes_flat = axes.ravel()
+    colors = _make_agent_colors(range(max(1, len(skill_values))))
+    skill_colors = {
+        group: colors[i % len(colors)]
+        for i, group in enumerate(sorted(df["skill_group"].dropna().unique()))
+    }
+
+    for ax, feature in zip(axes_flat, features):
+        dff = probability_table[probability_table["feature"] == feature]
+        for skill_group, dfg in dff.groupby("skill_group"):
+            dfg = dfg.sort_values("bin_mid")
+            ax.plot(
+                dfg["bin_mid"],
+                dfg["travel_probability"],
+                marker="o",
+                linewidth=2,
+                color=skill_colors.get(skill_group),
+                label=skill_group,
+            )
+            ax.scatter(
+                dfg["bin_mid"],
+                dfg["travel_probability"],
+                s=20 + 3 * dfg["n"],
+                color=skill_colors.get(skill_group),
+                alpha=0.75,
+            )
+        ax.set_title(labels[feature])
+        ax.set_xlabel(labels[feature])
+        ax.set_ylabel("Actual Pr(travel)")
+        ax.set_ylim(0, 1)
+        ax.grid(True, alpha=0.25)
+
+    for ax in axes_flat[len(features):]:
+        ax.set_visible(False)
+
+    handles, legend_labels = axes_flat[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, legend_labels, loc="lower center", ncol=min(4, len(handles)), frameon=True)
+    fig.suptitle(
+        "Actual Travel Probability by Variable and Skill Level",
+        fontsize=16,
+        fontweight="bold",
+    )
+
+    return fig, coefficient_table, probability_table, df
+
+
+def region_residence_table(log):
+    """Return per-agent time shares and average stay lengths by region."""
+    import numpy as np
+    import pandas as pd
+
+    aids = _numeric_agent_ids(log)
+    waterline = _infer_waterline(log)
+    rows = []
+
+    for aid in aids:
+        seq = _region_sequence(log, aid, waterline=waterline)
+        n = max(1, len(seq))
+        time_top = int(sum(region == "top" for region in seq))
+        time_bottom = int(sum(region == "bottom" for region in seq))
+
+        spells = {"top": [], "bottom": []}
+        if seq:
+            current_region = seq[0]
+            current_len = 1
+            for region in seq[1:]:
+                if region == current_region:
+                    current_len += 1
+                else:
+                    spells[current_region].append(current_len)
+                    current_region = region
+                    current_len = 1
+            spells[current_region].append(current_len)
+
+        rows.append({
+            "agent": int(aid),
+            "time_top": time_top,
+            "time_bottom": time_bottom,
+            "share_top": time_top / n,
+            "share_bottom": time_bottom / n,
+            "avg_stay_top": float(np.mean(spells["top"])) if spells["top"] else 0.0,
+            "avg_stay_bottom": float(np.mean(spells["bottom"])) if spells["bottom"] else 0.0,
+            "n_stays_top": int(len(spells["top"])),
+            "n_stays_bottom": int(len(spells["bottom"])),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def plot_region_residence_summary(obj, mode="single", title=None, figsize=(11, 4.8)):
+    """
+    Plot top/bottom residence time and average stay lengths.
+
+    Parameters
+    ----------
+    obj : dense log or run dict
+        For a single dense log, pass ``log`` and use mode="single".
+        For averages across all dense logs in a run, pass ``runs[2]`` and use
+        mode="average".
+    mode : {"single", "average"}
+        ``single`` treats obj as one dense log unless obj is a run with
+        ``dense_log``. ``average`` averages per-agent statistics across all dense
+        logs in the run.
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    if isinstance(obj, dict) and "states" in obj:
+        logs = {0: obj}
+    else:
+        logs = _extract_logs_from_run(obj)
+
+    if not logs:
+        raise ValueError("No dense logs found.")
+
+    if mode == "single":
+        first_key = next(iter(logs))
+        tables = [region_residence_table(logs[first_key]).assign(log_key=first_key)]
+    elif mode == "average":
+        tables = [
+            region_residence_table(log).assign(log_key=log_key)
+            for log_key, log in logs.items()
+        ]
+    else:
+        raise ValueError("mode must be 'single' or 'average'.")
+
+    raw_df = pd.concat(tables, ignore_index=True)
+
+    if mode == "average":
+        df = (
+            raw_df
+            .groupby("agent", as_index=False)
+            .agg(
+                time_top=("time_top", "mean"),
+                time_bottom=("time_bottom", "mean"),
+                share_top=("share_top", "mean"),
+                share_bottom=("share_bottom", "mean"),
+                avg_stay_top=("avg_stay_top", "mean"),
+                avg_stay_bottom=("avg_stay_bottom", "mean"),
+                n_stays_top=("n_stays_top", "mean"),
+                n_stays_bottom=("n_stays_bottom", "mean"),
+            )
+        )
+    else:
+        df = raw_df.drop(columns=["log_key"])
+
+    top_total = float(df["time_top"].sum())
+    bottom_total = float(df["time_bottom"].sum())
+    agent_colors = _make_agent_colors(df["agent"].astype(int).tolist())
+
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=figsize,
+        gridspec_kw={"width_ratios": [0.85, 1.6]},
+        constrained_layout=True,
+    )
+    ax_pie, ax_bar = axes
+
+    ax_pie.pie(
+        [top_total, bottom_total],
+        labels=["top", "bottom"],
+        autopct="%1.1f%%",
+        startangle=90,
+        colors=["#1f77b4", "#ff7f0e"],
+        wedgeprops=dict(edgecolor="white", linewidth=1),
+        textprops=dict(fontsize=10),
+    )
+    ax_pie.set_title("Average Time Spent by Region")
+
+    x = np.arange(len(df))
+    width = 0.38
+    ordered = df.sort_values("agent").reset_index(drop=True)
+    ax_bar.bar(
+        x - width / 2,
+        ordered["avg_stay_top"],
+        width=width,
+        color="#1f77b4",
+        alpha=0.82,
+        label="top",
+    )
+    ax_bar.bar(
+        x + width / 2,
+        ordered["avg_stay_bottom"],
+        width=width,
+        color="#ff7f0e",
+        alpha=0.82,
+        label="bottom",
+    )
+    for xpos, aid in zip(x, ordered["agent"]):
+        ax_bar.scatter(
+            [xpos],
+            [0],
+            marker="s",
+            s=45,
+            color=agent_colors.get(int(aid), "0.4"),
+            clip_on=False,
+            zorder=4,
+        )
+
+    ax_bar.set_title("Average Stay Length by Agent")
+    ax_bar.set_xlabel("agent")
+    ax_bar.set_ylabel("timesteps per stay")
+    ax_bar.set_xticks(x)
+    ax_bar.set_xticklabels([str(int(a)) for a in ordered["agent"]])
+    ax_bar.grid(True, axis="y", alpha=0.25)
+    ax_bar.legend(frameon=True)
+
+    if title is None:
+        title = "Single Dense Log" if mode == "single" else "Average Across Dense Logs"
+    fig.suptitle(f"Region Residence Summary: {title}", fontsize=14, fontweight="bold")
+
+    return fig, df, raw_df
 
 
 def plot_regional_composition_tax_phase(
