@@ -1,15 +1,24 @@
 import simulation as exp
+import os
 
 import ray
-    
+
+if os.getenv("IS_LOCAL", None) is not None:
+    print("Using local configuration")
+    memory = None
+    object_store_memory = None
+else:
+    memory = 48 * 1024**3 # 63 GB for workers
+    object_store_memory = 20 * 1024**3 # 27 GB for object store
 
 ray.shutdown()
 ray.init(
     ignore_reinit_error=True,
     log_to_driver=False,
     #num_gpus=1,
-    memory = 48 * 1024**3,          # 63 GB for workers
-    object_store_memory=20 * 1024**3  # 27 GB for object store
+    memory = memory,
+    object_store_memory= object_store_memory,
+    include_webui=False
 )
 
 

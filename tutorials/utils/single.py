@@ -346,28 +346,144 @@ def forced_move_event_table(log, window=100):
     return pd.DataFrame(rows)
 
 
+def _is_log_batch(log_or_logs):
+    return isinstance(log_or_logs, (list, tuple))
 
-def plot_forced_move_timeseries(log, window=100):
+
+def _forced_move_event_table_batch(logs, window=100):
+    rows = []
+    for rollout_id, log in enumerate(logs):
+        df = forced_move_event_table(log, window=window)
+        df["rollout_id"] = log.get("rollout_id", rollout_id)
+        rows.append(df)
+
+    if not rows:
+        raise ValueError("No logs provided.")
+
+    raw_df = pd.concat(rows, ignore_index=True)
+    raw_df["wood_trades"] = raw_df["bought_wood"] + raw_df["sold_wood"]
+    raw_df["stone_trades"] = raw_df["bought_stone"] + raw_df["sold_stone"]
+
+    metrics = [
+        "coin",
+        "utility",
+        "wood",
+        "stone",
+        "labor",
+        "wood_trades",
+        "stone_trades",
+        "built",
+    ]
+
+    summary_df = (
+        raw_df
+        .groupby("relative_t", sort=True)[metrics]
+        .agg(["mean", "std", "count"])
+    )
+    summary_df.columns = [
+        f"{metric}_{stat}"
+        for metric, stat in summary_df.columns
+    ]
+    summary_df = summary_df.reset_index()
+
+    for metric in metrics:
+        summary_df[f"{metric}_std"] = summary_df[f"{metric}_std"].fillna(0.0)
+        summary_df[f"{metric}_sem"] = (
+            summary_df[f"{metric}_std"] / np.sqrt(summary_df[f"{metric}_count"])
+        )
+
+    return raw_df, summary_df
+
+
+def _plot_mean_with_error(ax, df, metric, label, color=None, linestyle="-", errorbar="std"):
+    x = df["relative_t"].to_numpy()
+    mean = df[f"{metric}_mean"].to_numpy()
+
+    line = ax.plot(
+        x,
+        mean,
+        label=label,
+        color=color,
+        linestyle=linestyle,
+        linewidth=2.0,
+    )[0]
+
+    if errorbar is not None:
+        err_col = f"{metric}_{errorbar}"
+        if err_col not in df:
+            raise ValueError("errorbar must be one of None, 'std', or 'sem'.")
+        err = df[err_col].to_numpy()
+        ax.fill_between(
+            x,
+            mean - err,
+            mean + err,
+            color=line.get_color(),
+            alpha=0.12,
+            linewidth=0,
+        )
+
+
+def plot_forced_move_timeseries(log, window=100, errorbar="std"):
+    if _is_log_batch(log):
+        raw_df, summary_df = _forced_move_event_table_batch(log, window=window)
+
+        fig, axes = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
+
+        axes[0].plot(summary_df["relative_t"], summary_df["coin_mean"], color="#1f77b4", label="Avg coin")
+        if errorbar is not None:
+            err_col = f"coin_{errorbar}"
+            if err_col not in summary_df:
+                raise ValueError("errorbar must be one of None, 'std', or 'sem'.")
+            axes[0].fill_between(
+                summary_df["relative_t"].to_numpy(),
+                summary_df["coin_mean"].to_numpy() - summary_df[err_col].to_numpy(),
+                summary_df["coin_mean"].to_numpy() + summary_df[err_col].to_numpy(),
+                color="#1f77b4",
+                alpha=0.12,
+                linewidth=0,
+            )
+        axes[0].axvline(0, linestyle="--")
+        axes[0].set_title("Moved agent: average coin around forced move")
+        axes[0].set_ylabel("Coin")
+        axes[0].legend()
+        axes[0].grid(True)
+
+        _plot_mean_with_error(axes[1], summary_df, "wood", "Avg wood", errorbar=errorbar)
+        _plot_mean_with_error(axes[1], summary_df, "stone", "Avg stone", errorbar=errorbar)
+        axes[1].axvline(0, linestyle="--")
+        axes[1].set_title("Average inventory")
+        axes[1].legend()
+        axes[1].grid(True)
+
+        _plot_mean_with_error(axes[2], summary_df, "labor", "Avg labor", errorbar=errorbar)
+        axes[2].axvline(0, linestyle="--")
+        axes[2].set_title("Average labor")
+        axes[2].grid(True)
+
+        _plot_mean_with_error(axes[3], summary_df, "wood_trades", "Avg wood trades", errorbar=errorbar)
+        _plot_mean_with_error(axes[3], summary_df, "stone_trades", "Avg stone trades", errorbar=errorbar)
+        _plot_mean_with_error(axes[3], summary_df, "built", "Avg builds", errorbar=errorbar)
+        axes[3].axvline(0, linestyle="--")
+        axes[3].set_title("Average economic activity")
+        axes[3].set_xlabel("Timesteps relative to forced move")
+        axes[3].legend()
+        axes[3].grid(True)
+
+        fig.tight_layout()
+        return fig, summary_df, raw_df
+
     df = forced_move_event_table(log, window=window)
     fm = log["forced_move"]
     agent_id = fm["agent"]
 
     fig, axes = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
 
-    ax_coin = axes[0]
-    ax_utility = ax_coin.twinx()
-    coin_line = ax_coin.plot(df["relative_t"], df["coin"], color="#1f77b4", label="Coin")
-    utility_line = ax_utility.plot(df["relative_t"], df["utility"], color="#d62728", label="Utility")
+    axes[0].plot(df["relative_t"], df["coin"], color="#1f77b4", label="Coin")
     axes[0].axvline(0, linestyle="--")
-    ax_utility.axvline(0, linestyle="--", color="0.5", alpha=0.4)
-    axes[0].set_title(f"Agent {agent_id}: coin and utility around forced move")
-    ax_coin.set_ylabel("Coin", color="#1f77b4")
-    ax_utility.set_ylabel("Utility", color="#d62728")
-    ax_coin.tick_params(axis="y", labelcolor="#1f77b4")
-    ax_utility.tick_params(axis="y", labelcolor="#d62728")
-    lines = coin_line + utility_line
-    ax_coin.legend(lines, [line.get_label() for line in lines], loc="best")
-    ax_coin.grid(True)
+    axes[0].set_title(f"Agent {agent_id}: coin around forced move")
+    axes[0].set_ylabel("Coin")
+    axes[0].legend()
+    axes[0].grid(True)
 
     axes[1].plot(df["relative_t"], df["wood"], label="Wood")
     axes[1].plot(df["relative_t"], df["stone"], label="Stone")
@@ -989,13 +1105,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-def plot_forced_move_utilities_system(log, window=100):
+def _forced_move_utilities_system_table(log, window=100):
     """
-    Plot utility development before and after forced move for:
-    - moved agent
-    - average of other agents
-    - p_top reward
-    - p_bottom reward
+    Build utility/reward trajectories around a forced move for one rollout.
     """
     fm = log.get("forced_move", None)
     if fm is None:
@@ -1066,6 +1178,116 @@ def plot_forced_move_utilities_system(log, window=100):
         })
 
     df = pd.DataFrame(rows)
+    return df
+
+
+def _forced_move_utilities_system_table_batch(logs, window=100):
+    rows = []
+    for rollout_id, log in enumerate(logs):
+        df = _forced_move_utilities_system_table(log, window=window)
+        df["rollout_id"] = log.get("rollout_id", rollout_id)
+        rows.append(df)
+
+    if not rows:
+        raise ValueError("No logs provided.")
+
+    raw_df = pd.concat(rows, ignore_index=True)
+    metrics = [
+        "moved_agent_utility",
+        "other_top_agents_avg_utility",
+        "other_bottom_agents_avg_utility",
+        "p_top_reward",
+        "p_bottom_reward",
+    ]
+
+    summary_df = (
+        raw_df
+        .groupby("relative_t", sort=True)[metrics]
+        .agg(["mean", "std", "count"])
+    )
+    summary_df.columns = [
+        f"{metric}_{stat}"
+        for metric, stat in summary_df.columns
+    ]
+    summary_df = summary_df.reset_index()
+
+    for metric in metrics:
+        summary_df[f"{metric}_std"] = summary_df[f"{metric}_std"].fillna(0.0)
+        summary_df[f"{metric}_sem"] = (
+            summary_df[f"{metric}_std"] / np.sqrt(summary_df[f"{metric}_count"])
+        )
+
+    return raw_df, summary_df
+
+
+def plot_forced_move_utilities_system(log, window=100, errorbar="std"):
+    """
+    Plot utility development before and after forced move for:
+    - moved agent
+    - average of other agents
+    - p_top reward
+    - p_bottom reward
+    """
+    if _is_log_batch(log):
+        raw_df, summary_df = _forced_move_utilities_system_table_batch(log, window=window)
+
+        fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+        _plot_mean_with_error(
+            axes[0],
+            summary_df,
+            "moved_agent_utility",
+            "Moved agent avg utility",
+            errorbar=errorbar,
+        )
+        _plot_mean_with_error(
+            axes[0],
+            summary_df,
+            "other_top_agents_avg_utility",
+            "Other top agents avg utility",
+            linestyle="--",
+            errorbar=errorbar,
+        )
+        _plot_mean_with_error(
+            axes[0],
+            summary_df,
+            "other_bottom_agents_avg_utility",
+            "Other bottom agents avg utility",
+            linestyle=":",
+            errorbar=errorbar,
+        )
+        axes[0].axvline(0, linestyle="--")
+        axes[0].set_title("Average agent utility before and after forced move")
+        axes[0].set_ylabel("Utility")
+        axes[0].grid(True)
+        axes[0].legend()
+
+        _plot_mean_with_error(
+            axes[1],
+            summary_df,
+            "p_top_reward",
+            "p_top avg reward",
+            errorbar=errorbar,
+        )
+        _plot_mean_with_error(
+            axes[1],
+            summary_df,
+            "p_bottom_reward",
+            "p_bottom avg reward",
+            linestyle="--",
+            errorbar=errorbar,
+        )
+        axes[1].axvline(0, linestyle="--")
+        axes[1].set_title("Average planner rewards before and after forced move")
+        axes[1].set_xlabel("Timesteps relative to forced move")
+        axes[1].set_ylabel("Reward")
+        axes[1].grid(True)
+        axes[1].legend()
+
+        fig.tight_layout()
+        return fig, summary_df, raw_df
+
+    df = _forced_move_utilities_system_table(log, window=window)
 
     fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
 

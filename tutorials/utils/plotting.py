@@ -4850,6 +4850,511 @@ def breakdown_all_agents_from_result_folder(result_dir, episode_key=0, remap_key
     return breakdown, dense_log, dense_logs
 
 
+def breakdown_all_agents_average_from_result_folder(
+    result_dir,
+    remap_key="build_payment",
+    group_by_skill=False,
+    trade_count_bin_size=25,
+    metrics=None,
+    figsize_metrics=(18, 9),
+    figsize_trade=(16, 9),
+    figsize_skill=(12, 5),
+):
+    """
+    Average-style all-agent breakdown across every dense log in a result folder.
+
+    This intentionally leaves out map and movement panels, where averaging
+    trajectories would be misleading. Metric panels use one dense log as one
+    sample per agent. Set ``group_by_skill=True`` to pool agents by skill level
+    in the metric and trade-value panels.
+    """
+    import math
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    dense_logs = load_dense_logs_from_result_folder(result_dir)
+    log_items = _dense_log_items(dense_logs)
+    if not log_items:
+        raise ValueError(f"No dense logs found in {result_dir}")
+
+    first_log = log_items[0][1]
+    agent_ids = numeric_agent_ids_from_states(first_log["states"][0])
+    agent_colors = _make_agent_colors(agent_ids)
+
+    if remap_key is None:
+        ordered_agents = agent_ids[:]
+    else:
+        key_vals = np.array([
+            first_log["states"][0][str(aid)].get(remap_key, np.nan)
+            for aid in agent_ids
+        ], dtype=float)
+        ordered_agents = [agent_ids[i] for i in np.argsort(key_vals).tolist()]
+
+    build_payment = {
+        aid: float(first_log["states"][0][str(aid)].get("build_payment", np.nan))
+        for aid in agent_ids
+    }
+    finite_skills = sorted({v for v in build_payment.values() if np.isfinite(v)})
+    skill_rank = {v: i + 1 for i, v in enumerate(finite_skills)}
+
+    def skill_label(aid):
+        build = build_payment.get(aid, np.nan)
+        rank = skill_rank.get(build, None)
+        if rank is None:
+            return "skill ?"
+        return f"skill {rank}/{len(finite_skills)}"
+
+    def agent_label(aid):
+        build = build_payment.get(aid, np.nan)
+        build_text = "?" if not np.isfinite(build) else f"{build:.0f}"
+        return f"A{aid}\n{skill_label(aid)}\nbuild {build_text}"
+
+    skill_order = sorted(
+        {skill_label(aid) for aid in agent_ids},
+        key=lambda x: (999 if x == "skill ?" else int(x.split()[1].split("/")[0])),
+    )
+
+    metric_rows = []
+    trade_rows = []
+    rollout_lengths = {}
+
+    for rollout_id, log in log_items:
+        states = log.get("states", [])
+        if not states:
+            continue
+        rollout_lengths[rollout_id] = len(states)
+
+        builds_by_agent = {
+            aid: {"build_income": 0.0, "build_count": 0}
+            for aid in agent_ids
+        }
+        for builds in log.get("Build", []):
+            builds_ = builds.get("builds", []) if isinstance(builds, dict) else builds
+            if not isinstance(builds_, list):
+                continue
+            for build in builds_:
+                if not isinstance(build, dict) or "builder" not in build:
+                    continue
+                aid = int(build["builder"])
+                if aid not in builds_by_agent:
+                    continue
+                builds_by_agent[aid]["build_income"] += float(build.get("income", 0.0))
+                builds_by_agent[aid]["build_count"] += 1
+
+        trade_value = {
+            (aid, commodity, side): 0.0
+            for aid in agent_ids
+            for commodity in ["Wood", "Stone"]
+            for side in ["Sell", "Buy"]
+        }
+        trade_count = {
+            (aid, commodity, side): 0
+            for aid in agent_ids
+            for commodity in ["Wood", "Stone"]
+            for side in ["Sell", "Buy"]
+        }
+        for t, trades in enumerate(log.get("Trade", [])):
+            trades_ = trades.get("trades", []) if isinstance(trades, dict) else trades
+            if not isinstance(trades_, list):
+                continue
+            for trade in trades_:
+                if not isinstance(trade, dict):
+                    continue
+                commodity = trade.get("commodity")
+                if commodity not in ["Wood", "Stone"]:
+                    continue
+                seller = trade.get("seller")
+                buyer = trade.get("buyer")
+                if seller is not None:
+                    aid = int(seller)
+                    if aid in agent_ids:
+                        trade_value[(aid, commodity, "Sell")] += float(
+                            trade.get("income", trade.get("price", 0.0))
+                        )
+                        trade_count[(aid, commodity, "Sell")] += 1
+                        trade_rows.append({
+                            "rollout_id": rollout_id,
+                            "agent": aid,
+                            "skill": skill_label(aid),
+                            "build_payment": build_payment.get(aid, np.nan),
+                            "commodity": commodity,
+                            "side": "Sell",
+                            "value": float(trade.get("income", trade.get("price", 0.0))),
+                            "count": 1,
+                            "timestep": t,
+                        })
+                if buyer is not None:
+                    aid = int(buyer)
+                    if aid in agent_ids:
+                        trade_value[(aid, commodity, "Buy")] += float(
+                            trade.get("cost", trade.get("price", 0.0))
+                        )
+                        trade_count[(aid, commodity, "Buy")] += 1
+                        trade_rows.append({
+                            "rollout_id": rollout_id,
+                            "agent": aid,
+                            "skill": skill_label(aid),
+                            "build_payment": build_payment.get(aid, np.nan),
+                            "commodity": commodity,
+                            "side": "Buy",
+                            "value": float(trade.get("cost", trade.get("price", 0.0))),
+                            "count": 1,
+                            "timestep": t,
+                        })
+
+        for aid in agent_ids:
+            agent_states = [state[str(aid)] for state in states if str(aid) in state]
+            if not agent_states:
+                continue
+
+            def resource_series(resource):
+                return np.array([
+                    float(s.get("inventory", {}).get(resource, 0.0))
+                    + float(s.get("escrow", {}).get(resource, 0.0))
+                    for s in agent_states
+                ], dtype=float)
+
+            coin = resource_series("Coin")
+            wood = resource_series("Wood")
+            stone = resource_series("Stone")
+            labor = np.array([
+                float(s.get("endogenous", {}).get("Labor", np.nan))
+                for s in agent_states
+            ], dtype=float)
+            utility = np.array([
+                float(s.get("utility", np.nan))
+                for s in agent_states
+            ], dtype=float)
+            sell_total = sum(trade_value[(aid, c, "Sell")] for c in ["Wood", "Stone"])
+            buy_total = sum(trade_value[(aid, c, "Buy")] for c in ["Wood", "Stone"])
+
+            metric_rows.append({
+                "rollout_id": rollout_id,
+                "agent": aid,
+                "skill": skill_label(aid),
+                "build_payment": build_payment.get(aid, np.nan),
+                "final_coin": float(coin[-1]) if len(coin) else np.nan,
+                "mean_coin": float(np.nanmean(coin)) if len(coin) else np.nan,
+                "final_wood": float(wood[-1]) if len(wood) else np.nan,
+                "final_stone": float(stone[-1]) if len(stone) else np.nan,
+                "final_labor": float(labor[-1]) if len(labor) else np.nan,
+                "mean_labor": float(np.nanmean(labor)) if len(labor) else np.nan,
+                "mean_utility": float(np.nanmean(utility)) if np.any(np.isfinite(utility)) else np.nan,
+                "final_utility": float(utility[-1]) if len(utility) and np.isfinite(utility[-1]) else np.nan,
+                "build_income": builds_by_agent[aid]["build_income"],
+                "build_count": builds_by_agent[aid]["build_count"],
+                "sell_income": sell_total,
+                "buy_cost": buy_total,
+                "net_market": sell_total - buy_total,
+                "wood_sell_value": trade_value[(aid, "Wood", "Sell")],
+                "wood_buy_value": trade_value[(aid, "Wood", "Buy")],
+                "stone_sell_value": trade_value[(aid, "Stone", "Sell")],
+                "stone_buy_value": trade_value[(aid, "Stone", "Buy")],
+                "wood_sell_count": trade_count[(aid, "Wood", "Sell")],
+                "wood_buy_count": trade_count[(aid, "Wood", "Buy")],
+                "stone_sell_count": trade_count[(aid, "Stone", "Sell")],
+                "stone_buy_count": trade_count[(aid, "Stone", "Buy")],
+            })
+
+    metric_df = pd.DataFrame(metric_rows)
+    trade_event_df = pd.DataFrame(trade_rows)
+    if metric_df.empty:
+        raise ValueError("Dense logs were found, but no agent metric rows could be constructed.")
+
+    if metrics is None:
+        metrics = [
+            "final_coin",
+            "mean_coin",
+            "final_labor",
+            "mean_utility",
+            "build_income",
+            "net_market",
+        ]
+    metrics = [m for m in metrics if m in metric_df.columns and metric_df[m].notna().any()]
+
+    n_cols = min(3, max(1, len(metrics)))
+    n_rows = int(math.ceil(len(metrics) / n_cols))
+    fig_metrics, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=figsize_metrics,
+        squeeze=False,
+        constrained_layout=True,
+    )
+    axes_flat = axes.ravel()
+
+    if group_by_skill:
+        metric_groups = skill_order
+        metric_labels = metric_groups
+        metric_data_for = lambda group, metric: metric_df.loc[metric_df["skill"] == group, metric]
+        metric_colors = {
+            group: plt.get_cmap("tab10")(i % 10)
+            for i, group in enumerate(metric_groups)
+        }
+    else:
+        metric_groups = ordered_agents
+        metric_labels = [agent_label(aid) for aid in ordered_agents]
+        metric_data_for = lambda aid, metric: metric_df.loc[metric_df["agent"] == aid, metric]
+        metric_colors = {aid: agent_colors.get(aid, "0.5") for aid in ordered_agents}
+
+    for ax, metric in zip(axes_flat, metrics):
+        data = [
+            metric_data_for(group, metric).dropna().to_numpy(dtype=float)
+            for group in metric_groups
+        ]
+        bp = ax.boxplot(
+            data,
+            patch_artist=True,
+            showfliers=False,
+            showmeans=True,
+            meanprops=dict(marker="o", markerfacecolor="black", markeredgecolor="black", markersize=4),
+            medianprops=dict(color="black", linewidth=1.2),
+        )
+        for patch, group in zip(bp["boxes"], metric_groups):
+            patch.set_facecolor(metric_colors.get(group, "0.5"))
+            patch.set_alpha(0.55)
+        ax.set_title(metric.replace("_", " ").title())
+        ax.set_xticks(np.arange(1, len(metric_groups) + 1))
+        ax.set_xticklabels(metric_labels, rotation=0, fontsize=8)
+        ax.grid(True, axis="y", alpha=0.25)
+
+    for ax in axes_flat[len(metrics):]:
+        ax.set_visible(False)
+    metric_title_suffix = "Grouped by Skill" if group_by_skill else "By Agent"
+    fig_metrics.suptitle(f"Agent Metrics Across Dense Logs ({metric_title_suffix})", fontsize=14, fontweight="bold")
+
+    trade_summary = (
+        metric_df
+        .groupby(["agent", "skill", "build_payment"], as_index=False)
+        .agg(
+            wood_sell_value=("wood_sell_value", "mean"),
+            wood_sell_std=("wood_sell_value", "std"),
+            wood_buy_value=("wood_buy_value", "mean"),
+            wood_buy_std=("wood_buy_value", "std"),
+            stone_sell_value=("stone_sell_value", "mean"),
+            stone_sell_std=("stone_sell_value", "std"),
+            stone_buy_value=("stone_buy_value", "mean"),
+            stone_buy_std=("stone_buy_value", "std"),
+            wood_sell_count=("wood_sell_count", "mean"),
+            wood_buy_count=("wood_buy_count", "mean"),
+            stone_sell_count=("stone_sell_count", "mean"),
+            stone_buy_count=("stone_buy_count", "mean"),
+        )
+    ).fillna(0.0)
+
+    fig_trade, trade_axes = plt.subplots(2, 2, figsize=figsize_trade, sharex=True, constrained_layout=True)
+    trade_specs = [
+        ("Wood", "Sell", "wood_sell_value", "wood_sell_std", "#4c78a8"),
+        ("Wood", "Buy", "wood_buy_value", "wood_buy_std", "#72b7b2"),
+        ("Stone", "Sell", "stone_sell_value", "stone_sell_std", "#f58518"),
+        ("Stone", "Buy", "stone_buy_value", "stone_buy_std", "#eeca3b"),
+    ]
+    if group_by_skill:
+        trade_groups = skill_order
+        trade_labels = trade_groups
+
+        def trade_values_for(group, value_col):
+            return metric_df.loc[metric_df["skill"] == group, value_col].dropna().to_numpy(dtype=float)
+    else:
+        trade_groups = ordered_agents
+        trade_labels = [agent_label(aid) for aid in ordered_agents]
+
+        def trade_values_for(group, value_col):
+            return metric_df.loc[metric_df["agent"] == group, value_col].dropna().to_numpy(dtype=float)
+
+    x = np.arange(len(trade_groups))
+    for ax, (commodity, side, value_col, std_col, color) in zip(trade_axes.ravel(), trade_specs):
+        values = []
+        errs = []
+        for group in trade_groups:
+            raw_vals = trade_values_for(group, value_col)
+            values.append(float(np.nanmean(raw_vals)) if len(raw_vals) else 0.0)
+            errs.append(float(np.nanstd(raw_vals, ddof=1)) if len(raw_vals) > 1 else 0.0)
+        ax.bar(x, values, yerr=errs, color=color, alpha=0.82, capsize=3, edgecolor="white")
+        ax.set_title(f"{side} {commodity}: Mean Value per Dense Log")
+        ax.set_ylabel("coin")
+        ax.set_xticks(x)
+        ax.set_xticklabels(trade_labels, fontsize=8)
+        ax.grid(True, axis="y", alpha=0.25)
+    trade_title_suffix = "Grouped by Skill" if group_by_skill else "By Agent"
+    fig_trade.suptitle(
+        f"Trading Values by Commodity and Direction ({trade_title_suffix})",
+        fontsize=14,
+        fontweight="bold",
+    )
+
+    if group_by_skill:
+        count_groups = skill_order
+        count_title_suffix = "Grouped by Skill"
+    else:
+        count_groups = ordered_agents
+        count_title_suffix = "By Agent"
+
+    count_labels = [
+        group if group_by_skill else agent_label(group)
+        for group in count_groups
+    ]
+    bin_size = max(1, int(trade_count_bin_size))
+    max_steps = max(rollout_lengths.values()) if rollout_lengths else 0
+    n_bins = max(1, int(math.ceil(max_steps / bin_size)))
+    bin_ids = list(range(n_bins))
+
+    if trade_event_df.empty:
+        raw_count_df = pd.DataFrame(columns=[
+            "rollout_id", "time_bin", "agent", "skill", "commodity", "side", "count"
+        ])
+    else:
+        raw_count_df = trade_event_df.copy()
+        raw_count_df["time_bin"] = (raw_count_df["timestep"].astype(int) // bin_size).clip(lower=0)
+        raw_count_df = (
+            raw_count_df
+            .groupby(["rollout_id", "time_bin", "agent", "skill", "commodity", "side"], as_index=False)
+            .agg(count=("count", "sum"))
+        )
+
+    count_grid_rows = []
+    for rollout_id, _log in log_items:
+        for time_bin in bin_ids:
+            for aid in agent_ids:
+                for commodity in ["Wood", "Stone"]:
+                    for side in ["Sell", "Buy"]:
+                        count_grid_rows.append({
+                            "rollout_id": rollout_id,
+                            "time_bin": time_bin,
+                            "agent": aid,
+                            "skill": skill_label(aid),
+                            "commodity": commodity,
+                            "side": side,
+                        })
+    count_grid = pd.DataFrame(count_grid_rows)
+    count_plot_raw = count_grid.merge(
+        raw_count_df,
+        on=["rollout_id", "time_bin", "agent", "skill", "commodity", "side"],
+        how="left",
+    )
+    count_plot_raw["count"] = count_plot_raw["count"].fillna(0.0)
+
+    if group_by_skill:
+        per_rollout_count = (
+            count_plot_raw
+            .groupby(["rollout_id", "time_bin", "skill", "commodity", "side"], as_index=False)
+            .agg(count=("count", "mean"))
+        )
+        count_plot_df = (
+            per_rollout_count
+            .groupby(["time_bin", "skill", "commodity", "side"], as_index=False)
+            .agg(mean_count=("count", "mean"), std_count=("count", "std"))
+        )
+        count_group_col = "skill"
+    else:
+        count_plot_df = (
+            count_plot_raw
+            .groupby(["time_bin", "agent", "commodity", "side"], as_index=False)
+            .agg(mean_count=("count", "mean"), std_count=("count", "std"))
+        )
+        count_group_col = "agent"
+    count_plot_df["std_count"] = count_plot_df["std_count"].fillna(0.0)
+
+    n_count_cols = min(4, max(1, len(count_groups)))
+    n_count_rows = int(math.ceil(len(count_groups) / n_count_cols))
+    fig_skill, count_axes = plt.subplots(
+        n_count_rows,
+        n_count_cols,
+        figsize=(
+            max(figsize_skill[0], 3.4 * n_count_cols),
+            max(figsize_skill[1], 2.7 * n_count_rows),
+        ),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    count_axes_flat = count_axes.ravel()
+    resource_colors = {"Wood": "#8fcf7b", "Stone": "#f2ead4"}
+    x_vals = np.array([(b * bin_size) + (bin_size / 2.0) for b in bin_ids], dtype=float)
+
+    max_abs_count = 1.0
+    for _, row in count_plot_df.iterrows():
+        max_abs_count = max(max_abs_count, abs(float(row["mean_count"])))
+
+    for ax, group, label in zip(count_axes_flat, count_groups, count_labels):
+        ax.set_facecolor([0.30, 0.30, 0.30])
+        ax.axhline(0, color="white", linewidth=1.0, alpha=0.8)
+        for commodity in ["Wood", "Stone"]:
+            sell_match = count_plot_df[
+                (count_plot_df[count_group_col] == group)
+                & (count_plot_df["commodity"] == commodity)
+                & (count_plot_df["side"] == "Sell")
+            ].set_index("time_bin").reindex(bin_ids)
+            buy_match = count_plot_df[
+                (count_plot_df[count_group_col] == group)
+                & (count_plot_df["commodity"] == commodity)
+                & (count_plot_df["side"] == "Buy")
+            ].set_index("time_bin").reindex(bin_ids)
+            sell_counts = sell_match["mean_count"].fillna(0.0).to_numpy(dtype=float)
+            buy_counts = buy_match["mean_count"].fillna(0.0).to_numpy(dtype=float)
+            ax.plot(
+                x_vals,
+                sell_counts,
+                color=resource_colors[commodity],
+                linewidth=2.0,
+                marker=".",
+                markersize=5,
+                alpha=0.95,
+            )
+            ax.plot(
+                x_vals,
+                -buy_counts,
+                color=resource_colors[commodity],
+                linewidth=2.0,
+                marker=".",
+                markersize=5,
+                alpha=0.95,
+            )
+
+        ax.set_title(label, fontsize=9, color="black")
+        ax.set_xlim(0, max_steps if max_steps > 0 else bin_size)
+        ax.set_ylim(-max_abs_count * 1.25, max_abs_count * 1.25)
+        ax.set_xlabel("timestep", fontsize=8)
+        ax.tick_params(axis="y", colors="black", labelsize=8)
+        ax.grid(True, axis="y", color="white", alpha=0.18)
+
+    for ax in count_axes_flat[len(count_groups):]:
+        ax.axis("off")
+
+    legend_handles = [
+        Line2D([0], [0], color=resource_colors["Wood"], linewidth=2.5, label="Wood"),
+        Line2D([0], [0], color=resource_colors["Stone"], linewidth=2.5, label="Stone"),
+    ]
+    fig_skill.legend(
+        handles=legend_handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, -0.01),
+        ncol=4,
+        frameon=True,
+        fontsize=9,
+    )
+    fig_skill.subplots_adjust(bottom=0.16)
+    fig_skill.suptitle(
+        f"Average Trade Counts by {bin_size}-Step Time Bin ({count_title_suffix})",
+        fontsize=14,
+        fontweight="bold",
+    )
+
+    figures = {
+        "metrics": fig_metrics,
+        "trade_values_by_agent": fig_trade,
+        "trade_counts_by_skill": fig_skill,
+    }
+    tables = {
+        "agent_metrics": metric_df,
+        "trade_events": trade_event_df,
+        "trade_summary": trade_summary,
+        "trade_counts": count_plot_df,
+    }
+    return figures, tables, dense_logs
+
+
 def extract_periodic_tax_streams(log, tax_keys=("PeriodicTax-p_top", "PeriodicTax-p_bottom")):
     """Summarize sparse PeriodicTax component logs into one row per tax event."""
     import numpy as np
@@ -9801,6 +10306,7 @@ def plot_travel_probability_by_skill(
         income_window=income_window,
         cluster_by="agent",
     )
+    df["did_travel_int"] = pd.to_numeric(df["did_travel_int"], errors="coerce")
     features = [
         "mean_coin",
         "period_coin_change",
@@ -9815,6 +10321,27 @@ def plot_travel_probability_by_skill(
         "mean_visible_other_houses": "Visible other houses",
         "mean_visible_own_houses": "Visible own houses",
     }
+
+    valid_outcome = df["did_travel_int"].dropna()
+    if valid_outcome.nunique() < 2:
+        event_rate = float(valid_outcome.mean()) if len(valid_outcome) else np.nan
+        coefficient_table = _simple_logit_slope_table(df, features, group_col=None)
+        coefficient_table["feature_label"] = coefficient_table["feature"].map(labels)
+        probability_table = pd.DataFrame()
+        fig, ax = plt.subplots(figsize=(9, 4), constrained_layout=True)
+        ax.axis("off")
+        message = (
+            "Travel probability by skill was not plotted.\n\n"
+            "The selected run/filter has no variation in travel decisions:\n"
+            f"observations = {len(valid_outcome)}, "
+            f"travel events = {int(valid_outcome.sum()) if len(valid_outcome) else 0}, "
+            f"event rate = {event_rate:.3f}.\n\n"
+            "This means every included agent-period is either travel or non-travel, "
+            "so variable effects by skill cannot be compared."
+        )
+        ax.text(0.02, 0.72, message, va="top", ha="left", fontsize=12)
+        fig.suptitle("Actual Travel Probability by Variable and Skill Level", fontsize=14, fontweight="bold")
+        return fig, coefficient_table, probability_table, df
 
     skill_values = sorted(v for v in df["skill_build_payment"].dropna().unique())
     skill_rank = {v: i + 1 for i, v in enumerate(skill_values)}
@@ -9859,7 +10386,7 @@ def plot_travel_probability_by_skill(
     coefficient_table["feature_label"] = coefficient_table["feature"].map(labels)
 
     n_cols = 3
-    n_rows = int(np.ceil(len(features) / n_cols))
+    n_rows = 2
     fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False, constrained_layout=True)
     axes_flat = axes.ravel()
     colors = _make_agent_colors(range(max(1, len(skill_values))))
@@ -9876,16 +10403,20 @@ def plot_travel_probability_by_skill(
                 dfg["bin_mid"],
                 dfg["travel_probability"],
                 marker="o",
-                linewidth=2,
+                markersize=4,
+                linewidth=1.6,
                 color=skill_colors.get(skill_group),
+                alpha=0.9,
                 label=skill_group,
             )
             ax.scatter(
                 dfg["bin_mid"],
                 dfg["travel_probability"],
-                s=20 + 3 * dfg["n"],
+                s=np.clip(14 + 2.2 * dfg["n"], 24, 130),
                 color=skill_colors.get(skill_group),
-                alpha=0.75,
+                alpha=0.65,
+                edgecolor="white",
+                linewidth=0.6,
             )
         ax.set_title(labels[feature])
         ax.set_xlabel(labels[feature])
@@ -9898,7 +10429,14 @@ def plot_travel_probability_by_skill(
 
     handles, legend_labels = axes_flat[0].get_legend_handles_labels()
     if handles:
-        fig.legend(handles, legend_labels, loc="lower center", ncol=min(4, len(handles)), frameon=True)
+        by_label = dict(zip(legend_labels, handles))
+        fig.legend(
+            by_label.values(),
+            by_label.keys(),
+            loc="lower center",
+            ncol=min(4, len(by_label)),
+            frameon=True,
+        )
     fig.suptitle(
         "Actual Travel Probability by Variable and Skill Level",
         fontsize=16,
