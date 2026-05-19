@@ -493,21 +493,56 @@ def build_policies(
     obs_space_bottom = env_obj.observation_space_pl["p_bottom"]
     act_space_bottom = env_obj.action_space_pl["p_bottom"]
 
-    agent_policy_config = agent_policy_config or {"lr": 3e-4}
+    agent_model_config = {
+        "custom_model": "keras_conv_lstm",
+        "custom_model_config": {
+            "fc_dim": 128,
+            "idx_emb_dim": 4,
+            "input_emb_vocab": 100,
+            "lstm_cell_size": 128,
+            "num_conv": 2,
+            "num_fc": 2,
+        },
+        "max_seq_len": 25,
+    }
+    planner_model_config = {
+        "custom_model": "keras_conv_lstm",
+        "custom_model_config": {
+            "fc_dim": 256,
+            "idx_emb_dim": 4,
+            "input_emb_vocab": 100,
+            "lstm_cell_size": 256,
+            "num_conv": 2,
+            "num_fc": 2,
+        },
+        "max_seq_len": 25,
+    }
+
+    default_agent_config = {
+        "lr": 3e-4,
+        "model": deepcopy(agent_model_config),
+    }
+    agent_policy_config = {**default_agent_config, **(agent_policy_config or {})}
+    agent_policy_config["model"] = {
+        **deepcopy(agent_model_config),
+        **agent_policy_config.get("model", {}),
+    }
+
     default_planner_config = {
         "lr": 1e-4,
         "entropy_coeff": 0.02,
-        "model": {
-            "custom_model": "keras_linear",
-            "custom_model_config": {
-                "fully_connected_value": True,
-                "fc_dim": 128,
-                "num_fc": 2,
-            },
-        },
+        "model": deepcopy(planner_model_config),
     }
     p_top_config = {**default_planner_config, **(p_top_config or {})}
+    p_top_config["model"] = {
+        **deepcopy(planner_model_config),
+        **p_top_config.get("model", {}),
+    }
     p_bottom_config = {**default_planner_config, **(p_bottom_config or {})}
+    p_bottom_config["model"] = {
+        **deepcopy(planner_model_config),
+        **p_bottom_config.get("model", {}),
+    }
 
     return {
         "a": (None, obs_space_a, act_space_a, agent_policy_config),
