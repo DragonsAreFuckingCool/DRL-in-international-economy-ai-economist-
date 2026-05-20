@@ -7233,7 +7233,69 @@ def plot_bracket_counts_for_log(
     period=100,
     figsize=(13, 5),
 ):
-    df_income, counts, labels = _income_bracket_counts(log, brackets, period=period)
+    import numpy as np
+    import pandas as pd
+
+    log_items = _dense_log_items(log)
+    if not log_items:
+        raise ValueError("No dense logs found. Pass a dense log, dense_logs, or a run dict.")
+
+    income_frames = []
+    count_frames = []
+    labels = None
+    for rollout_id, dense_log in log_items:
+        df_one, counts_one, labels_one = _income_bracket_counts(
+            dense_log,
+            brackets,
+            period=period,
+        )
+        if labels is None:
+            labels = labels_one
+        if not df_one.empty:
+            df_one = df_one.copy()
+            df_one["rollout_id"] = rollout_id
+            income_frames.append(df_one)
+        if not counts_one.empty:
+            counts_one = counts_one.copy()
+            counts_one["rollout_id"] = rollout_id
+            count_frames.append(counts_one)
+
+    df_income = pd.concat(income_frames, ignore_index=True) if income_frames else pd.DataFrame()
+    raw_counts = pd.concat(count_frames, ignore_index=True) if count_frames else pd.DataFrame()
+    if raw_counts.empty:
+        raise ValueError("No income bracket counts could be constructed.")
+
+    if len(log_items) > 1:
+        full_index = pd.MultiIndex.from_product(
+            [
+                raw_counts["rollout_id"].unique(),
+                sorted(raw_counts["tax_day_number"].unique()),
+                ["top", "bottom"],
+                labels,
+            ],
+            names=["rollout_id", "tax_day_number", "planner_region", "tax_bracket"],
+        )
+        counts_complete = (
+            raw_counts
+            .set_index(["rollout_id", "tax_day_number", "planner_region", "tax_bracket"])
+            .reindex(full_index, fill_value=0)
+            .reset_index()
+        )
+        counts = (
+            counts_complete
+            .groupby(["tax_day_number", "planner_region", "tax_bracket"], as_index=False, observed=False)
+            .agg(
+                n_agents=("n_agents", "mean"),
+                n_agents_std=("n_agents", "std"),
+                n_dense_logs=("n_agents", "count"),
+            )
+        )
+        counts["n_agents_std"] = counts["n_agents_std"].fillna(0.0)
+    else:
+        counts = raw_counts.copy()
+        counts["n_agents_std"] = 0.0
+        counts["n_dense_logs"] = 1
+
     date_by_period = (
         df_income.dropna(subset=["date"])
         .drop_duplicates("tax_day_number")
@@ -7260,13 +7322,14 @@ def plot_bracket_counts_for_log(
         )
 
         im = ax.imshow(
-            pivot.values,
+            pivot.values.astype(float),
             aspect="auto",
             interpolation="nearest",
             cmap="viridis",
         )
 
-        ax.set_title(f"{region} planner: agents per income bracket")
+        title_suffix = "average" if len(log_items) > 1 else "agents"
+        ax.set_title(f"{region} planner: {title_suffix} per income bracket")
         ax.set_xlabel("tax day")
         ax.set_yticks(np.arange(len(labels)))
         ax.set_yticklabels(labels)
@@ -7282,6 +7345,8 @@ def plot_bracket_counts_for_log(
     cbar = fig.colorbar(im, ax=axes, location="right", shrink=0.9, pad=0.02)
     cbar.set_label("n agents")
 
+    if len(log_items) > 1:
+        cbar.set_label("mean n agents")
     return fig, df_income, counts
 
 
@@ -10369,7 +10434,7 @@ def plot_travel_probability_by_skill(
 
         grouped = (
             valid
-            .groupby(["skill_group", "_bin"], observed=False, as_index=False)
+            .groupby(["skill_group", "_bin"], observed=True, as_index=False)
             .agg(
                 bin_mid=("_bin_mid", "mean"),
                 travel_probability=("did_travel_int", "mean"),
