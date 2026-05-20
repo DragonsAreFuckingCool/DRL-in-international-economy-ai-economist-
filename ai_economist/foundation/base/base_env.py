@@ -727,6 +727,28 @@ class BaseEnvironment(ABC):
                     v["flat"] if flatten_observations else v
                 )
 
+        if hasattr(self.world, "planners") and len(self.world.planners) > 1:
+            scenario = getattr(self.world, "scenario", None)
+            if scenario is not None and hasattr(scenario, "_is_top_agent"):
+                for planner in self.world.planners:
+                    pid = str(planner.idx)
+                    keys_to_delete = []
+                    for key in list(obs[pid].keys()):
+                        if not isinstance(key, str) or not key.startswith("p"):
+                            continue
+                        agent_id = key[1:]
+                        if not agent_id.isdigit():
+                            continue
+
+                        agent = self.world.agents[int(agent_id)]
+                        agent_is_top = bool(scenario._is_top_agent(agent))
+                        planner_is_top = "top" in pid
+                        if agent_is_top != planner_is_top:
+                            keys_to_delete.append(key)
+
+                    for key in keys_to_delete:
+                        del obs[pid][key]
+
 
         # Get each agent's action masks and incorporate them into the observations
         for aidx, amask in self._generate_masks(flatten_masks=flatten_masks).items():

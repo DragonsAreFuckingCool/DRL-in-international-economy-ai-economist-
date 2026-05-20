@@ -1999,6 +1999,10 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
             if pid not in obs:
                 obs[pid] = {}
 
+            for k in list(obs[pid].keys()):
+                if isinstance(k, str) and k.startswith("inventory-"):
+                    del obs[pid][k]
+
             # Keep only region-relevant per-agent planner entries ("p0", "p1", ...)
             # Remove entries for agents outside this planner's region.
             keys_to_delete = []

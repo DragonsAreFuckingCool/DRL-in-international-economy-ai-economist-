@@ -633,7 +633,8 @@ class ContinuousDoubleAuction(BaseComponent):
         submit). Agents also see their own outstanding bids/asks.
         """
         world = self.world
-        obs = {a.idx: {} for a in world.agents + [world.planner]}
+        planners = list(getattr(world, "planners", [world.planner]))
+        obs = {a.idx: {} for a in world.agents + planners}
 
         prices = np.arange(self.price_floor, self.price_ceiling + 1)
 
@@ -647,7 +648,87 @@ class ContinuousDoubleAuction(BaseComponent):
             )
             scaled_price_history = net_price_history * self.inv_scale
 
-            if not self.restrict_trade_to_region:
+            if len(planners) > 1:
+                for planner in planners:
+                    planner_region = "top" if "top" in str(planner.idx) else "bottom"
+                    region_agent_ids = [
+                        agent.idx
+                        for agent in world.agents
+                        if self.get_agent_region(agent) == planner_region
+                    ]
+                    if region_agent_ids:
+                        region_price_history = np.sum(
+                            np.stack(
+                                [
+                                    self.price_history[c][i]
+                                    for i in region_agent_ids
+                                ]
+                            ),
+                            axis=0,
+                        )
+                    else:
+                        region_price_history = self._price_zeros()
+
+                    region_market_rate = prices.dot(region_price_history) / np.maximum(
+                        0.001, np.sum(region_price_history)
+                    )
+
+                    obs[planner.idx].update(
+                        {
+                            f"market_rate-{c}": region_market_rate,
+                            f"price_history-{c}": region_price_history * self.inv_scale,
+                            f"full_asks-{c}": self.available_asks_for_region(
+                                c, planner_region
+                            ),
+                            f"full_bids-{c}": self.available_bids_for_region(
+                                c, planner_region
+                            ),
+                        }
+                    )
+
+                if not self.restrict_trade_to_region:
+                    full_asks = self.available_asks(c, agent=None)
+                    full_bids = self.available_bids(c, agent=None)
+
+                    for agent in world.agents:
+                        obs[agent.idx].update(
+                            {
+                                f"market_rate-{c}": market_rate,
+                                f"price_history-{c}": scaled_price_history,
+                                f"available_asks-{c}": full_asks - self.ask_hists[c][agent.idx],
+                                f"available_bids-{c}": full_bids - self.bid_hists[c][agent.idx],
+                                f"my_asks-{c}": self.ask_hists[c][agent.idx],
+                                f"my_bids-{c}": self.bid_hists[c][agent.idx],
+                            }
+                        )
+
+                else:
+                    for agent in world.agents:
+                        my_region = self.get_agent_region(agent)
+                        other_region = "bottom" if my_region == "top" else "top"
+
+                        obs[agent.idx].update(
+                            {
+                                f"market_rate-{c}": market_rate,
+                                f"price_history-{c}": scaled_price_history,
+                                f"my_region_asks-{c}": self.available_asks_for_region(
+                                    c, my_region, exclude_agent_idx=agent.idx
+                                ),
+                                f"my_region_bids-{c}": self.available_bids_for_region(
+                                    c, my_region, exclude_agent_idx=agent.idx
+                                ),
+                                f"other_region_asks-{c}": self.available_asks_for_region(
+                                    c, other_region
+                                ),
+                                f"other_region_bids-{c}": self.available_bids_for_region(
+                                    c, other_region
+                                ),
+                                f"my_asks-{c}": self.ask_hists[c][agent.idx],
+                                f"my_bids-{c}": self.bid_hists[c][agent.idx],
+                            }
+                        )
+
+            elif not self.restrict_trade_to_region:
                 full_asks = self.available_asks(c, agent=None)
                 full_bids = self.available_bids(c, agent=None)
 
