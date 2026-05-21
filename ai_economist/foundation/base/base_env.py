@@ -728,11 +728,23 @@ class BaseEnvironment(ABC):
                 )
 
         if hasattr(self.world, "planners") and len(self.world.planners) > 1:
+            def zero_like_observation(value):
+                if isinstance(value, dict):
+                    return {k: zero_like_observation(v) for k, v in value.items()}
+                if isinstance(value, np.ndarray):
+                    return np.zeros_like(value)
+                if isinstance(value, list):
+                    return np.zeros_like(np.asarray(value)).tolist()
+                if isinstance(value, tuple):
+                    return tuple(np.zeros_like(np.asarray(value)).tolist())
+                if isinstance(value, (int, float, np.integer, np.floating)):
+                    return type(value)(0)
+                return value
+
             scenario = getattr(self.world, "scenario", None)
             if scenario is not None and hasattr(scenario, "_is_top_agent"):
                 for planner in self.world.planners:
                     pid = str(planner.idx)
-                    keys_to_delete = []
                     for key in list(obs[pid].keys()):
                         if not isinstance(key, str) or not key.startswith("p"):
                             continue
@@ -744,10 +756,7 @@ class BaseEnvironment(ABC):
                         agent_is_top = bool(scenario._is_top_agent(agent))
                         planner_is_top = "top" in pid
                         if agent_is_top != planner_is_top:
-                            keys_to_delete.append(key)
-
-                    for key in keys_to_delete:
-                        del obs[pid][key]
+                            obs[pid][key] = zero_like_observation(obs[pid][key])
 
 
         # Get each agent's action masks and incorporate them into the observations

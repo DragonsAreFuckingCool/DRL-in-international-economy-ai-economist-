@@ -3810,6 +3810,12 @@ def extract_agent_labor_allocation_over_time(
 
     def _events_at(key, t):
         seq = dense_log.get(key, [])
+        if isinstance(seq, list) and any(isinstance(event, dict) and "t" in event for event in seq):
+            return [
+                event
+                for event in seq
+                if isinstance(event, dict) and int(event.get("t", -1)) == int(t)
+            ]
         if t >= len(seq):
             return []
 
@@ -3944,6 +3950,12 @@ def extract_agent_labor_allocation(
 
     def _events_at(key, t):
         seq = dense_log.get(key, [])
+        if isinstance(seq, list) and any(isinstance(event, dict) and "t" in event for event in seq):
+            return [
+                event
+                for event in seq
+                if isinstance(event, dict) and int(event.get("t", -1)) == int(t)
+            ]
         if t >= len(seq):
             return []
 
@@ -4844,8 +4856,29 @@ def get_dense_log_from_result_folder(result_dir, episode_key=0):
     raise ValueError(f"Could not find an episode log with states in {result_dir}")
 
 
+def _dense_logs_from_source(source):
+    """Resolve a result folder path, dense log, dense_logs object, or run dict."""
+    import os
+
+    if isinstance(source, (str, os.PathLike)):
+        return load_dense_logs_from_result_folder(source)
+    return source
+
+
+def _select_dense_log_from_source(source, episode_key=0):
+    dense_logs = _dense_logs_from_source(source)
+    log_items = _dense_log_items(dense_logs)
+    if not log_items:
+        raise ValueError("No dense logs found. Pass a result folder, dense log, dense_logs, or a run dict.")
+
+    for key, dense_log in log_items:
+        if key == episode_key or str(key) == str(episode_key):
+            return dense_log, dense_logs
+    return log_items[int(episode_key)][1], dense_logs
+
+
 def breakdown_all_agents_from_result_folder(result_dir, episode_key=0, remap_key="build_payment", n_cols=4):
-    dense_log, dense_logs = get_dense_log_from_result_folder(result_dir, episode_key=episode_key)
+    dense_log, dense_logs = _select_dense_log_from_source(result_dir, episode_key=episode_key)
     breakdown = breakdown_all_agents(dense_log, remap_key=remap_key, n_cols=n_cols)
     return breakdown, dense_log, dense_logs
 
@@ -4874,7 +4907,7 @@ def breakdown_all_agents_average_from_result_folder(
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
 
-    dense_logs = load_dense_logs_from_result_folder(result_dir)
+    dense_logs = _dense_logs_from_source(result_dir)
     log_items = _dense_log_items(dense_logs)
     if not log_items:
         raise ValueError(f"No dense logs found in {result_dir}")
@@ -9340,21 +9373,35 @@ def extract_tax_period_travel_context_table(
 
 def _dense_log_items(log_or_run):
     """Return ``(rollout_id, dense_log)`` pairs for a single log or many logs."""
-    if isinstance(log_or_run, dict) and "states" in log_or_run:
+    if isinstance(log_or_run, dict) and isinstance(log_or_run.get("states"), list):
         return [(0, log_or_run)]
 
     if isinstance(log_or_run, dict):
         logs = _extract_logs_from_run(log_or_run)
         if logs:
-            return [(k, v) for k, v in logs.items() if isinstance(v, dict)]
+            return [
+                (k, v)
+                for k, v in logs.items()
+                if isinstance(v, dict) and isinstance(v.get("states"), list)
+            ]
+        nested = []
+        for key in ["final", "episodes", "dense_logs", "logs", "data"]:
+            if key in log_or_run:
+                nested.extend(_dense_log_items(log_or_run[key]))
+        if nested:
+            return nested
         return [
             (k, v)
             for k, v in log_or_run.items()
-            if isinstance(v, dict) and ("states" in v or "planner_actions" in v)
+            if isinstance(v, dict) and isinstance(v.get("states"), list)
         ]
 
     if isinstance(log_or_run, (list, tuple)):
-        return [(i, v) for i, v in enumerate(log_or_run) if isinstance(v, dict)]
+        return [
+            (i, v)
+            for i, v in enumerate(log_or_run)
+            if isinstance(v, dict) and isinstance(v.get("states"), list)
+        ]
 
     return []
 

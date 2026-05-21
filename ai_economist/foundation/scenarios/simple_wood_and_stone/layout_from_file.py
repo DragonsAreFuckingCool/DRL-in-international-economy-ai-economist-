@@ -2003,9 +2003,8 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
                 if isinstance(k, str) and k.startswith("inventory-"):
                     del obs[pid][k]
 
-            # Keep only region-relevant per-agent planner entries ("p0", "p1", ...)
-            # Remove entries for agents outside this planner's region.
-            keys_to_delete = []
+            # Keep observation keys fixed for RLlib, but zero out agent entries
+            # from outside this planner's current region.
             for k in list(obs[pid].keys()):
                 if not isinstance(k, str):
                     continue
@@ -2018,13 +2017,14 @@ class SplitWorldOverlayRegional(CustomSplitOverlayFromFile):
 
                 if "top" in pid:
                     if agent_id not in top_agent_ids:
-                        keys_to_delete.append(k)
+                        obs[pid][k] = {
+                            kk: np.zeros_like(vv) for kk, vv in obs[pid][k].items()
+                        }
                 else:
                     if agent_id not in bottom_agent_ids:
-                        keys_to_delete.append(k)
-
-            for k in keys_to_delete:
-                del obs[pid][k]
+                        obs[pid][k] = {
+                            kk: np.zeros_like(vv) for kk, vv in obs[pid][k].items()
+                        }
 
             # Give each planner only its own region's spatial view
             if "top" in pid:
