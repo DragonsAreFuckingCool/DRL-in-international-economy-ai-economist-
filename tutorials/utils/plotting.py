@@ -41,11 +41,11 @@ def _make_agent_colors(agent_ids):
         "#1f77b4",  # blue
         "#ff7f0e",  # orange
         "#2ca02c",  # green
-        "#17becf",  # cyan, replacing default tab10 red slot
+        "#17becf",  # cyan, 
         "#9467bd",  # purple
         "#8c564b",  # brown
         "#e377c2",  # pink
-        "#d62728",  # red, replacing the default gray slot
+        "#d62728",  # red,
         "#bcbd22",  # olive
         "#aec7e8",  # light blue
         "#ffbb78",  # light orange
@@ -2898,6 +2898,8 @@ def extract_trade_region_distribution(log, volume_field="price"):
                 "timestep": t,
                 "route_type": route_type,
                 "route": route,
+                "buyer_region": buyer_region,
+                "seller_region": seller_region,
                 "commodity": trade.get("commodity", "unknown"),
                 "units": float(trade.get("quantity", 1.0)),
                 "volume": float(trade.get(volume_field, trade.get("price", 1.0))),
@@ -2909,7 +2911,7 @@ def extract_trade_region_distribution(log, volume_field="price"):
     if not rows:
         return pd.DataFrame(columns=[
             "timestep", "route_type", "route", "commodity", "units", "volume",
-            "price", "buyer_cost", "tariff"
+            "price", "buyer_cost", "tariff", "buyer_region", "seller_region"
         ])
 
     return pd.DataFrame(rows)
@@ -3342,6 +3344,69 @@ def plot_trade_enabled_run_trade_and_redistribution(
         redist["trade_tariff_funded_redistribution_std"] = 0.0
         redist["non_income_tax_redistribution_std"] = 0.0
 
+    buyer_route_cols = [
+        "tax_period", "buyer_region", "route_group", "units", "units_std",
+        "avg_price", "avg_price_std", "n_dense_logs",
+    ]
+    if trade_raw.empty or "buyer_region" not in trade_raw:
+        buyer_route = pd.DataFrame(columns=buyer_route_cols)
+    else:
+        buyer_raw = trade_raw[
+            trade_raw["buyer_region"].isin(["top", "bottom"])
+            & trade_raw["route_group"].isin(["within region", "cross region"])
+        ].copy()
+        if buyer_raw.empty:
+            buyer_route = pd.DataFrame(columns=buyer_route_cols)
+        elif mode == "average":
+            per_rollout_buyer_route = (
+                buyer_raw
+                .groupby(["rollout_id", "tax_period", "buyer_region", "route_group"], as_index=False)
+                .agg(
+                    units=("units", "sum"),
+                    avg_price=("price", "mean"),
+                )
+            )
+            full_index = pd.MultiIndex.from_product(
+                [
+                    [rollout_id for rollout_id, _ in logs],
+                    sorted(trade_raw["tax_period"].dropna().unique()),
+                    ["top", "bottom"],
+                    ["within region", "cross region"],
+                ],
+                names=["rollout_id", "tax_period", "buyer_region", "route_group"],
+            )
+            per_rollout_buyer_route = (
+                per_rollout_buyer_route
+                .set_index(["rollout_id", "tax_period", "buyer_region", "route_group"])
+                .reindex(full_index, fill_value=0.0)
+                .reset_index()
+            )
+            buyer_route = (
+                per_rollout_buyer_route
+                .groupby(["tax_period", "buyer_region", "route_group"], as_index=False)
+                .agg(
+                    units=("units", "mean"),
+                    units_std=("units", "std"),
+                    avg_price=("avg_price", "mean"),
+                    avg_price_std=("avg_price", "std"),
+                    n_dense_logs=("units", "count"),
+                )
+            )
+            buyer_route["units_std"] = buyer_route["units_std"].fillna(0.0)
+            buyer_route["avg_price_std"] = buyer_route["avg_price_std"].fillna(0.0)
+        else:
+            buyer_route = (
+                buyer_raw
+                .groupby(["tax_period", "buyer_region", "route_group"], as_index=False)
+                .agg(
+                    units=("units", "sum"),
+                    avg_price=("price", "mean"),
+                )
+            )
+            buyer_route["units_std"] = 0.0
+            buyer_route["avg_price_std"] = 0.0
+            buyer_route["n_dense_logs"] = 1
+
     fig = plt.figure(figsize=(figsize[0], max(6, figsize[1] * 0.68)), constrained_layout=True)
     gs = fig.add_gridspec(
         2,
@@ -3555,7 +3620,148 @@ def plot_trade_enabled_run_trade_and_redistribution(
     )
     fig_redist.subplots_adjust(top=0.78)
 
+    fig_cross, (ax_cross, ax_price, ax_share) = plt.subplots(
+        3,
+        1,
+        figsize=(figsize[0], max(6.8, figsize[1] * 0.68)),
+        sharex=True,
+        constrained_layout=True,
+        gridspec_kw={"height_ratios": [1.45, 0.9, 0.8]},
+    )
+    buyer_regions = ["top", "bottom"]
+    buyer_route_colors = {
+        ("top", "within region"): "#9bd7f0",
+        ("top", "cross region"): "#1f77b4",
+        ("bottom", "within region"): "#ffd59e",
+        ("bottom", "cross region"): "#ff7f0e",
+    }
+    buyer_route_offsets = {
+        ("top", "within region"): -0.27,
+        ("top", "cross region"): -0.09,
+        ("bottom", "within region"): 0.09,
+        ("bottom", "cross region"): 0.27,
+    }
+    route_label = {"within region": "within", "cross region": "cross"}
+    buyer_periods = (
+        sorted(set(plot_periods) | set(buyer_route["tax_period"].dropna().unique()))
+        if not buyer_route.empty
+        else plot_periods
+    )
+    buyer_x = np.arange(len(buyer_periods))
+    buyer_width = 0.16
+    totals_by_region_route = {}
+    err_by_region_route = {}
+    price_by_region_route = {}
+    price_err_by_region_route = {}
+
+    for buyer_region in buyer_regions:
+        for route_group in route_groups:
+            vals = []
+            errs = []
+            prices = []
+            price_errs = []
+            for tax_period in buyer_periods:
+                match = buyer_route[
+                    (buyer_route["tax_period"] == tax_period)
+                    & (buyer_route["buyer_region"] == buyer_region)
+                    & (buyer_route["route_group"] == route_group)
+                ]
+                vals.append(float(match["units"].sum()) if len(match) else 0.0)
+                errs.append(float(match["units_std"].sum()) if len(match) else 0.0)
+                prices.append(float(match["avg_price"].mean()) if len(match) else np.nan)
+                price_errs.append(float(match["avg_price_std"].mean()) if len(match) else 0.0)
+            vals = np.asarray(vals, dtype=float)
+            errs = np.asarray(errs, dtype=float)
+            prices = np.asarray(prices, dtype=float)
+            price_errs = np.asarray(price_errs, dtype=float)
+            totals_by_region_route[(buyer_region, route_group)] = vals
+            err_by_region_route[(buyer_region, route_group)] = errs
+            price_by_region_route[(buyer_region, route_group)] = prices
+            price_err_by_region_route[(buyer_region, route_group)] = price_errs
+            ax_cross.bar(
+                buyer_x + buyer_route_offsets[(buyer_region, route_group)],
+                vals,
+                width=buyer_width,
+                color=buyer_route_colors[(buyer_region, route_group)],
+                alpha=0.88,
+                edgecolor="0.25",
+                linewidth=0.6,
+                hatch="//" if route_group == "cross region" else "",
+                label=f"{buyer_region} buys {route_label[route_group]}",
+                yerr=errs if show_std and mode == "average" else None,
+                error_kw=dict(ecolor="0.25", elinewidth=0.8, capsize=2, capthick=0.8),
+            )
+            ax_price.plot(
+                buyer_x,
+                prices,
+                marker="o",
+                linewidth=1.8,
+                color=buyer_route_colors[(buyer_region, route_group)],
+                linestyle="--" if route_group == "cross region" else "-",
+                label=f"{buyer_region} {route_label[route_group]} price",
+            )
+            if show_std and mode == "average":
+                ax_price.fill_between(
+                    buyer_x,
+                    prices - price_errs,
+                    prices + price_errs,
+                    color=buyer_route_colors[(buyer_region, route_group)],
+                    alpha=0.12,
+                    linewidth=0,
+                )
+
+    for buyer_region, color in [("top", "#1f77b4"), ("bottom", "#ff7f0e")]:
+        within = totals_by_region_route.get((buyer_region, "within region"), np.zeros(len(buyer_periods)))
+        cross = totals_by_region_route.get((buyer_region, "cross region"), np.zeros(len(buyer_periods)))
+        denom = within + cross
+        share = np.divide(cross, denom, out=np.full_like(cross, np.nan, dtype=float), where=denom > 0)
+        ax_share.plot(
+            buyer_x,
+            share,
+            marker="o",
+            linewidth=2.0,
+            color=color,
+            label=f"{buyer_region} cross share",
+        )
+
+    ax_cross.set_title("Goods Bought by Buyer Region and Route")
+    ax_cross.set_ylabel("Units bought")
+    ax_cross.grid(True, axis="y", alpha=0.25)
+    ax_cross.legend(loc="upper left", ncol=4, fontsize=8, frameon=True)
+
+    ax_price.set_title("Average Untaxed Seller Price by Buyer Region and Route")
+    ax_price.set_ylabel("Avg seller price")
+    ax_price.grid(True, axis="y", alpha=0.25)
+    ax_price.legend(loc="upper left", ncol=4, fontsize=8, frameon=True)
+
+    ax_share.set_title("Share of Each Region's Purchases That Are Cross-Region")
+    ax_share.set_ylabel("Cross / total")
+    share_values = []
+    for line in ax_share.lines:
+        y = np.asarray(line.get_ydata(), dtype=float)
+        share_values.extend(y[np.isfinite(y)].tolist())
+    if share_values:
+        share_min = float(np.nanmin(share_values))
+        share_max = float(np.nanmax(share_values))
+        pad = max(0.03, 0.15 * (share_max - share_min))
+        ax_share.set_ylim(max(0.0, share_min - pad), min(1.0, share_max + pad))
+    else:
+        ax_share.set_ylim(0, 1)
+    ax_share.set_xlabel("Tax period")
+    ax_share.set_xticks(buyer_x)
+    ax_share.set_xticklabels([str(int(k)) for k in buyer_periods], fontsize=8)
+    ax_share.grid(True, axis="y", alpha=0.25)
+    ax_share.legend(loc="upper left", fontsize=8, frameon=True)
+
+    fig_cross.suptitle(
+        f"Within- vs Cross-Region Purchases by Buyer Region ({title_suffix})",
+        fontsize=13,
+        fontweight="bold",
+    )
+
     fig.redistribution_figure = fig_redist
+    fig.cross_region_buyer_figure = fig_cross
+    fig.cross_region_buyer_table = buyer_route
     return fig, trade_units, price_summary, redist
 
 def plot_regional_trade_and_planner_redistribution(
@@ -7720,6 +7926,306 @@ def plot_tax_bracket_snapshots_compact(
 
     fig.suptitle(
         "Tax-Day Snapshots: Bracket Counts, Tax Rates, Planner Reward, Production, Equality",
+        fontsize=14,
+    )
+
+    return fig, df_income, counts, df_swf
+
+
+def plot_tax_bracket_snapshots_compact_average(
+    run,
+    env_obj,
+    brackets,
+    period=100,
+    n_snapshots=10,
+    top_first=True,
+    show_std=True,
+    figsize=None,
+):
+    """Average compact tax bracket snapshots across all dense logs in a run."""
+    log_items = _dense_log_items(run)
+    if not log_items:
+        raise ValueError("No dense logs found. Pass a run dict, dense_logs, or a dense log.")
+
+    income_frames = []
+    count_frames = []
+    swf_frames = []
+    rate_frames = []
+    labels = None
+
+    for rollout_id, dense_log in log_items:
+        df_income_one, counts_one, labels_one = _income_bracket_counts(
+            dense_log,
+            brackets,
+            period=period,
+        )
+        if labels is None:
+            labels = labels_one
+
+        df_swf_one = _period_swf_table(dense_log, period=period)
+        ptop_rates, pbot_rates = _tax_rate_matrices(dense_log, env_obj, top_first=top_first)
+        tax_days = sorted(df_income_one["tax_day_number"].unique())
+
+        if not df_income_one.empty:
+            df_income_one = df_income_one.copy()
+            df_income_one["rollout_id"] = rollout_id
+            income_frames.append(df_income_one)
+
+        if not counts_one.empty:
+            counts_one = counts_one.copy()
+            counts_one["rollout_id"] = rollout_id
+            count_frames.append(counts_one)
+
+        if not df_swf_one.empty:
+            df_swf_one = df_swf_one.copy()
+            df_swf_one["rollout_id"] = rollout_id
+            swf_frames.append(df_swf_one)
+
+        def tax_day_to_decision_idx(tax_day, rate_matrix):
+            if rate_matrix.shape[0] == len(tax_days):
+                return min(int(tax_day) - 1, rate_matrix.shape[0] - 1)
+            if len(tax_days) == 1 or rate_matrix.shape[0] == 1:
+                return 0
+            frac = (tax_day - tax_days[0]) / (tax_days[-1] - tax_days[0])
+            return int(np.clip(round(frac * (rate_matrix.shape[0] - 1)), 0, rate_matrix.shape[0] - 1))
+
+        for region, planner_id, rate_matrix in [
+            ("top", "p_top", ptop_rates),
+            ("bottom", "p_bottom", pbot_rates),
+        ]:
+            for tax_day in tax_days:
+                decision_idx = tax_day_to_decision_idx(tax_day, rate_matrix)
+                for bracket_idx, rate in enumerate(rate_matrix[decision_idx]):
+                    rate_frames.append({
+                        "rollout_id": rollout_id,
+                        "tax_day_number": tax_day,
+                        "planner_region": region,
+                        "planner_id": planner_id,
+                        "bracket_idx": bracket_idx,
+                        "rate": float(rate),
+                    })
+
+    if labels is None:
+        raise ValueError("No tax bracket labels could be constructed.")
+
+    df_income = pd.concat(income_frames, ignore_index=True) if income_frames else pd.DataFrame()
+    raw_counts = pd.concat(count_frames, ignore_index=True) if count_frames else pd.DataFrame()
+    raw_swf = pd.concat(swf_frames, ignore_index=True) if swf_frames else pd.DataFrame()
+    raw_rates = pd.DataFrame(rate_frames)
+
+    if raw_counts.empty or raw_rates.empty:
+        raise ValueError("No bracket counts or tax rates could be constructed.")
+
+    rollout_ids = [rollout_id for rollout_id, _ in log_items]
+    tax_days = sorted(raw_counts["tax_day_number"].dropna().unique())
+    full_count_index = pd.MultiIndex.from_product(
+        [rollout_ids, tax_days, ["top", "bottom"], labels],
+        names=["rollout_id", "tax_day_number", "planner_region", "tax_bracket"],
+    )
+    counts_complete = (
+        raw_counts
+        .set_index(["rollout_id", "tax_day_number", "planner_region", "tax_bracket"])
+        .reindex(full_count_index, fill_value=0)
+        .reset_index()
+    )
+    counts = (
+        counts_complete
+        .groupby(["tax_day_number", "planner_region", "tax_bracket"], as_index=False, observed=False)
+        .agg(
+            n_agents=("n_agents", "mean"),
+            n_agents_std=("n_agents", "std"),
+            n_dense_logs=("n_agents", "count"),
+        )
+    )
+    counts["n_agents_std"] = counts["n_agents_std"].fillna(0.0)
+
+    rate_summary = (
+        raw_rates
+        .groupby(["tax_day_number", "planner_region", "planner_id", "bracket_idx"], as_index=False)
+        .agg(
+            rate=("rate", "mean"),
+            rate_std=("rate", "std"),
+            n_dense_logs=("rate", "count"),
+        )
+    )
+    rate_summary["rate_std"] = rate_summary["rate_std"].fillna(0.0)
+
+    if raw_swf.empty:
+        df_swf = pd.DataFrame()
+    else:
+        df_swf = (
+            raw_swf
+            .groupby(["tax_day_number", "planner_region", "planner_id"], as_index=False)
+            .agg(
+                production=("production", "mean"),
+                production_std=("production", "std"),
+                equality=("equality", "mean"),
+                equality_std=("equality", "std"),
+                swf_proxy=("swf_proxy", "mean"),
+                swf_proxy_std=("swf_proxy", "std"),
+                planner_reward_sum=("planner_reward_sum", "mean"),
+                planner_reward_sum_std=("planner_reward_sum", "std"),
+                planner_reward_mean=("planner_reward_mean", "mean"),
+                planner_reward_mean_std=("planner_reward_mean", "std"),
+                n_dense_logs=("planner_reward_sum", "count"),
+            )
+        )
+        for col in [c for c in df_swf.columns if c.endswith("_std")]:
+            df_swf[col] = df_swf[col].fillna(0.0)
+
+    if len(tax_days) <= n_snapshots:
+        chosen_days = tax_days
+    else:
+        idx = np.linspace(0, len(tax_days) - 1, n_snapshots).round().astype(int)
+        chosen_days = [tax_days[i] for i in idx]
+
+    n_cols = 5
+    n_rows = 4
+    if figsize is None:
+        figsize = (2.8 * n_cols, 10.8)
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=figsize,
+        sharey=True,
+        constrained_layout=True,
+    )
+    axes = np.asarray(axes).reshape(n_rows, n_cols)
+
+    bracket_x = np.arange(len(labels))
+    max_count = max(1.0, float((counts["n_agents"] + counts["n_agents_std"]).max()))
+
+    configs = [
+        ("top", "p_top", "#1f77b4", 0),
+        ("bottom", "p_bottom", "#ff7f0e", 2),
+    ]
+
+    for ax in axes.flat:
+        ax.set_visible(False)
+
+    for region, planner_id, color, base_row in configs:
+        region_rates = rate_summary[rate_summary["planner_region"] == region]
+        tax_ymax = max(1.0, float((region_rates["rate"] + region_rates["rate_std"]).max()) * 1.05)
+
+        for snapshot_idx, tax_day in enumerate(chosen_days[: n_rows // 2 * n_cols]):
+            row = base_row + snapshot_idx // n_cols
+            col = snapshot_idx % n_cols
+            ax = axes[row, col]
+            ax.set_visible(True)
+
+            day_counts = (
+                counts[
+                    (counts["planner_region"] == region)
+                    & (counts["tax_day_number"] == tax_day)
+                ]
+                .set_index("tax_bracket")
+                .reindex(labels)
+            )
+            count_vals = day_counts["n_agents"].fillna(0.0).to_numpy(dtype=float)
+            count_err = day_counts["n_agents_std"].fillna(0.0).to_numpy(dtype=float)
+
+            day_rates = (
+                rate_summary[
+                    (rate_summary["planner_region"] == region)
+                    & (rate_summary["tax_day_number"] == tax_day)
+                ]
+                .set_index("bracket_idx")
+                .reindex(range(len(labels)))
+            )
+            rates = day_rates["rate"].fillna(0.0).to_numpy(dtype=float)
+            rate_err = day_rates["rate_std"].fillna(0.0).to_numpy(dtype=float)
+            scaled_rates = rates / tax_ymax * max_count
+            scaled_rate_err = rate_err / tax_ymax * max_count
+
+            ax.bar(
+                bracket_x,
+                count_vals,
+                yerr=count_err if show_std else None,
+                color=color,
+                alpha=0.35,
+                edgecolor=color,
+                linewidth=1.1,
+                error_kw=dict(ecolor=color, elinewidth=0.8, capsize=2, alpha=0.75),
+            )
+
+            ax.plot(
+                bracket_x,
+                scaled_rates,
+                color=color,
+                marker="o",
+                linewidth=2.2,
+            )
+            if show_std:
+                ax.fill_between(
+                    bracket_x,
+                    np.maximum(0.0, scaled_rates - scaled_rate_err),
+                    scaled_rates + scaled_rate_err,
+                    color=color,
+                    alpha=0.16,
+                    linewidth=0,
+                )
+
+            swf_row = df_swf[
+                (df_swf["tax_day_number"] == tax_day)
+                & (df_swf["planner_region"] == region)
+            ] if not df_swf.empty else df_swf
+
+            if len(swf_row):
+                sr = swf_row.iloc[0]
+                reward_text = f"{sr['planner_reward_sum']:.3g}"
+                prod_text = f"{sr['production']:.3g}"
+                eq_text = f"{sr['equality']:.3f}"
+                if show_std:
+                    reward_text += f" +/- {sr['planner_reward_sum_std']:.2g}"
+                    prod_text += f" +/- {sr['production_std']:.2g}"
+                    eq_text += f" +/- {sr['equality_std']:.2g}"
+            else:
+                reward_text = prod_text = eq_text = "n/a"
+
+            txt = (
+                f"{planner_id} R sum: {reward_text}\n"
+                f"prod: {prod_text}\n"
+                f"eq: {eq_text}"
+            )
+            ax.text(
+                0.03,
+                0.95,
+                txt,
+                transform=ax.transAxes,
+                va="top",
+                ha="left",
+                fontsize=8,
+                bbox=dict(facecolor="white", edgecolor="none", alpha=0.75),
+            )
+
+            ax.set_ylim(0, max_count + 0.5)
+            ax.set_yticks(range(0, int(np.ceil(max_count)) + 1))
+
+            if col == 0:
+                ax.set_ylabel("mean n agents")
+            else:
+                ax.tick_params(axis="y", labelleft=False)
+
+            is_last_visible_col = col == min(n_cols, len(chosen_days) - (row - base_row) * n_cols) - 1
+            if is_last_visible_col:
+                axr = ax.secondary_yaxis(
+                    "right",
+                    functions=(
+                        lambda y: y / max_count * tax_ymax,
+                        lambda y: y / tax_ymax * max_count,
+                    ),
+                )
+                axr.set_ylabel("tax rate")
+
+            ax.set_title(f"{planner_id}\ntax day {int(tax_day)}", fontsize=10)
+            ax.set_xticks(bracket_x)
+            ax.set_xticklabels([f"b{i}" for i in range(len(labels))], fontsize=8)
+            ax.grid(True, axis="y", alpha=0.25)
+
+    suffix = "mean +/- SD" if show_std else "mean"
+    fig.suptitle(
+        f"Average Tax-Day Snapshots Across Dense Logs ({suffix})",
         fontsize=14,
     )
 
