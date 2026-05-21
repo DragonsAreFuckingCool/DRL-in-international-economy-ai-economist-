@@ -15,8 +15,8 @@ else:
     memory = 48 * 1024**3 # 63 GB for workers
     object_store_memory = 20 * 1024**3 # 27 GB for object store
     num_workers = 4
-    num_envs_per_worker = 2
-    train_batch_size =1600
+    num_envs_per_worker = 1 #2
+    train_batch_size =800 #1600
     sgd_minibatch_size = 200
 
 ray.shutdown()
@@ -41,7 +41,7 @@ settings = exp.ExperimentSettings(
     travel_enabled_phase3b=True,
     restrict_trade_to_region = False,
 
-    fixed_tax_planner_id=("p_top", "p_bottom"),
+    fixed_tax_planner_id=None, #("p_top", "p_bottom"),
     #fixed_tax_bracket_rates_top=(0.01, 0.095, 0.15, 0.23, 0.32, 0.395, 0.42), #lux-old
     fixed_tax_bracket_rates_top=(0.05, 0.07, 0.17, 0.19, 0.27, 0.30, 0.32),
     #fixed_tax_bracket_rates_top=(0.09, 0.123, 0.18, 0.24, 0.30, 0.36, 0.405),
@@ -50,10 +50,10 @@ settings = exp.ExperimentSettings(
     layout_file = "stacked_51x25_symetric_original.txt",
 
     travel_cost_coin_phase3a = 10,
-    travel_cost_labor_phase3a = 12,
+    travel_cost_labor_phase3a = 10,
 
     travel_cost_coin_phase3b = 10,
-    travel_cost_labor_phase3b = 12,
+    travel_cost_labor_phase3b = 10,
 
 # same as AI economist original 
     # num_workers=15,
