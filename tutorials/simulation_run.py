@@ -46,14 +46,14 @@ settings = exp.ExperimentSettings(
     fixed_tax_bracket_rates_top=(0.05, 0.07, 0.17, 0.19, 0.27, 0.30, 0.32),
     #fixed_tax_bracket_rates_top=(0.09, 0.123, 0.18, 0.24, 0.30, 0.36, 0.405),
     fixed_tax_bracket_rates_bottom=(0.1, 0.12, 0.22, 0.24, 0.32, 0.35, 0.37), #US
-    experiment_extra_tag="fixed_10_12",
+    experiment_extra_tag="travel_10_8",
     layout_file = "stacked_51x25_symetric_original.txt",
 
     travel_cost_coin_phase3a = 10,
-    travel_cost_labor_phase3a = 10,
+    travel_cost_labor_phase3a = 8,
 
     travel_cost_coin_phase3b = 10,
-    travel_cost_labor_phase3b = 10,
+    travel_cost_labor_phase3b = 8,
 
 # same as AI economist original 
     # num_workers=15,
