@@ -165,24 +165,42 @@ class ContinuousDoubleAuction(BaseComponent):
 
         return 0.0
 
+    def _buyer_cost_for_trade(self, seller_price, buyer_idx, seller_idx):
+        """Total buyer cost for a candidate trade at a given seller price."""
+        seller_price = float(seller_price)
+        return seller_price + self._trade_tariff(seller_price, buyer_idx, seller_idx)
+
+    def _max_seller_price_for_buyer_bid(self, buyer_bid, buyer_idx, seller_idx):
+        """
+        Highest seller price affordable when the buyer bid is interpreted as
+        the buyer's maximum total cost, including any cross-region tariff.
+        """
+        buyer_bid = float(buyer_bid)
+
+        if self.restrict_trade_to_region or not self._is_cross_region_trade(buyer_idx, seller_idx):
+            return buyer_bid
+
+        if self.cross_region_trade_tax_mode == "none":
+            return buyer_bid
+
+        if self.cross_region_trade_tax_mode == "flat":
+            return buyer_bid - self.cross_region_trade_tax_flat
+
+        if self.cross_region_trade_tax_mode == "percent":
+            return buyer_bid / (1.0 + self.cross_region_trade_tax_rate)
+
+        return buyer_bid
+
 
     def _max_possible_bid_escrow(self, bid_price):
         """
-        Reserve enough coin at bid creation to cover worst-case tariff.
-        This keeps settlement safe even for cross-region matches.
+        Reserve enough coin at bid creation.
+
+        Bids are interpreted as the buyer's maximum total cost, including any
+        cross-region tariff. Matching and settlement ensure the realized cost
+        never exceeds this amount.
         """
-        bid_price = float(bid_price)
-
-        if self.restrict_trade_to_region or self.cross_region_trade_tax_mode == "none":
-            return bid_price
-
-        if self.cross_region_trade_tax_mode == "flat":
-            return bid_price + self.cross_region_trade_tax_flat
-
-        if self.cross_region_trade_tax_mode == "percent":
-            return bid_price * (1.0 + self.cross_region_trade_tax_rate)
-
-        return bid_price
+        return float(bid_price)
 
     def available_asks(self, resource, agent):
         """
@@ -304,7 +322,7 @@ class ContinuousDoubleAuction(BaseComponent):
         self.bid_hists[resource][bid["buyer"]][bid["bid"] - self.price_floor] += 1
         self.n_orders[resource][agent.idx] += 1
 
-        # Reserve enough coin to cover worst-case tariff if needed
+        # Reserve the buyer's maximum total payment.
         _ = agent.inventory_to_escrow("Coin", int(reserve_payment))
 
         # Incur the labor cost of creating an order
@@ -371,41 +389,46 @@ class ContinuousDoubleAuction(BaseComponent):
             while any(possible_match) and keep_checking:
                 idx_bid, idx_ask = 0, 0
                 while True:
+                    bid = bids[idx_bid] if idx_bid < len(bids) else None
+
                     # Out of bids to check. Exit both loops.
                     if idx_bid >= len(bids):
                         keep_checking = False
                         break
 
                     # Already know this buyer is no good for this round.
-                    if not possible_match[bids[idx_bid]["buyer"]]:
+                    if not possible_match[bid["buyer"]]:
                         idx_bid += 1
 
-                    # Out of asks to check. This buyer won't find a match on this round.
-                    elif idx_ask >= len(asks):
-                        possible_match[bids[idx_bid]["buyer"]] = False
-                        break
-
-                    # Skip self-trade
-                    elif asks[idx_ask]["seller"] == bids[idx_bid]["buyer"]:
-                        idx_ask += 1
-
-                    # If regional restriction is on, skip cross-region matches
-                    elif (
-                        self.restrict_trade_to_region
-                        and self._is_cross_region_trade(
-                            bids[idx_bid]["buyer"],
-                            asks[idx_ask]["seller"]
-                        )
-                    ):
-                        idx_ask += 1
-
-                    # Price does not clear
-                    elif bids[idx_bid]["bid"] < asks[idx_ask]["ask"]:
-                        possible_match[bids[idx_bid]["buyer"]] = False
-                        break
-
-                    # TRADE
                     else:
+                        candidate_asks = []
+                        for ask_idx, ask in enumerate(asks):
+                            if ask["seller"] == bid["buyer"]:
+                                continue
+
+                            if (
+                                self.restrict_trade_to_region
+                                and self._is_cross_region_trade(
+                                    bid["buyer"],
+                                    ask["seller"]
+                                )
+                            ):
+                                continue
+
+                            min_buyer_cost = self._buyer_cost_for_trade(
+                                ask["ask"],
+                                bid["buyer"],
+                                ask["seller"],
+                            )
+                            if float(bid["bid"]) >= min_buyer_cost:
+                                candidate_asks.append((min_buyer_cost, ask["ask"], -ask["ask_lifetime"], ask_idx))
+
+                        # This buyer has no tariff-inclusive clearing match.
+                        if not candidate_asks:
+                            possible_match[bid["buyer"]] = False
+                            break
+
+                        idx_ask = min(candidate_asks)[-1]
                         bid = bids.pop(idx_bid)
                         ask = asks.pop(idx_ask)
 
@@ -416,7 +439,13 @@ class ContinuousDoubleAuction(BaseComponent):
                         if bid["bid_lifetime"] <= ask["ask_lifetime"]:
                             trade["price"] = int(trade["ask"])
                         else:
-                            trade["price"] = int(trade["bid"])
+                            max_seller_price = self._max_seller_price_for_buyer_bid(
+                                trade["bid"],
+                                trade["buyer"],
+                                trade["seller"],
+                            )
+                            trade["price"] = int(np.floor(max_seller_price))
+                            trade["price"] = max(int(trade["ask"]), trade["price"])
 
                         tariff = self._trade_tariff(
                             trade["price"],
@@ -428,9 +457,14 @@ class ContinuousDoubleAuction(BaseComponent):
                         trade["cross_region"] = int(
                             self._is_cross_region_trade(trade["buyer"], trade["seller"])
                         )
+                        trade["buyer_region"] = self.get_region(trade["buyer"])
+                        trade["seller_region"] = self.get_region(trade["seller"])
 
                         trade["cost"] = float(trade["price"] + tariff)
                         trade["income"] = float(trade["price"])
+                        assert trade["cost"] <= float(trade["bid"]) + 1e-6, (
+                            f"Trade cost exceeds bid: cost={trade['cost']}, bid={trade['bid']}"
+                        )
 
                         buyer = self.world.agents[trade["buyer"]]
                         seller = self.world.agents[trade["seller"]]
