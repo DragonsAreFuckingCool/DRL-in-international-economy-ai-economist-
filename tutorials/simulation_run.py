@@ -12,7 +12,7 @@ if os.getenv("IS_LOCAL", None) is not None:
     train_batch_size =200
     sgd_minibatch_size = 100
 else:
-    memory = 48 * 1024**3 # 63 GB for workers
+    memory = 36 * 1024**3 # 63 GB for workers
     object_store_memory = 20 * 1024**3 # 27 GB for object store
     num_workers = 4
     num_envs_per_worker = 1 #2
@@ -39,14 +39,14 @@ settings = exp.ExperimentSettings(
     save_results=True,
     travel_enabled_phase3a=False,
     travel_enabled_phase3b=False,
-    restrict_trade_to_region = True,
+    restrict_trade_to_region = False,
 
     fixed_tax_planner_id=None, #("p_top", "p_bottom"),
     #fixed_tax_bracket_rates_top=(0.01, 0.095, 0.15, 0.23, 0.32, 0.395, 0.42), #lux-old
     fixed_tax_bracket_rates_top=(0.05, 0.07, 0.17, 0.19, 0.27, 0.30, 0.32),
     #fixed_tax_bracket_rates_top=(0.09, 0.123, 0.18, 0.24, 0.30, 0.36, 0.405),
     fixed_tax_bracket_rates_bottom=(0.1, 0.12, 0.22, 0.24, 0.32, 0.35, 0.37), #US
-    experiment_extra_tag="base_short",
+    experiment_extra_tag="trade_short",
     layout_file = "stacked_51x25_symetric_original.txt",
 
     travel_cost_coin_phase3a = 10,
