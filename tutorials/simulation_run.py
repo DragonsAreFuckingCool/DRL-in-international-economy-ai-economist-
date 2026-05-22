@@ -37,11 +37,11 @@ settings = exp.ExperimentSettings(
     phase3a_iters = 500,
     phase3b_iters = 1500,
     save_results=True,
-    travel_enabled_phase3a=True,
-    travel_enabled_phase3b=True,
-    restrict_trade_to_region =False,
+    travel_enabled_phase3a=False,
+    travel_enabled_phase3b=False,
+    restrict_trade_to_region =True,
 
-    fixed_tax_planner_id=("p_top", "p_bottom"),
+    fixed_tax_planner_id=None,#("p_top", "p_bottom"),
     #fixed_tax_bracket_rates_top=(0.01, 0.095, 0.15, 0.23, 0.32, 0.395, 0.42), #lux-old
     fixed_tax_bracket_rates_top=(0.05, 0.07, 0.17, 0.19, 0.27, 0.30, 0.32),
     #fixed_tax_bracket_rates_top=(0.09, 0.123, 0.18, 0.24, 0.30, 0.36, 0.405),
