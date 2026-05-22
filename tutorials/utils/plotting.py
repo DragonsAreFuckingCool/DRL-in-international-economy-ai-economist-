@@ -2010,6 +2010,11 @@ def compare_training_curves(
                 print(f"Skipping {run['name']}: metric '{metric}' needs missing column(s): {missing}.")
             continue
 
+        if metric_key == "mean_tax":
+            mean_tax_cols = [column for column, _ in run_metric_series]
+            zero_both = df[mean_tax_cols].fillna(0.0).eq(0.0).all(axis=1)
+            df.loc[zero_both, mean_tax_cols] = np.nan
+
         df["phase"] = pd.Categorical(df["phase"], categories=phase_order, ordered=True)
         df = df.sort_values(["phase", "iter"]).reset_index(drop=True)
 
@@ -2039,15 +2044,19 @@ def compare_training_curves(
                 if sdf.empty:
                     continue
 
-                y_phase = sdf[metric_column].astype(float).to_numpy()
+                y_series = sdf[metric_column].astype(float)
+                if metric_key == "mean_tax":
+                    y_series = y_series.interpolate(limit_direction="both")
 
-                if smooth_window > 1 and len(y_phase) >= smooth_window:
+                if smooth_window > 1 and len(y_series) >= smooth_window:
                     y_phase = (
-                        pd.Series(y_phase)
+                        y_series
                         .rolling(window=smooth_window, min_periods=1, center=False)
                         .mean()
                         .to_numpy()
                     )
+                else:
+                    y_phase = y_series.to_numpy()
 
                 x_phase = np.arange(len(sdf)) + cumulative_offset
 
@@ -2131,6 +2140,892 @@ def compare_training_curves(
         fig.tight_layout()
 
     return fig
+
+
+def compare_equality_production_over_time(
+    runs,
+    short_labels=None,
+    show_std=True,
+    smooth_window=1,
+    max_timestep=None,
+    figsize=(12, 7),
+):
+    """
+    Compare equality and production over episode timesteps across runs.
+
+    Equality and production are computed from each dense log's per-timestep
+    agent coin holdings. Production is total nonnegative coin; equality is
+    1 - Gini over the same coin vector.
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    def gini(values):
+        values = np.asarray(values, dtype=float)
+        values = values[np.isfinite(values)]
+        if len(values) <= 1:
+            return 0.0
+        values = np.maximum(values, 0.0)
+        total = float(np.sum(values))
+        if total <= 0:
+            return 0.0
+        values = np.sort(values)
+        n = len(values)
+        return float((2.0 * np.sum(np.arange(1, n + 1) * values)) / (n * total) - (n + 1.0) / n)
+
+    def coin_total(agent_state):
+        inventory = agent_state.get("inventory", {})
+        escrow = agent_state.get("escrow", {})
+        return float(inventory.get("Coin", 0.0)) + float(escrow.get("Coin", 0.0))
+
+    def dense_logs_for_run(run):
+        if isinstance(run, dict):
+            logs = _extract_logs_from_run(run)
+            if logs:
+                return [(k, v) for k, v in logs.items() if isinstance(v, dict) and "states" in v]
+            if isinstance(run.get("states"), list):
+                return [(0, run)]
+        return []
+
+    run_names = [run.get("name", f"Run {i+1}") for i, run in enumerate(runs)]
+    if short_labels is None:
+        short_labels = {name: f"Run {i+1}" for i, name in enumerate(run_names)}
+    elif isinstance(short_labels, list):
+        short_labels = {name: short_labels[i] for i, name in enumerate(run_names)}
+
+    colors = [
+        "#1f77b4",
+        "#d62728",
+        "#2ca02c",
+        "#9467bd",
+        "#ff7f0e",
+        "#8c564b",
+    ]
+
+    rows = []
+    for run_idx, run in enumerate(runs):
+        run_name = run_names[run_idx]
+        for rollout_id, log in dense_logs_for_run(run):
+            states = log.get("states", [])
+            if max_timestep is not None:
+                states = states[: int(max_timestep) + 1]
+            for timestep, state in enumerate(states):
+                coins = [
+                    coin_total(agent_state)
+                    for agent_id, agent_state in state.items()
+                    if str(agent_id).isdigit() and isinstance(agent_state, dict)
+                ]
+                if not coins:
+                    continue
+                coins = np.asarray(coins, dtype=float)
+                production = float(np.sum(np.maximum(coins, 0.0)))
+                equality = float(1.0 - gini(coins))
+                rows.append({
+                    "run": run_name,
+                    "label": short_labels.get(run_name, run_name),
+                    "rollout_id": rollout_id,
+                    "timestep": timestep,
+                    "production": production,
+                    "equality": equality,
+                })
+
+    raw_df = pd.DataFrame(rows)
+    if raw_df.empty:
+        raise ValueError("No dense-log state data found for equality/production comparison.")
+
+    summary_df = (
+        raw_df
+        .groupby(["run", "label", "timestep"], as_index=False)
+        .agg(
+            production=("production", "mean"),
+            production_std=("production", "std"),
+            equality=("equality", "mean"),
+            equality_std=("equality", "std"),
+            n_dense_logs=("production", "count"),
+        )
+    )
+    for col in ["production_std", "equality_std"]:
+        summary_df[col] = summary_df[col].fillna(0.0)
+
+    if smooth_window and smooth_window > 1:
+        for metric in ["production", "production_std", "equality", "equality_std"]:
+            summary_df[metric] = (
+                summary_df
+                .sort_values(["run", "timestep"])
+                .groupby("run")[metric]
+                .transform(lambda s: s.rolling(smooth_window, min_periods=1).mean())
+            )
+
+    fig, (ax_eq, ax_prod) = plt.subplots(
+        2,
+        1,
+        figsize=figsize,
+        sharex=True,
+        constrained_layout=True,
+    )
+
+    for run_idx, run_name in enumerate(run_names):
+        dfr = summary_df[summary_df["run"] == run_name].sort_values("timestep")
+        if dfr.empty:
+            continue
+        color = colors[run_idx % len(colors)]
+        label = short_labels.get(run_name, run_name)
+        x = dfr["timestep"].to_numpy(dtype=float)
+
+        eq = dfr["equality"].to_numpy(dtype=float)
+        eq_std = dfr["equality_std"].to_numpy(dtype=float)
+        ax_eq.plot(x, eq, color=color, linewidth=2.0, label=label)
+        if show_std:
+            ax_eq.fill_between(
+                x,
+                np.clip(eq - eq_std, 0.0, 1.0),
+                np.clip(eq + eq_std, 0.0, 1.0),
+                color=color,
+                alpha=0.13,
+                linewidth=0,
+            )
+
+        prod = dfr["production"].to_numpy(dtype=float)
+        prod_std = dfr["production_std"].to_numpy(dtype=float)
+        ax_prod.plot(x, prod, color=color, linewidth=2.0, label=label)
+        if show_std:
+            ax_prod.fill_between(
+                x,
+                prod - prod_std,
+                prod + prod_std,
+                color=color,
+                alpha=0.13,
+                linewidth=0,
+            )
+
+    ax_eq.set_title("Equality Over Episode Timesteps")
+    ax_eq.set_ylabel("Equality (1 - Gini)")
+    ax_eq.set_ylim(0, 1)
+    ax_eq.grid(True, alpha=0.25)
+
+    ax_prod.set_title("Production Over Episode Timesteps")
+    ax_prod.set_ylabel("Production (total coin)")
+    ax_prod.set_xlabel("Episode timestep")
+    ax_prod.grid(True, alpha=0.25)
+
+    max_x = float(summary_df["timestep"].max())
+    ax_prod.set_xlim(0, max_x if max_x > 0 else 1)
+
+    handles, labels = ax_eq.get_legend_handles_labels()
+    if handles:
+        fig.legend(
+            handles,
+            labels,
+            loc="lower center",
+            bbox_to_anchor=(0.5, -0.02),
+            ncol=min(4, len(labels)),
+            frameon=True,
+            fontsize=10,
+        )
+        fig.set_constrained_layout_pads(h_pad=0.08, w_pad=0.08)
+
+    fig.suptitle("Equality and Production Comparison Across Runs", fontsize=14, fontweight="bold")
+    return fig, summary_df, raw_df
+
+
+def compare_redistribution_over_time(
+    runs,
+    short_labels=None,
+    period=100,
+    rate_disc=0.05,
+    show_std=True,
+    smooth_window=1,
+    figsize=(12, 7),
+):
+    """Compare coin redistributed across runs by tax period."""
+    import json
+    import os
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    def dense_logs_for_run(run):
+        if isinstance(run, dict):
+            logs = _extract_logs_from_run(run)
+            if logs:
+                return [(k, v) for k, v in logs.items() if isinstance(v, dict) and "states" in v]
+            if isinstance(run.get("states"), list):
+                return [(0, run)]
+        return []
+
+    def infer_travel_cost_coin(run):
+        config = run.get("config", {}) if isinstance(run, dict) else {}
+        if not config and isinstance(run, dict) and run.get("run_dir"):
+            config_path = os.path.join(run["run_dir"], "config.json")
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+
+        if not isinstance(config, dict):
+            return 0.0
+        for key in ["travel_cost_coin_phase3b", "travel_cost_coin_phase3a", "travel_cost_coin"]:
+            if key in config:
+                return float(config[key])
+        phase_configs = [
+            value for _, value in config.items()
+            if isinstance(value, dict) and "components" in value
+        ]
+        for phase_config in reversed(phase_configs):
+            for component in phase_config.get("components", []):
+                if (
+                    isinstance(component, (list, tuple))
+                    and len(component) >= 2
+                    and component[0] == "CrossWaterTravel"
+                    and isinstance(component[1], dict)
+                    and "travel_cost_coin" in component[1]
+                ):
+                    return float(component[1]["travel_cost_coin"])
+        return 0.0
+
+    run_names = [run.get("name", f"Run {i+1}") for i, run in enumerate(runs)]
+    if short_labels is None:
+        short_labels = {name: f"Run {i+1}" for i, name in enumerate(run_names)}
+    elif isinstance(short_labels, list):
+        short_labels = {name: short_labels[i] for i, name in enumerate(run_names)}
+
+    rows = []
+    production_rows = []
+    for run_idx, run in enumerate(runs):
+        run_name = run_names[run_idx]
+        travel_cost_coin = infer_travel_cost_coin(run)
+        for rollout_id, log in dense_logs_for_run(run):
+            redist = extract_planner_redistribution_by_period(
+                log,
+                period=period,
+                rate_disc=rate_disc,
+                travel_cost_coin=travel_cost_coin,
+            )
+            if redist.empty:
+                continue
+            redist = redist.copy()
+            redist["run"] = run_name
+            redist["label"] = short_labels.get(run_name, run_name)
+            redist["rollout_id"] = rollout_id
+            rows.append(redist)
+
+            states = log.get("states", [])
+            aids = _numeric_agent_ids(log) if states else []
+            tax_days = list(range(period - 1, len(states), period))
+            prev_t = 0
+            for tax_period, tax_t in enumerate(tax_days, start=1):
+                state_prev = states[prev_t]
+                state_now = states[tax_t]
+                production = float(np.sum([
+                    max(0.0, _coin(state_now[str(aid)]) - _coin(state_prev[str(aid)]))
+                    for aid in aids
+                    if str(aid) in state_now and str(aid) in state_prev
+                ]))
+                production_rows.append({
+                    "run": run_name,
+                    "label": short_labels.get(run_name, run_name),
+                    "rollout_id": rollout_id,
+                    "tax_period": tax_period,
+                    "production": production,
+                })
+                prev_t = tax_t
+
+    raw_df = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    if raw_df.empty:
+        raise ValueError("No redistribution rows could be constructed from these runs.")
+    production_df = pd.DataFrame(production_rows)
+    if production_df.empty:
+        raise ValueError("No production rows could be constructed from these runs.")
+
+    planner_summary = (
+        raw_df
+        .groupby(["run", "label", "tax_period", "planner_region"], as_index=False)
+        .agg(
+            redistributed=("redistributed", "mean"),
+            redistributed_std=("redistributed", "std"),
+            income_tax_collected=("income_tax_collected", "mean"),
+            tariff_revenue=("tariff_revenue", "mean"),
+            travel_tax_revenue=("travel_tax_revenue", "mean"),
+            n_dense_logs=("redistributed", "count"),
+        )
+    )
+    planner_summary["redistributed_std"] = planner_summary["redistributed_std"].fillna(0.0)
+
+    per_rollout_total = (
+        raw_df
+        .groupby(["run", "label", "rollout_id", "tax_period"], as_index=False)
+        .agg(redistributed=("redistributed", "sum"))
+    )
+    per_rollout_total = per_rollout_total.merge(
+        production_df,
+        on=["run", "label", "rollout_id", "tax_period"],
+        how="left",
+    )
+    per_rollout_total["redistribution_share"] = np.divide(
+        per_rollout_total["redistributed"],
+        per_rollout_total["production"],
+        out=np.full(len(per_rollout_total), np.nan, dtype=float),
+        where=per_rollout_total["production"].to_numpy(dtype=float) > 0,
+    )
+    total_summary = (
+        per_rollout_total
+        .groupby(["run", "label", "tax_period"], as_index=False)
+        .agg(
+            redistributed=("redistributed", "mean"),
+            redistributed_std=("redistributed", "std"),
+            production=("production", "mean"),
+            production_std=("production", "std"),
+            redistribution_share=("redistribution_share", "mean"),
+            redistribution_share_std=("redistribution_share", "std"),
+            n_dense_logs=("redistributed", "count"),
+        )
+    )
+    total_summary[["redistributed_std", "production_std", "redistribution_share_std"]] = (
+        total_summary[["redistributed_std", "production_std", "redistribution_share_std"]].fillna(0.0)
+    )
+
+    if smooth_window and smooth_window > 1:
+        for df in [planner_summary, total_summary]:
+            group_cols = ["run"] if "planner_region" not in df.columns else ["run", "planner_region"]
+            smooth_cols = ["redistributed", "redistributed_std"]
+            if "redistribution_share" in df.columns:
+                smooth_cols += ["production", "production_std", "redistribution_share", "redistribution_share_std"]
+            for col in smooth_cols:
+                df[col] = (
+                    df
+                    .sort_values(group_cols + ["tax_period"])
+                    .groupby(group_cols)[col]
+                    .transform(lambda s: s.rolling(smooth_window, min_periods=1).mean())
+                )
+
+    colors = [
+        "#1f77b4",
+        "#d62728",
+        "#2ca02c",
+        "#9467bd",
+        "#ff7f0e",
+        "#8c564b",
+    ]
+
+    fig, (ax_total, ax_share) = plt.subplots(
+        2,
+        1,
+        figsize=figsize,
+        sharex=True,
+        constrained_layout=True,
+    )
+
+    for run_idx, run_name in enumerate(run_names):
+        color = colors[run_idx % len(colors)]
+        label = short_labels.get(run_name, run_name)
+
+        dft = total_summary[total_summary["run"] == run_name].sort_values("tax_period")
+        if not dft.empty:
+            x = dft["tax_period"].to_numpy(dtype=float)
+            y = dft["redistributed"].to_numpy(dtype=float)
+            yerr = dft["redistributed_std"].to_numpy(dtype=float)
+            ax_total.plot(x, y, color=color, linewidth=2.2, marker="o", label=label)
+            if show_std:
+                ax_total.fill_between(x, y - yerr, y + yerr, color=color, alpha=0.13, linewidth=0)
+
+            share = dft["redistribution_share"].to_numpy(dtype=float) * 100.0
+            share_err = dft["redistribution_share_std"].to_numpy(dtype=float) * 100.0
+            ax_share.plot(x, share, color=color, linewidth=2.2, marker="o", label=label)
+            if show_std:
+                ax_share.fill_between(
+                    x,
+                    share - share_err,
+                    share + share_err,
+                    color=color,
+                    alpha=0.13,
+                    linewidth=0,
+                )
+
+    ax_total.set_title("Total Redistribution by Tax Period")
+    ax_total.set_ylabel("Coin redistributed")
+    ax_total.grid(True, alpha=0.25)
+
+    ax_share.set_title("Redistribution as Share of Period Production")
+    ax_share.set_ylabel("% of period production redistributed")
+    ax_share.set_xlabel("Tax period")
+    ax_share.grid(True, alpha=0.25)
+
+    max_period = float(raw_df["tax_period"].max())
+    ax_share.set_xlim(1, max_period if max_period > 1 else 1)
+
+    handles, labels = ax_total.get_legend_handles_labels()
+    if handles:
+        ax_total.legend(handles, labels, loc="upper left", ncol=min(4, len(labels)), frameon=True)
+    handles, labels = ax_share.get_legend_handles_labels()
+    if handles:
+        ax_share.legend(handles, labels, loc="upper left", ncol=min(4, len(labels)), frameon=True, fontsize=8)
+
+    fig.suptitle("Redistribution Comparison Across Runs", fontsize=14, fontweight="bold")
+    summary_df = {"total": total_summary, "by_planner": planner_summary, "production": production_df}
+    return fig, summary_df, raw_df
+
+
+def compare_builds_by_skill(
+    runs,
+    short_labels=None,
+    show_std=True,
+    figsize=(10, 5),
+):
+    """Compare total houses built by agent build-skill group across runs."""
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    def dense_logs_for_run(run):
+        if isinstance(run, dict):
+            logs = _extract_logs_from_run(run)
+            if logs:
+                return [(k, v) for k, v in logs.items() if isinstance(v, dict) and "states" in v]
+            if isinstance(run.get("states"), list):
+                return [(0, run)]
+        return []
+
+    def build_events(log):
+        for item in log.get("Build", []):
+            builds = item.get("builds", []) if isinstance(item, dict) else item
+            if not isinstance(builds, list):
+                continue
+            for build in builds:
+                if isinstance(build, dict) and "builder" in build:
+                    yield build
+
+    run_names = [run.get("name", f"Run {i+1}") for i, run in enumerate(runs)]
+    if short_labels is None:
+        short_labels = {name: f"Run {i+1}" for i, name in enumerate(run_names)}
+    elif isinstance(short_labels, list):
+        short_labels = {name: short_labels[i] for i, name in enumerate(run_names)}
+
+    all_skill_values = []
+    run_log_items = []
+    for run_idx, run in enumerate(runs):
+        log_items = dense_logs_for_run(run)
+        run_log_items.append(log_items)
+        for _, log in log_items:
+            states = log.get("states", [])
+            if not states:
+                continue
+            for aid in _numeric_agent_ids(log):
+                skill = states[0].get(str(aid), {}).get("build_payment", np.nan)
+                if np.isfinite(skill):
+                    all_skill_values.append(float(skill))
+
+    skill_values = sorted(set(all_skill_values))
+    if not skill_values:
+        raise ValueError("No finite build_payment skill values found in dense logs.")
+    skill_rank = {skill: i + 1 for i, skill in enumerate(skill_values)}
+    skill_labels = {
+        skill: f"skill {skill_rank[skill]} ({skill:.0f})"
+        for skill in skill_values
+    }
+
+    rows = []
+    for run_idx, run in enumerate(runs):
+        run_name = run_names[run_idx]
+        for rollout_id, log in run_log_items[run_idx]:
+            states = log.get("states", [])
+            if not states:
+                continue
+            agent_skill = {}
+            for aid in _numeric_agent_ids(log):
+                skill = states[0].get(str(aid), {}).get("build_payment", np.nan)
+                agent_skill[aid] = float(skill) if np.isfinite(skill) else np.nan
+
+            counts = {skill: 0 for skill in skill_values}
+            for build in build_events(log):
+                aid = int(build.get("builder", -1))
+                skill = agent_skill.get(aid, np.nan)
+                if np.isfinite(skill):
+                    counts[float(skill)] = counts.get(float(skill), 0) + 1
+
+            for skill in skill_values:
+                rows.append({
+                    "run": run_name,
+                    "label": short_labels.get(run_name, run_name),
+                    "rollout_id": rollout_id,
+                    "build_payment": skill,
+                    "skill_group": skill_labels[skill],
+                    "n_builds": float(counts.get(skill, 0)),
+                })
+
+    raw_df = pd.DataFrame(rows)
+    if raw_df.empty:
+        raise ValueError("No build rows could be constructed from these runs.")
+
+    summary_df = (
+        raw_df
+        .groupby(["run", "label", "build_payment", "skill_group"], as_index=False)
+        .agg(
+            n_builds=("n_builds", "mean"),
+            n_builds_std=("n_builds", "std"),
+            n_dense_logs=("n_builds", "count"),
+        )
+    )
+    summary_df["n_builds_std"] = summary_df["n_builds_std"].fillna(0.0)
+
+    x = np.arange(len(run_names), dtype=float)
+    n_skills = len(skill_values)
+    total_width = min(0.82, 0.18 * max(1, n_skills))
+    bar_width = total_width / max(1, n_skills)
+    offsets = (np.arange(n_skills) - (n_skills - 1) / 2.0) * bar_width
+    colors = _make_agent_colors(range(n_skills))
+
+    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+    for skill_idx, skill in enumerate(skill_values):
+        vals = []
+        errs = []
+        for run_name in run_names:
+            match = summary_df[
+                (summary_df["run"] == run_name)
+                & (summary_df["build_payment"] == skill)
+            ]
+            vals.append(float(match["n_builds"].iloc[0]) if len(match) else 0.0)
+            errs.append(float(match["n_builds_std"].iloc[0]) if len(match) else 0.0)
+
+        ax.bar(
+            x + offsets[skill_idx],
+            vals,
+            width=bar_width * 0.92,
+            color=colors[skill_idx % len(colors)],
+            edgecolor="white",
+            linewidth=0.8,
+            label=skill_labels[skill],
+            yerr=errs if show_std else None,
+            error_kw=dict(ecolor="0.25", elinewidth=0.9, capsize=3, capthick=0.9),
+        )
+
+    ax.set_title("Total Houses Built by Skill Group")
+    ax.set_ylabel("Houses built per dense log")
+    ax.set_xticks(x)
+    ax.set_xticklabels([short_labels.get(name, name) for name in run_names])
+    ax.grid(True, axis="y", alpha=0.25)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=min(n_skills, 4), frameon=True)
+
+    return fig, summary_df, raw_df
+
+
+def compare_skill_group_mechanisms(
+    runs,
+    short_labels=None,
+    period=100,
+    rate_disc=0.05,
+    visible_radius=5,
+    show_std=True,
+    figsize=(15, 8),
+):
+    """
+    Compare possible mechanisms by run and build-skill group.
+
+    Metrics:
+    builds, bought trade units, gathered units, visible resources, coin before
+    tax day, and net tax paid after redistribution.
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    def dense_logs_for_run(run):
+        if isinstance(run, dict):
+            logs = _extract_logs_from_run(run)
+            if logs:
+                return [(k, v) for k, v in logs.items() if isinstance(v, dict) and "states" in v]
+            if isinstance(run.get("states"), list):
+                return [(0, run)]
+        return []
+
+    def events_from_timeline(log, key, inner_key=None):
+        for t, item in enumerate(log.get(key, [])):
+            events = item.get(inner_key, []) if inner_key and isinstance(item, dict) else item
+            if not isinstance(events, list):
+                continue
+            for event in events:
+                if isinstance(event, dict):
+                    yield t, event
+
+    def world_at(log, t):
+        worlds = log.get("world", [])
+        if not worlds:
+            return {}
+        t = min(max(0, int(t)), len(worlds) - 1)
+        if worlds[t]:
+            return worlds[t]
+        for j in range(t, -1, -1):
+            if worlds[j]:
+                return worlds[j]
+        for item in worlds:
+            if item:
+                return item
+        return {}
+
+    def map_array(world, key):
+        value = world.get(key, None) if isinstance(world, dict) else None
+        if value is None or isinstance(value, dict):
+            return None
+        return np.asarray(value)
+
+    def visible_sum(log, t, loc, key):
+        arr = map_array(world_at(log, t), key)
+        if arr is None:
+            return np.nan
+        r, c = int(loc[0]), int(loc[1])
+        r0 = max(0, r - visible_radius)
+        r1 = min(arr.shape[0], r + visible_radius + 1)
+        c0 = max(0, c - visible_radius)
+        c1 = min(arr.shape[1], c + visible_radius + 1)
+        return float(np.nansum(arr[r0:r1, c0:c1]))
+
+    run_names = [run.get("name", f"Run {i+1}") for i, run in enumerate(runs)]
+    if short_labels is None:
+        short_labels = {name: f"Run {i+1}" for i, name in enumerate(run_names)}
+    elif isinstance(short_labels, list):
+        short_labels = {name: short_labels[i] for i, name in enumerate(run_names)}
+
+    all_skill_values = []
+    run_log_items = []
+    for run in runs:
+        log_items = dense_logs_for_run(run)
+        run_log_items.append(log_items)
+        for _, log in log_items:
+            states = log.get("states", [])
+            if not states:
+                continue
+            for aid in _numeric_agent_ids(log):
+                skill = states[0].get(str(aid), {}).get("build_payment", np.nan)
+                if np.isfinite(skill):
+                    all_skill_values.append(float(skill))
+
+    skill_values = sorted(set(all_skill_values))
+    if not skill_values:
+        raise ValueError("No finite build_payment skill values found in dense logs.")
+    skill_rank = {skill: i + 1 for i, skill in enumerate(skill_values)}
+    skill_labels = {skill: f"skill {skill_rank[skill]} ({skill:.0f})" for skill in skill_values}
+
+    rows = []
+    for run_idx, run in enumerate(runs):
+        run_name = run_names[run_idx]
+        for rollout_id, log in run_log_items[run_idx]:
+            states = log.get("states", [])
+            if not states:
+                continue
+
+            aids = _numeric_agent_ids(log)
+            agent_skill = {}
+            for aid in aids:
+                skill = states[0].get(str(aid), {}).get("build_payment", np.nan)
+                if np.isfinite(skill):
+                    agent_skill[aid] = float(skill)
+
+            waterline = _infer_waterline(log)
+            planner_region_by_agent = {
+                aid: _planner_region_from_initial_state(log, aid, waterline=waterline)
+                for aid in aids
+            }
+            cutoffs = None
+            for tax_event in log.get("PeriodicTax", []):
+                if isinstance(tax_event, dict) and tax_event and "cutoffs" in tax_event:
+                    cutoffs = np.asarray(tax_event["cutoffs"], dtype=float)
+                    break
+            if cutoffs is None:
+                cutoffs = np.asarray([0.0, 9.7, 39.475, 84.2, 160.725, 204.1, 510.3], dtype=float)
+            schedules_by_period = _all_current_planner_schedules_from_actions(
+                log,
+                period=period,
+                rate_disc=rate_disc,
+                cutoffs=cutoffs,
+            )
+            redist_by_period_region = extract_planner_redistribution_by_period(
+                log,
+                period=period,
+                rate_disc=rate_disc,
+            )
+            redist_lookup = {}
+            if not redist_by_period_region.empty:
+                for _, row in redist_by_period_region.iterrows():
+                    redist_lookup[(int(row["tax_period"]), row["planner_region"])] = {
+                        "redistributed": float(row.get("redistributed", 0.0)),
+                        "n_agents": max(1, int(row.get("n_agents", 1))),
+                    }
+
+            metrics = {
+                skill: {
+                    "builds": 0.0,
+                    "trade_units_bought": 0.0,
+                    "gather_units": 0.0,
+                    "visible_resources_values": [],
+                    "coin_before_tax_values": [],
+                    "net_tax_minus_subsidy_values": [],
+                }
+                for skill in skill_values
+            }
+
+            for _, build in events_from_timeline(log, "Build", "builds"):
+                aid = int(build.get("builder", -1))
+                skill = agent_skill.get(aid, np.nan)
+                if np.isfinite(skill):
+                    metrics[skill]["builds"] += 1.0
+
+            for _, trade in events_from_timeline(log, "Trade", "trades"):
+                aid = int(trade.get("buyer", -1))
+                skill = agent_skill.get(aid, np.nan)
+                if np.isfinite(skill):
+                    metrics[skill]["trade_units_bought"] += float(trade.get("quantity", 1.0))
+
+            for _, gather in events_from_timeline(log, "Gather", "gathers"):
+                aid = int(gather.get("agent", -1))
+                skill = agent_skill.get(aid, np.nan)
+                if np.isfinite(skill):
+                    metrics[skill]["gather_units"] += float(gather.get("quantity", gather.get("n", 1.0)))
+
+            tax_days = list(range(period - 1, len(states), period))
+            prev_t = 0
+            planner_id_by_region = {"top": "p_top", "bottom": "p_bottom"}
+            for tax_period, tax_t in enumerate(tax_days, start=1):
+                schedules = schedules_by_period.get(tax_period, {})
+                for aid in aids:
+                    aid_key = str(aid)
+                    skill = agent_skill.get(aid, np.nan)
+                    if (
+                        not np.isfinite(skill)
+                        or aid_key not in states[tax_t]
+                        or aid_key not in states[prev_t]
+                    ):
+                        continue
+                    state_period_start = states[prev_t][aid_key]
+                    state_after_tax = states[tax_t][aid_key]
+                    metrics[skill]["coin_before_tax_values"].append(_coin(state_period_start))
+                    planner_region = planner_region_by_agent.get(aid)
+                    planner_id = planner_id_by_region.get(planner_region)
+                    schedule = schedules.get(planner_id, np.zeros(len(cutoffs), dtype=float))
+                    income = _coin(state_after_tax) - _coin(state_period_start)
+                    tax_due = _tax_due_for_schedule(income, schedule, cutoffs)
+                    inventory_coin = float(state_after_tax.get("inventory", {}).get("Coin", 0.0))
+                    tax_paid = float(np.minimum(inventory_coin, tax_due))
+                    redist_info = redist_lookup.get(
+                        (tax_period, planner_region),
+                        {"redistributed": 0.0, "n_agents": 1},
+                    )
+                    subsidy_share = redist_info["redistributed"] / max(1, redist_info["n_agents"])
+                    metrics[skill]["net_tax_minus_subsidy_values"].append(
+                        tax_paid - subsidy_share
+                    )
+                    loc = state_after_tax.get("loc", None)
+                    if loc is not None:
+                        visible_wood = visible_sum(log, tax_t, loc, "Wood")
+                        visible_stone = visible_sum(log, tax_t, loc, "Stone")
+                        metrics[skill]["visible_resources_values"].append(
+                            float(np.nansum([visible_wood, visible_stone]))
+                        )
+                prev_t = tax_t
+
+            for skill in skill_values:
+                values = metrics[skill]
+                rows.append({
+                    "run": run_name,
+                    "label": short_labels.get(run_name, run_name),
+                    "rollout_id": rollout_id,
+                    "build_payment": skill,
+                    "skill_group": skill_labels[skill],
+                    "builds": values["builds"],
+                    "trade_units_bought": values["trade_units_bought"],
+                    "gather_units": values["gather_units"],
+                    "visible_resources": (
+                        float(np.nanmean(values["visible_resources_values"]))
+                        if values["visible_resources_values"] else np.nan
+                    ),
+                    "coin_before_tax": (
+                        float(np.nanmean(values["coin_before_tax_values"]))
+                        if values["coin_before_tax_values"] else np.nan
+                    ),
+                    "net_tax_minus_subsidy": (
+                        float(np.nanmean(values["net_tax_minus_subsidy_values"]))
+                        if values["net_tax_minus_subsidy_values"] else np.nan
+                    ),
+                })
+
+    raw_df = pd.DataFrame(rows)
+    if raw_df.empty:
+        raise ValueError("No skill mechanism rows could be constructed from these runs.")
+
+    metric_specs = [
+        ("builds", "Houses Built", "count per dense log"),
+        ("trade_units_bought", "Trade Units Bought", "units per dense log"),
+        ("gather_units", "Resources Gathered", "units per dense log"),
+        ("visible_resources", "Visible Resources", "avg wood+stone near agent"),
+        ("coin_before_tax", "Coin Before Tax Day", "avg coin"),
+        ("net_tax_minus_subsidy", "Net Tax After Redistribution", "tax paid - redistribution received"),
+    ]
+
+    agg_kwargs = {}
+    for metric, _, _ in metric_specs:
+        agg_kwargs[metric] = (metric, "mean")
+        agg_kwargs[f"{metric}_std"] = (metric, "std")
+    summary_df = (
+        raw_df
+        .groupby(["run", "label", "build_payment", "skill_group"], as_index=False)
+        .agg(**agg_kwargs)
+    )
+    for metric, _, _ in metric_specs:
+        summary_df[f"{metric}_std"] = summary_df[f"{metric}_std"].fillna(0.0)
+
+    n_cols = 3
+    n_rows = 2
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False, constrained_layout=True)
+    axes_flat = axes.ravel()
+
+    x = np.arange(len(run_names), dtype=float)
+    n_skills = len(skill_values)
+    total_width = 0.82
+    bar_width = total_width / max(1, n_skills)
+    offsets = (np.arange(n_skills) - (n_skills - 1) / 2.0) * bar_width
+    colors = _make_agent_colors(range(n_skills))
+
+    for ax, (metric, title, ylabel) in zip(axes_flat, metric_specs):
+        for skill_idx, skill in enumerate(skill_values):
+            vals = []
+            errs = []
+            for run_name in run_names:
+                match = summary_df[
+                    (summary_df["run"] == run_name)
+                    & (summary_df["build_payment"] == skill)
+                ]
+                vals.append(float(match[metric].iloc[0]) if len(match) else np.nan)
+                errs.append(float(match[f"{metric}_std"].iloc[0]) if len(match) else 0.0)
+            ax.bar(
+                x + offsets[skill_idx],
+                vals,
+                width=bar_width * 0.92,
+                color=colors[skill_idx % len(colors)],
+                edgecolor="white",
+                linewidth=0.7,
+                label=skill_labels[skill],
+                yerr=errs if show_std else None,
+                error_kw=dict(ecolor="0.25", elinewidth=0.8, capsize=2.5, capthick=0.8),
+            )
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        ax.set_xticks(x)
+        ax.set_xticklabels([short_labels.get(name, name) for name in run_names], rotation=0)
+        ax.grid(True, axis="y", alpha=0.25)
+
+    for ax in axes_flat[len(metric_specs):]:
+        ax.set_visible(False)
+
+    handles, labels = axes_flat[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(
+            handles,
+            labels,
+            loc="lower center",
+            bbox_to_anchor=(0.5, -0.02),
+            ncol=min(4, len(labels)),
+            frameon=True,
+        )
+    fig.suptitle("Skill-Group Mechanisms Across Runs", fontsize=14, fontweight="bold")
+    return fig, summary_df, raw_df
 
 def plot_planner_rewards(run, smooth_window=25):
     df = run["metrics"].copy()
@@ -2858,14 +3753,14 @@ def extract_trade_region_distribution(log, volume_field="price"):
 
             buyer = trade.get("buyer")
             seller = trade.get("seller")
-            buyer_region = None
-            seller_region = None
+            buyer_region = trade.get("buyer_region", None)
+            seller_region = trade.get("seller_region", None)
 
-            if buyer is not None and str(buyer) in state_t:
+            if buyer_region is None and buyer is not None and str(buyer) in state_t:
                 buyer_region = _location_region_from_state(
                     state_t[str(buyer)], waterline=waterline
                 )
-            if seller is not None and str(seller) in state_t:
+            if seller_region is None and seller is not None and str(seller) in state_t:
                 seller_region = _location_region_from_state(
                     state_t[str(seller)], waterline=waterline
                 )
@@ -11107,7 +12002,7 @@ def region_residence_table(log):
     return pd.DataFrame(rows)
 
 
-def plot_region_residence_summary(obj, mode="single", title=None, figsize=(11, 4.8)):
+def plot_region_residence_summary(obj, mode="auto", title=None, figsize=(11, 4.8)):
     """
     Plot top/bottom residence time and average stay lengths.
 
@@ -11117,10 +12012,11 @@ def plot_region_residence_summary(obj, mode="single", title=None, figsize=(11, 4
         For a single dense log, pass ``log`` and use mode="single".
         For averages across all dense logs in a run, pass ``runs[2]`` and use
         mode="average".
-    mode : {"single", "average"}
-        ``single`` treats obj as one dense log unless obj is a run with
-        ``dense_log``. ``average`` averages per-agent statistics across all dense
-        logs in the run.
+    mode : {"auto", "single", "average"}
+        ``auto`` uses single mode for a raw dense log and average mode for a
+        run/dense_logs object. ``single`` treats obj as one dense log unless obj
+        is a run with ``dense_log``. ``average`` averages per-agent statistics
+        across all dense logs in the run.
     """
     import numpy as np
     import pandas as pd
@@ -11134,6 +12030,9 @@ def plot_region_residence_summary(obj, mode="single", title=None, figsize=(11, 4
     if not logs:
         raise ValueError("No dense logs found.")
 
+    if mode == "auto":
+        mode = "single" if isinstance(obj, dict) and "states" in obj else "average"
+
     if mode == "single":
         first_key = next(iter(logs))
         tables = [region_residence_table(logs[first_key]).assign(log_key=first_key)]
@@ -11143,7 +12042,7 @@ def plot_region_residence_summary(obj, mode="single", title=None, figsize=(11, 4
             for log_key, log in logs.items()
         ]
     else:
-        raise ValueError("mode must be 'single' or 'average'.")
+        raise ValueError("mode must be 'auto', 'single', or 'average'.")
 
     raw_df = pd.concat(tables, ignore_index=True)
 
@@ -11228,7 +12127,10 @@ def plot_region_residence_summary(obj, mode="single", title=None, figsize=(11, 4
     ax_bar.legend(frameon=True)
 
     if title is None:
-        title = "Single Dense Log" if mode == "single" else "Average Across Dense Logs"
+        if mode == "single":
+            title = f"Single Dense Log {raw_df['log_key'].iloc[0]}"
+        else:
+            title = f"Average Across {raw_df['log_key'].nunique()} Dense Logs"
     fig.suptitle(f"Region Residence Summary: {title}", fontsize=14, fontweight="bold")
 
     return fig, df, raw_df
