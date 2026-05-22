@@ -49,11 +49,11 @@ settings = exp.ExperimentSettings(
     experiment_extra_tag="travel_5_5_short",
     layout_file = "stacked_51x25_symetric_original.txt",
 
-    travel_cost_coin_phase3a = 5,
-    travel_cost_labor_phase3a = 5,
+    travel_cost_coin_phase3a = 2,
+    travel_cost_labor_phase3a = 2,
 
-    travel_cost_coin_phase3b = 5,
-    travel_cost_labor_phase3b = 5,
+    travel_cost_coin_phase3b = 2,
+    travel_cost_labor_phase3b = 2,
 
 # same as AI economist original 
     # num_workers=15,
