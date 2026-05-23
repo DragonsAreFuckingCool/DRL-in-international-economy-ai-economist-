@@ -350,7 +350,39 @@ def _is_log_batch(log_or_logs):
     return isinstance(log_or_logs, (list, tuple))
 
 
-def _forced_move_event_table_batch(logs, window=100):
+def _summarize_relative_t(raw_df, metrics, expected_rollouts=None):
+    summary_df = (
+        raw_df
+        .groupby("relative_t", sort=True)[metrics]
+        .agg(["mean", "std", "count"])
+    )
+    summary_df.columns = [
+        f"{metric}_{stat}"
+        for metric, stat in summary_df.columns
+    ]
+    summary_df = summary_df.reset_index()
+
+    if expected_rollouts is not None:
+        rollout_counts = (
+            raw_df
+            .groupby("relative_t", sort=True)["rollout_id"]
+            .nunique()
+            .rename("rollout_count")
+            .reset_index()
+        )
+        summary_df = summary_df.merge(rollout_counts, on="relative_t", how="left")
+        summary_df = summary_df[summary_df["rollout_count"] >= expected_rollouts].reset_index(drop=True)
+
+    for metric in metrics:
+        summary_df[f"{metric}_std"] = summary_df[f"{metric}_std"].fillna(0.0)
+        summary_df[f"{metric}_sem"] = (
+            summary_df[f"{metric}_std"] / np.sqrt(summary_df[f"{metric}_count"])
+        )
+
+    return summary_df
+
+
+def _forced_move_event_table_batch(logs, window=100, complete_only=True):
     rows = []
     for rollout_id, log in enumerate(logs):
         df = forced_move_event_table(log, window=window)
@@ -375,22 +407,8 @@ def _forced_move_event_table_batch(logs, window=100):
         "built",
     ]
 
-    summary_df = (
-        raw_df
-        .groupby("relative_t", sort=True)[metrics]
-        .agg(["mean", "std", "count"])
-    )
-    summary_df.columns = [
-        f"{metric}_{stat}"
-        for metric, stat in summary_df.columns
-    ]
-    summary_df = summary_df.reset_index()
-
-    for metric in metrics:
-        summary_df[f"{metric}_std"] = summary_df[f"{metric}_std"].fillna(0.0)
-        summary_df[f"{metric}_sem"] = (
-            summary_df[f"{metric}_std"] / np.sqrt(summary_df[f"{metric}_count"])
-        )
+    expected_rollouts = len(rows) if complete_only else None
+    summary_df = _summarize_relative_t(raw_df, metrics, expected_rollouts=expected_rollouts)
 
     return raw_df, summary_df
 
@@ -423,9 +441,13 @@ def _plot_mean_with_error(ax, df, metric, label, color=None, linestyle="-", erro
         )
 
 
-def plot_forced_move_timeseries(log, window=100, errorbar="std"):
+def plot_forced_move_timeseries(log, window=100, errorbar="std", complete_only=True):
     if _is_log_batch(log):
-        raw_df, summary_df = _forced_move_event_table_batch(log, window=window)
+        raw_df, summary_df = _forced_move_event_table_batch(
+            log,
+            window=window,
+            complete_only=complete_only,
+        )
 
         fig, axes = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
 
@@ -1141,6 +1163,8 @@ def _forced_move_utilities_system_table(log, window=100):
 
     t_start = max(0, t0 - window)
     t_end = min(len(states), t0 + window + 1)
+    p_top_arr = np.array(log.get("planner_rewards", {}).get("p_top", []), dtype=float)
+    p_bottom_arr = np.array(log.get("planner_rewards", {}).get("p_bottom", []), dtype=float)
 
     rows = []
     for t in range(t_start, t_end):
@@ -1161,9 +1185,6 @@ def _forced_move_utilities_system_table(log, window=100):
         others_top_u = np.array(others_top_u, dtype=float)
         others_bottom_u = np.array(others_bottom_u, dtype=float)
 
-        p_top_arr = np.array(log.get("planner_rewards", {}).get("p_top", []), dtype=float)
-        p_bottom_arr = np.array(log.get("planner_rewards", {}).get("p_bottom", []), dtype=float)
-
         p_top_val = p_top_arr[t] if t < len(p_top_arr) else np.nan
         p_bottom_val = p_bottom_arr[t] if t < len(p_bottom_arr) else np.nan
 
@@ -1181,7 +1202,7 @@ def _forced_move_utilities_system_table(log, window=100):
     return df
 
 
-def _forced_move_utilities_system_table_batch(logs, window=100):
+def _forced_move_utilities_system_table_batch(logs, window=100, complete_only=True):
     rows = []
     for rollout_id, log in enumerate(logs):
         df = _forced_move_utilities_system_table(log, window=window)
@@ -1200,27 +1221,17 @@ def _forced_move_utilities_system_table_batch(logs, window=100):
         "p_bottom_reward",
     ]
 
-    summary_df = (
-        raw_df
-        .groupby("relative_t", sort=True)[metrics]
-        .agg(["mean", "std", "count"])
+    expected_rollouts = len(rows) if complete_only else None
+    summary_df = _summarize_relative_t(
+        raw_df,
+        metrics,
+        expected_rollouts=expected_rollouts,
     )
-    summary_df.columns = [
-        f"{metric}_{stat}"
-        for metric, stat in summary_df.columns
-    ]
-    summary_df = summary_df.reset_index()
-
-    for metric in metrics:
-        summary_df[f"{metric}_std"] = summary_df[f"{metric}_std"].fillna(0.0)
-        summary_df[f"{metric}_sem"] = (
-            summary_df[f"{metric}_std"] / np.sqrt(summary_df[f"{metric}_count"])
-        )
 
     return raw_df, summary_df
 
 
-def plot_forced_move_utilities_system(log, window=100, errorbar="std"):
+def plot_forced_move_utilities_system(log, window=100, errorbar="std", complete_only=True):
     """
     Plot utility development before and after forced move for:
     - moved agent
@@ -1229,7 +1240,11 @@ def plot_forced_move_utilities_system(log, window=100, errorbar="std"):
     - p_bottom reward
     """
     if _is_log_batch(log):
-        raw_df, summary_df = _forced_move_utilities_system_table_batch(log, window=window)
+        raw_df, summary_df = _forced_move_utilities_system_table_batch(
+            log,
+            window=window,
+            complete_only=complete_only,
+        )
 
         fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
 
