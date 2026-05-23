@@ -4059,9 +4059,10 @@ def plot_trade_enabled_run_trade_and_redistribution(
     Plot one trade-enabled run, either one dense log or the average across logs.
 
     Top-left: units of Wood and Stone traded within-region versus cross-region
-    over the full rollout. Top-right: average untaxed transaction price by
-    commodity and route type. Bottom: redistribution by planner and tax period,
-    split into income-tax-funded and other redistribution.
+    over the full rollout. Cross-region average trade prices include their
+    logged tariff so price comparisons reflect buyer cost. Bottom:
+    redistribution by planner and tax period, split into income-tax-funded and
+    other redistribution.
     """
     import numpy as np
     import pandas as pd
@@ -4151,6 +4152,11 @@ def plot_trade_enabled_run_trade_and_redistribution(
     if not trade_raw.empty:
         trade_raw = trade_raw.copy()
         trade_raw["tax_period"] = (trade_raw["timestep"].astype(int) // int(period)) + 1
+        trade_raw["price_with_cross_tariff"] = trade_raw["price"]
+        cross_trade = trade_raw["route_group"].eq("cross region")
+        trade_raw.loc[cross_trade, "price_with_cross_tariff"] = (
+            trade_raw.loc[cross_trade, "price"] + trade_raw.loc[cross_trade, "tariff"]
+        )
 
     if trade_raw.empty:
         trade_units = pd.DataFrame(columns=["tax_period", "commodity", "route_group", "units", "units_std"])
@@ -4170,7 +4176,7 @@ def plot_trade_enabled_run_trade_and_redistribution(
         per_rollout_prices = (
             trade_raw
             .groupby(["rollout_id", "commodity", "route_group"], as_index=False)
-            .agg(avg_price=("price", "mean"))
+            .agg(avg_price=("price_with_cross_tariff", "mean"))
         )
         price_summary = (
             per_rollout_prices
@@ -4188,7 +4194,7 @@ def plot_trade_enabled_run_trade_and_redistribution(
         price_summary = (
             trade_raw
             .groupby(["commodity", "route_group"], as_index=False)
-            .agg(avg_price=("price", "mean"))
+            .agg(avg_price=("price_with_cross_tariff", "mean"))
         )
         price_summary["avg_price_std"] = 0.0
 
@@ -4258,7 +4264,7 @@ def plot_trade_enabled_run_trade_and_redistribution(
                 .groupby(["rollout_id", "tax_period", "buyer_region", "route_group"], as_index=False)
                 .agg(
                     units=("units", "sum"),
-                    avg_price=("price", "mean"),
+                    avg_price=("price_with_cross_tariff", "mean"),
                 )
             )
             full_index = pd.MultiIndex.from_product(
@@ -4295,7 +4301,7 @@ def plot_trade_enabled_run_trade_and_redistribution(
                 .groupby(["tax_period", "buyer_region", "route_group"], as_index=False)
                 .agg(
                     units=("units", "sum"),
-                    avg_price=("price", "mean"),
+                    avg_price=("price_with_cross_tariff", "mean"),
                 )
             )
             buyer_route["units_std"] = 0.0
@@ -4409,7 +4415,10 @@ def plot_trade_enabled_run_trade_and_redistribution(
                 price_text = f"{price:.2f} +/- {price_std:.2f}"
             else:
                 price_text = f"{price:.2f}"
-            price_lines.append(f"{price_label} avg seller price: {price_text}")
+            if route_group == "cross region":
+                price_lines.append(f"{price_label} avg price incl tariff: {price_text}")
+            else:
+                price_lines.append(f"{price_label} avg seller price: {price_text}")
 
         if sum(values) > 0:
             ax.pie(
@@ -4624,8 +4633,8 @@ def plot_trade_enabled_run_trade_and_redistribution(
     ax_cross.grid(True, axis="y", alpha=0.25)
     ax_cross.legend(loc="upper left", ncol=4, fontsize=8, frameon=True)
 
-    ax_price.set_title("Average Untaxed Seller Price by Buyer Region and Route")
-    ax_price.set_ylabel("Avg seller price")
+    ax_price.set_title("Average Price by Buyer Region and Route\ncross-region includes tariff")
+    ax_price.set_ylabel("Avg trade price")
     ax_price.grid(True, axis="y", alpha=0.25)
     ax_price.legend(loc="upper left", ncol=4, fontsize=8, frameon=True)
 
@@ -10983,19 +10992,18 @@ def plot_tax_period_travel_context_dashboard(
         ax.set_ylabel(ylabel)
         ax.grid(True, axis="y", alpha=0.25)
 
-    title_suffix = " (rollout averages)" if n_rollouts > 1 else ""
-    grouped_box(ax_coin, "mean_coin", f"Coin During Period{title_suffix}", "coin")
-    grouped_box(ax_resources, "mean_visible_resources", f"Visible Resources During Period{title_suffix}", "wood + stone")
-    grouped_box(ax_houses, "mean_visible_own_houses", f"Own Houses Visible During Period{title_suffix}", "count")
+    grouped_box(ax_coin, "mean_coin", "Coin During Period", "coin")
+    grouped_box(ax_resources, "mean_visible_resources", "Visible Resources During Period", "wood + stone")
+    grouped_box(ax_houses, "mean_visible_own_houses", "Own Houses Visible During Period", "count")
     grouped_box(
         ax_other_houses,
         "mean_visible_other_houses",
-        f"Other Agents' Houses Visible During Period{title_suffix}",
+        "Other Agents' Houses Visible During Period",
         "count",
     )
 
     ax_scatter.scatter(
-        period_df.loc[~period_df["did_travel"], "mean_coin"],
+        period_df.loc[~period_df["did_travel"], "period_coin_change"],
         period_df.loc[~period_df["did_travel"], "mean_visible_other_houses"],
         s=28,
         color=nontravel_color,
@@ -11004,7 +11012,7 @@ def plot_tax_period_travel_context_dashboard(
     )
     travel_periods = period_df[period_df["did_travel"]]
     ax_scatter.scatter(
-        travel_periods["mean_coin"],
+        travel_periods["period_coin_change"],
         travel_periods["mean_visible_other_houses"],
         s=55,
         color=[agent_colors.get(int(a), travel_color) for a in travel_periods["agent"]],
@@ -11013,9 +11021,9 @@ def plot_tax_period_travel_context_dashboard(
         alpha=0.9,
         label="travel in period",
     )
-    trend = period_df[["mean_coin", "mean_visible_other_houses"]].dropna()
-    if len(trend) >= 2 and trend["mean_coin"].nunique() >= 2:
-        xfit = trend["mean_coin"].to_numpy(dtype=float)
+    trend = travel_periods[["period_coin_change", "mean_visible_other_houses"]].dropna()
+    if len(trend) >= 2 and trend["period_coin_change"].nunique() >= 2:
+        xfit = trend["period_coin_change"].to_numpy(dtype=float)
         yfit = trend["mean_visible_other_houses"].to_numpy(dtype=float)
         slope, intercept = np.polyfit(xfit, yfit, 1)
         xs = np.linspace(float(np.min(xfit)), float(np.max(xfit)), 100)
@@ -11025,10 +11033,10 @@ def plot_tax_period_travel_context_dashboard(
             color="0.15",
             linewidth=2.2,
             alpha=0.9,
-            label="pooled trend",
+            label="travel-point least-squares fit",
         )
     ax_scatter.set_title("Agent-Period Contexts")
-    ax_scatter.set_xlabel("mean coin")
+    ax_scatter.set_xlabel("period income / coin change")
     ax_scatter.set_ylabel("mean visible other agents' houses")
     ax_scatter.grid(True, alpha=0.25)
     fig.suptitle("Tax-Period Travel Context: Travelers vs Non-Travelers", fontsize=16, fontweight="bold")
@@ -11309,7 +11317,10 @@ def plot_tax_travel_counterfactuals(
         ax_scatter.plot([lo - pad, hi + pad], [lo - pad, hi + pad], color="0.35", linestyle="--", linewidth=1)
         ax_scatter.set_xlim(lo - pad, hi + pad)
         ax_scatter.set_ylim(lo - pad, hi + pad)
-        trend = plot_df[["current_region_tax_due", "other_region_tax_due"]].dropna()
+        trend = plot_df.loc[
+            plot_df["did_travel"],
+            ["current_region_tax_due", "other_region_tax_due"],
+        ].dropna()
         if len(trend) >= 2 and trend["current_region_tax_due"].nunique() >= 2:
             xfit = trend["current_region_tax_due"].to_numpy(dtype=float)
             yfit = trend["other_region_tax_due"].to_numpy(dtype=float)
@@ -11321,7 +11332,7 @@ def plot_tax_travel_counterfactuals(
                 color="0.15",
                 linewidth=2.2,
                 alpha=0.9,
-                label="pooled trend",
+                label="travel-point least-squares fit",
             )
             ax_scatter.legend(loc="best", frameon=True)
         if sc is not None:
@@ -11366,6 +11377,51 @@ def travel_regression_table_for_run(
 
     if not frames:
         raise ValueError("No agent-period rows could be constructed from this run.")
+
+    out = pd.concat(frames, ignore_index=True)
+    out["did_travel_int"] = out["did_travel"].astype(int)
+    if cluster_by == "agent":
+        out["cluster_id"] = out["agent_cluster"]
+    elif cluster_by == "rollout_agent":
+        out["cluster_id"] = out["rollout_agent_cluster"]
+    else:
+        raise ValueError("cluster_by must be 'agent' or 'rollout_agent'.")
+    return out
+
+
+def travel_tax_regression_table_for_run(
+    run,
+    period=100,
+    visible_radius=5,
+    income_window=100,
+    rate_disc=0.05,
+    cluster_by="agent",
+):
+    """Build a pooled agent-period regression table with tax counterfactuals."""
+    import pandas as pd
+
+    logs = _extract_logs_from_run(run)
+    if not logs:
+        raise ValueError("No dense logs found in run.")
+
+    frames = []
+    for log_key, log in logs.items():
+        df = tax_period_travel_counterfactual_table(
+            log,
+            period=period,
+            visible_radius=visible_radius,
+            income_window=income_window,
+            rate_disc=rate_disc,
+        ).copy()
+        if df.empty:
+            continue
+        df["rollout_id"] = log_key
+        df["agent_cluster"] = df["agent"].astype(str)
+        df["rollout_agent_cluster"] = df["rollout_id"].astype(str) + "_a" + df["agent"].astype(str)
+        frames.append(df)
+
+    if not frames:
+        raise ValueError("No agent-period tax rows could be constructed from this run.")
 
     out = pd.concat(frames, ignore_index=True)
     out["did_travel_int"] = out["did_travel"].astype(int)
@@ -11717,6 +11773,320 @@ def plot_travel_probability_regression(
     return fig, model_tables, df, results
 
 
+def plot_travel_probability_regression_tax(
+    run,
+    period=100,
+    visible_radius=5,
+    income_window=100,
+    rate_disc=0.05,
+    cluster_by="agent",
+    include_tax_period_fixed_effects=True,
+    include_agent_fixed_effects=False,
+    figsize=(14, 5.5),
+):
+    """
+    Logistic regression for travel probability using tax counterfactual variables.
+
+    The regressors summarize the tax context from ``plot_tax_travel_counterfactuals``:
+    the average marginal tax rate faced in the current region and the difference
+    between tax due in the other region and tax due in the current region.
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    try:
+        import statsmodels.api as sm
+    except ModuleNotFoundError:
+        sm = None
+
+    df = travel_tax_regression_table_for_run(
+        run,
+        period=period,
+        visible_radius=visible_radius,
+        income_window=income_window,
+        rate_disc=rate_disc,
+        cluster_by=cluster_by,
+    )
+
+    model_features = [
+        "current_region_avg_tax",
+        "other_minus_current_tax_due",
+    ]
+    feature_labels = {
+        "current_region_avg_tax": "Average tax faced",
+        "other_minus_current_tax_due": "Other minus current tax due",
+    }
+
+    model_cols = [
+        "did_travel_int",
+        "tax_period",
+        "agent",
+        "cluster_id",
+        *model_features,
+    ]
+    model_df = df[model_cols].copy()
+    model_df["did_travel_int"] = pd.to_numeric(model_df["did_travel_int"], errors="coerce")
+    for feature in model_features:
+        model_df[feature] = pd.to_numeric(model_df[feature], errors="coerce")
+    model_df = model_df.dropna(subset=model_cols).copy()
+
+    if model_df["did_travel_int"].nunique() < 2:
+        event_rate = float(model_df["did_travel_int"].mean()) if len(model_df) else np.nan
+        coef_df = pd.DataFrame([{
+            "feature": feature,
+            "label": feature_labels[feature],
+            "coef": np.nan,
+            "std_error": np.nan,
+            "p_value": np.nan,
+            "odds_ratio": np.nan,
+            "ci_low": np.nan,
+            "ci_high": np.nan,
+        } for feature in model_features])
+        fit_df = pd.DataFrame([{
+            "n_obs": int(len(model_df)),
+            "n_events": int(model_df["did_travel_int"].sum()) if len(model_df) else 0,
+            "event_rate": event_rate,
+            "n_clusters": int(model_df["cluster_id"].nunique()) if len(model_df) else 0,
+            "mcfadden_pseudo_r2": np.nan,
+            "log_likelihood": np.nan,
+            "ll_null": np.nan,
+            "aic": np.nan,
+            "bic": np.nan,
+            "auc": np.nan,
+            "tax_period_fixed_effects": bool(include_tax_period_fixed_effects),
+            "agent_fixed_effects": bool(include_agent_fixed_effects),
+            "clustered_se_by": cluster_by,
+            "note": "not estimated: did_travel has no variation after filtering",
+        }])
+        fig, ax = plt.subplots(figsize=(9, 4), constrained_layout=True)
+        ax.axis("off")
+        ax.text(
+            0.02,
+            0.72,
+            "Logistic regression was not estimated.\n\n"
+            "The dependent variable did_travel has no variation after filtering:\n"
+            f"observations = {fit_df.at[0, 'n_obs']}, "
+            f"travel events = {fit_df.at[0, 'n_events']}, "
+            f"event rate = {event_rate:.3f}.",
+            va="top",
+            ha="left",
+            fontsize=12,
+        )
+        fig.suptitle("Tax Regression: Probability of Travel", fontsize=14, fontweight="bold")
+        fit_summary = pd.DataFrame([
+            ["Observations", f"{fit_df.at[0, 'n_obs']}"],
+            ["Travel events", f"{fit_df.at[0, 'n_events']}"],
+            ["Event rate", f"{fit_df.at[0, 'event_rate']:.3f}"],
+            ["Clusters", f"{fit_df.at[0, 'n_clusters']} ({cluster_by})"],
+            ["Pseudo-R2 (McFadden)", "not estimated"],
+            ["AUC", "not estimated"],
+            ["Tax-period FE", "yes" if include_tax_period_fixed_effects else "no"],
+            ["Agent FE", "yes" if include_agent_fixed_effects else "no"],
+        ], columns=["statistic", "value"])
+        model_tables = {"coefficients": coef_df, "fit": fit_df, "fit_summary": fit_summary}
+        results = {"main": None, "X": None, "y": None, "model_df": model_df}
+        return fig, model_tables, df, results
+
+    for feature in model_features:
+        std = float(model_df[feature].std())
+        mean = float(model_df[feature].mean())
+        model_df[f"z_{feature}"] = 0.0 if std <= 1e-12 else (model_df[feature] - mean) / std
+
+    x_parts = [model_df[[f"z_{feature}" for feature in model_features]]]
+    if include_tax_period_fixed_effects:
+        x_parts.append(pd.get_dummies(model_df["tax_period"].astype(int), prefix="period", drop_first=True, dtype=float))
+    if include_agent_fixed_effects:
+        x_parts.append(pd.get_dummies(model_df["agent"].astype(int), prefix="agent", drop_first=True, dtype=float))
+    X = pd.concat(x_parts, axis=1)
+    if sm is not None:
+        X = sm.add_constant(X, has_constant="add")
+    else:
+        X.insert(0, "const", 1.0)
+    y = model_df["did_travel_int"].astype(float)
+
+    if sm is not None:
+        model = sm.Logit(y, X)
+        try:
+            result = model.fit(
+                disp=False,
+                maxiter=300,
+                cov_type="cluster",
+                cov_kwds={"groups": model_df["cluster_id"]},
+            )
+        except Exception:
+            result = model.fit(disp=False, maxiter=300)
+        params = result.params
+        pvalues = result.pvalues
+        conf = result.conf_int()
+        pred = np.asarray(result.predict(X), dtype=float)
+        llf = float(result.llf)
+        llnull = float(result.llnull) if hasattr(result, "llnull") else np.nan
+        pseudo_r2 = float(getattr(result, "prsquared", np.nan))
+        aic = float(result.aic)
+        bic = float(result.bic)
+        result_obj = result
+    else:
+        import math
+
+        def normal_cdf(x):
+            return 0.5 * (1.0 + math.erf(float(x) / math.sqrt(2.0)))
+
+        def sigmoid(z):
+            z = np.clip(z, -35, 35)
+            return 1.0 / (1.0 + np.exp(-z))
+
+        X_np = X.to_numpy(dtype=float)
+        y_np = y.to_numpy(dtype=float)
+        beta = np.zeros(X_np.shape[1], dtype=float)
+        ridge = 1e-8
+
+        for _ in range(300):
+            eta = X_np @ beta
+            prob = sigmoid(eta)
+            w = np.clip(prob * (1.0 - prob), 1e-8, None)
+            hessian = X_np.T @ (X_np * w[:, None])
+            grad = X_np.T @ (y_np - prob)
+            step = np.linalg.solve(
+                hessian + ridge * np.eye(hessian.shape[0]),
+                grad,
+            )
+            beta_new = beta + step
+            if np.max(np.abs(step)) < 1e-8:
+                beta = beta_new
+                break
+            beta = beta_new
+
+        pred = sigmoid(X_np @ beta)
+        w = np.clip(pred * (1.0 - pred), 1e-8, None)
+        bread = np.linalg.pinv(X_np.T @ (X_np * w[:, None]))
+        scores = X_np * (y_np - pred)[:, None]
+        meat = np.zeros((X_np.shape[1], X_np.shape[1]), dtype=float)
+        groups = model_df["cluster_id"].to_numpy()
+        unique_groups = pd.unique(groups)
+        for group in unique_groups:
+            sg = scores[groups == group].sum(axis=0)
+            meat += np.outer(sg, sg)
+        cov = bread @ meat @ bread
+        n_obs = X_np.shape[0]
+        n_params = X_np.shape[1]
+        n_clusters = len(unique_groups)
+        if n_clusters > 1 and n_obs > n_params:
+            cov *= (n_clusters / (n_clusters - 1.0)) * ((n_obs - 1.0) / (n_obs - n_params))
+        se = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+        z_vals = np.divide(beta, se, out=np.zeros_like(beta), where=se > 0)
+        p_vals = np.asarray([2.0 * (1.0 - normal_cdf(abs(z))) for z in z_vals])
+        ci_low = beta - 1.96 * se
+        ci_high = beta + 1.96 * se
+
+        params = pd.Series(beta, index=X.columns)
+        pvalues = pd.Series(p_vals, index=X.columns)
+        conf = pd.DataFrame({0: ci_low, 1: ci_high}, index=X.columns)
+        eps = 1e-12
+        llf = float(np.sum(y_np * np.log(pred + eps) + (1.0 - y_np) * np.log(1.0 - pred + eps)))
+        mean_y = np.clip(float(np.mean(y_np)), eps, 1.0 - eps)
+        llnull = float(np.sum(y_np * np.log(mean_y) + (1.0 - y_np) * np.log(1.0 - mean_y)))
+        pseudo_r2 = float(1.0 - llf / llnull) if llnull != 0 else np.nan
+        aic = float(2 * n_params - 2 * llf)
+        bic = float(np.log(n_obs) * n_params - 2 * llf)
+        result_obj = {
+            "params": params,
+            "pvalues": pvalues,
+            "conf_int": conf,
+            "cov_cluster": cov,
+            "method": "numpy_logit_cluster_fallback",
+        }
+
+    coef_rows = []
+    for feature in model_features:
+        name = f"z_{feature}"
+        coef = float(params[name])
+        ci_low, ci_high = conf.loc[name].astype(float).tolist()
+        coef_rows.append({
+            "feature": feature,
+            "label": feature_labels[feature],
+            "coef": coef,
+            "odds_ratio": float(np.exp(coef)),
+            "ci_low": float(np.exp(ci_low)),
+            "ci_high": float(np.exp(ci_high)),
+            "p_value": float(pvalues[name]),
+        })
+    coef_df = pd.DataFrame(coef_rows).sort_values("odds_ratio")
+
+    y_arr = y.to_numpy(dtype=float)
+    pos = pred[y_arr == 1]
+    neg = pred[y_arr == 0]
+    if len(pos) and len(neg):
+        ranks = pd.Series(pred).rank(method="average").to_numpy(dtype=float)
+        auc = float((np.sum(ranks[y_arr == 1]) - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg)))
+    else:
+        auc = np.nan
+
+    fit_df = pd.DataFrame([{
+        "n_obs": int(len(model_df)),
+        "n_events": int(y.sum()),
+        "event_rate": float(y.mean()),
+        "n_clusters": int(model_df["cluster_id"].nunique()),
+        "mcfadden_pseudo_r2": pseudo_r2,
+        "log_likelihood": llf,
+        "ll_null": llnull,
+        "aic": aic,
+        "bic": bic,
+        "auc": auc,
+        "tax_period_fixed_effects": bool(include_tax_period_fixed_effects),
+        "agent_fixed_effects": bool(include_agent_fixed_effects),
+        "clustered_se_by": cluster_by,
+    }])
+
+    fig, (ax_or, ax_p) = plt.subplots(1, 2, figsize=figsize, constrained_layout=True)
+    y_pos = np.arange(len(coef_df))
+    ax_or.errorbar(
+        coef_df["odds_ratio"],
+        y_pos,
+        xerr=[
+            coef_df["odds_ratio"] - coef_df["ci_low"],
+            coef_df["ci_high"] - coef_df["odds_ratio"],
+        ],
+        fmt="o",
+        color="#1f77b4",
+        ecolor="0.35",
+        capsize=4,
+    )
+    ax_or.axvline(1.0, color="0.25", linestyle="--", linewidth=1)
+    ax_or.set_yticks(y_pos)
+    ax_or.set_yticklabels(coef_df["label"])
+    ax_or.set_xscale("log")
+    ax_or.set_xlabel("Odds ratio for +1 std increase")
+    ax_or.set_title("Tax Variables: Odds Ratios")
+    ax_or.grid(True, axis="x", alpha=0.25)
+
+    p_df = coef_df.sort_values("p_value", ascending=False)
+    colors = ["#c92a2a" if p < 0.05 else "0.65" for p in p_df["p_value"]]
+    ax_p.barh(p_df["label"], p_df["p_value"], color=colors, alpha=0.85)
+    ax_p.axvline(0.05, color="0.2", linestyle="--", linewidth=1, label="p = 0.05")
+    ax_p.set_xlim(0, min(1.0, max(0.1, float(np.nanmax(p_df["p_value"])) * 1.15)))
+    ax_p.set_xlabel("Cluster-robust p-value")
+    ax_p.set_title("Statistical Significance")
+    ax_p.legend(frameon=True)
+    ax_p.grid(True, axis="x", alpha=0.25)
+
+    fit_summary = pd.DataFrame([
+        ["Observations", f"{fit_df.at[0, 'n_obs']}"],
+        ["Travel events", f"{fit_df.at[0, 'n_events']}"],
+        ["Event rate", f"{fit_df.at[0, 'event_rate']:.3f}"],
+        ["Clusters", f"{fit_df.at[0, 'n_clusters']} ({cluster_by})"],
+        ["Pseudo-R2 (McFadden)", f"{fit_df.at[0, 'mcfadden_pseudo_r2']:.3f}"],
+        ["AUC", f"{fit_df.at[0, 'auc']:.3f}"],
+        ["Tax-period FE", "yes" if include_tax_period_fixed_effects else "no"],
+        ["Agent FE", "yes" if include_agent_fixed_effects else "no"],
+    ], columns=["statistic", "value"])
+
+    fig.suptitle("Tax Regression: Probability of Travel", fontsize=16, fontweight="bold")
+    model_tables = {"coefficients": coef_df, "fit": fit_df, "fit_summary": fit_summary}
+    results = {"main": result_obj, "X": X, "y": y, "model_df": model_df}
+    return fig, model_tables, df, results
+
+
 def _simple_logit_slope_table(df, features, group_col=None):
     """Small no-dependency univariate logit slopes for actual travel probability."""
     import math
@@ -11798,6 +12168,7 @@ def plot_travel_probability_by_skill(
     period=100,
     visible_radius=5,
     income_window=100,
+    rate_disc=0.05,
     n_bins=5,
     figsize=(16, 10),
 ):
@@ -11812,11 +12183,12 @@ def plot_travel_probability_by_skill(
     import pandas as pd
     import matplotlib.pyplot as plt
 
-    df = travel_regression_table_for_run(
+    df = travel_tax_regression_table_for_run(
         run,
         period=period,
         visible_radius=visible_radius,
         income_window=income_window,
+        rate_disc=rate_disc,
         cluster_by="agent",
     )
     df["did_travel_int"] = pd.to_numeric(df["did_travel_int"], errors="coerce")
@@ -11826,6 +12198,7 @@ def plot_travel_probability_by_skill(
         "mean_visible_resources",
         "mean_visible_other_houses",
         "mean_visible_own_houses",
+        "current_region_avg_tax",
     ]
     labels = {
         "mean_coin": "Mean coin",
@@ -11833,6 +12206,7 @@ def plot_travel_probability_by_skill(
         "mean_visible_resources": "Visible resources",
         "mean_visible_other_houses": "Visible other houses",
         "mean_visible_own_houses": "Visible own houses",
+        "current_region_avg_tax": "Average tax faced",
     }
 
     valid_outcome = df["did_travel_int"].dropna()
