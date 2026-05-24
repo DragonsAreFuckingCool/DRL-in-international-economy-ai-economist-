@@ -1921,6 +1921,7 @@ def compare_training_curves(
     show_phase_boundaries=True,
     short_labels=None,
     smooth_window=1,
+    episode_range=None,
     figsize=(10, 5),
 ):
     """
@@ -1948,6 +1949,10 @@ def compare_training_curves(
 
     smooth_window : int
         Rolling mean window for smoothing. Use 1 for no smoothing.
+
+    episode_range : None or tuple
+        Optional cumulative training-iteration window to show, e.g.
+        ``(2500, 4000)`` for the final 1500 iterations.
 
     figsize : tuple
         Figure size.
@@ -1992,6 +1997,15 @@ def compare_training_curves(
 
     all_boundaries = None
     max_x = 0
+    if episode_range is not None:
+        if len(episode_range) != 2:
+            raise ValueError("episode_range must be None or a (start, end) tuple.")
+        episode_start, episode_end = [float(v) for v in episode_range]
+        if episode_end <= episode_start:
+            raise ValueError("episode_range end must be greater than start.")
+    else:
+        episode_start = None
+        episode_end = None
 
     for i, run in enumerate(runs):
         df = run["metrics"].copy()
@@ -2101,6 +2115,8 @@ def compare_training_curves(
     # Draw phase boundaries once
     if show_phase_boundaries and all_boundaries is not None:
         for b in all_boundaries[:-1]:
+            if episode_range is not None and not (episode_start <= b <= episode_end):
+                continue
             ax.axvline(b, linestyle="--", alpha=0.35, color="gray", linewidth=1)
 
     # Nicer labels
@@ -2111,7 +2127,10 @@ def compare_training_curves(
     ax.grid(True, alpha=0.3)
 
     # Keep x-axis tight to data
-    ax.set_xlim(0, max_x if max_x > 0 else 1)
+    if episode_range is not None:
+        ax.set_xlim(episode_start, episode_end)
+    else:
+        ax.set_xlim(0, max_x if max_x > 0 else 1)
 
     # Put legend below, not to the side
     handles, labels = ax.get_legend_handles_labels()
@@ -6208,9 +6227,9 @@ def breakdown_all_agents_average_from_result_folder(
 
     if metrics is None:
         metrics = [
-            "final_coin",
+            "build_count",
             "mean_coin",
-            "final_labor",
+            "mean_labor",
             "mean_utility",
             "build_income",
             "net_market",
@@ -6552,7 +6571,7 @@ def plot_periodic_tax_streams_from_result_folder(result_dir, episode_key=0, figs
             "No PeriodicTax-p_top or PeriodicTax-p_bottom events found in the selected dense log."
         )
 
-    colors = {"p_top": "#1f77b4", "p_bottom": "#ff7f0e"}
+    colors = {"p_top": "#1f77b4", "p_bottom": "#d62728"}
     fig = plt.figure(figsize=figsize, constrained_layout=True)
     gs = fig.add_gridspec(3, 2, height_ratios=[1.0, 1.0, 1.25])
     ax_tax_paid = fig.add_subplot(gs[0, :])
@@ -9002,7 +9021,7 @@ def plot_tax_bracket_snapshots_compact_average(
 
     configs = [
         ("top", "p_top", "#1f77b4", 0),
-        ("bottom", "p_bottom", "#ff7f0e", 2),
+        ("bottom", "p_bottom", "#d62728", 2),
     ]
 
     for ax in axes.flat:
@@ -9134,6 +9153,291 @@ def plot_tax_bracket_snapshots_compact_average(
     )
 
     return fig, df_income, counts, df_swf
+
+
+def tax_bracket_correlation_outcome_table_average(
+    run,
+    env_obj,
+    brackets,
+    period=100,
+    top_first=True,
+    exclude_highest_bracket=True,
+    min_tax_period=1,
+):
+    """
+    Measure how tax rates align with occupied income brackets by tax period.
+
+    The correlation is Pearson corr(tax rate by bracket, number of agents in
+    bracket), computed separately for each rollout, tax period, and planner
+    region. Positive values mean higher rates are assigned to more populated
+    brackets; negative values mean higher rates are assigned to less populated
+    brackets. Outcomes are the same production/equality values used by the
+    compact tax-bracket snapshot plots.
+    """
+    import numpy as np
+    import pandas as pd
+
+    log_items = _dense_log_items(run)
+    if not log_items:
+        raise ValueError("No dense logs found. Pass a run dict, dense_logs, or a dense log.")
+
+    labels = None
+    rows = []
+
+    def pearson_corr(x, y):
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        ok = np.isfinite(x) & np.isfinite(y)
+        x = x[ok]
+        y = y[ok]
+        if len(x) < 2:
+            return np.nan
+        if float(np.nanstd(x)) <= 1e-12 or float(np.nanstd(y)) <= 1e-12:
+            return np.nan
+        return float(np.corrcoef(x, y)[0, 1])
+
+    for rollout_id, dense_log in log_items:
+        _, counts_one, labels_one = _income_bracket_counts(
+            dense_log,
+            brackets,
+            period=period,
+        )
+        if labels is None:
+            labels = labels_one
+
+        df_swf_one = _period_swf_table(dense_log, period=period)
+        ptop_rates, pbot_rates = _tax_rate_matrices(dense_log, env_obj, top_first=top_first)
+        tax_days = sorted(counts_one["tax_day_number"].dropna().unique())
+
+        if not tax_days:
+            continue
+
+        def tax_day_to_decision_idx(tax_day, rate_matrix):
+            if rate_matrix.shape[0] == len(tax_days):
+                return min(int(tax_day) - 1, rate_matrix.shape[0] - 1)
+            if len(tax_days) == 1 or rate_matrix.shape[0] == 1:
+                return 0
+            frac = (tax_day - tax_days[0]) / (tax_days[-1] - tax_days[0])
+            return int(np.clip(round(frac * (rate_matrix.shape[0] - 1)), 0, rate_matrix.shape[0] - 1))
+
+        for region, planner_id, rate_matrix in [
+            ("top", "p_top", ptop_rates),
+            ("bottom", "p_bottom", pbot_rates),
+        ]:
+            for tax_day in tax_days:
+                if int(tax_day) < int(min_tax_period):
+                    continue
+                decision_idx = tax_day_to_decision_idx(tax_day, rate_matrix)
+                rates = np.asarray(rate_matrix[decision_idx], dtype=float)
+                n_brackets = min(len(labels), len(rates))
+                include_idx = np.arange(n_brackets)
+                if exclude_highest_bracket and len(include_idx) > 1:
+                    include_idx = include_idx[:-1]
+
+                day_counts = (
+                    counts_one[
+                        (counts_one["planner_region"] == region)
+                        & (counts_one["tax_day_number"] == tax_day)
+                    ]
+                    .set_index("tax_bracket")["n_agents"]
+                    .reindex(labels[:n_brackets])
+                    .fillna(0.0)
+                    .to_numpy(dtype=float)
+                )
+
+                corr = pearson_corr(rates[include_idx], day_counts[include_idx])
+                swf_row = df_swf_one[
+                    (df_swf_one["tax_day_number"] == tax_day)
+                    & (df_swf_one["planner_region"] == region)
+                ]
+                if len(swf_row):
+                    sr = swf_row.iloc[0]
+                    production = float(sr["production"])
+                    equality = float(sr["equality"])
+                    planner_reward_sum = float(sr["planner_reward_sum"])
+                else:
+                    production = equality = planner_reward_sum = np.nan
+
+                rows.append({
+                    "rollout_id": rollout_id,
+                    "tax_day_number": int(tax_day),
+                    "planner_region": region,
+                    "planner_id": planner_id,
+                    "tax_count_corr": corr,
+                    "mean_tax_rate_included": float(np.nanmean(rates[include_idx])) if len(include_idx) else np.nan,
+                    "mean_agents_per_bracket_included": float(np.nanmean(day_counts[include_idx])) if len(include_idx) else np.nan,
+                    "total_agents_included": float(np.nansum(day_counts[include_idx])) if len(include_idx) else np.nan,
+                    "production": production,
+                    "equality": equality,
+                    "planner_reward_sum": planner_reward_sum,
+                    "n_brackets_included": int(len(include_idx)),
+                    "highest_bracket_excluded": bool(exclude_highest_bracket),
+                })
+
+    raw_df = pd.DataFrame(rows)
+    if raw_df.empty:
+        raise ValueError("No tax-bracket correlation rows could be constructed.")
+
+    summary = (
+        raw_df
+        .groupby(["tax_day_number", "planner_region", "planner_id"], as_index=False)
+        .agg(
+            tax_count_corr=("tax_count_corr", "mean"),
+            tax_count_corr_std=("tax_count_corr", "std"),
+            production=("production", "mean"),
+            production_std=("production", "std"),
+            equality=("equality", "mean"),
+            equality_std=("equality", "std"),
+            planner_reward_sum=("planner_reward_sum", "mean"),
+            planner_reward_sum_std=("planner_reward_sum", "std"),
+            n_dense_logs=("tax_count_corr", "count"),
+            n_brackets_included=("n_brackets_included", "max"),
+        )
+    )
+    for col in [c for c in summary.columns if c.endswith("_std")]:
+        summary[col] = summary[col].fillna(0.0)
+
+    return summary, raw_df
+
+
+def plot_tax_bracket_correlation_outcomes_average(
+    run,
+    env_obj,
+    brackets,
+    period=100,
+    top_first=True,
+    exclude_highest_bracket=True,
+    min_tax_period=1,
+    show_std=True,
+    figsize=(14, 10),
+):
+    """
+    Plot whether tax-bracket alignment correlates with equality/production.
+
+    Returns
+    -------
+    fig, summary_df, raw_df
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    summary, raw_df = tax_bracket_correlation_outcome_table_average(
+        run,
+        env_obj,
+        brackets,
+        period=period,
+        top_first=top_first,
+        exclude_highest_bracket=exclude_highest_bracket,
+        min_tax_period=min_tax_period,
+    )
+
+    colors = {"top": "#1f77b4", "bottom": "#d62728"}
+    if figsize == (14, 10):
+        figsize = (18, 5.5)
+    fig, (ax_corr, ax_eq, ax_prod) = plt.subplots(1, 3, figsize=figsize, constrained_layout=True)
+
+    for region in ["top", "bottom"]:
+        dfr = summary[summary["planner_region"] == region].sort_values("tax_day_number")
+        if dfr.empty:
+            continue
+        color = colors[region]
+        x = dfr["tax_day_number"].to_numpy(dtype=float)
+        corr = dfr["tax_count_corr"].to_numpy(dtype=float)
+        corr_std = dfr["tax_count_corr_std"].to_numpy(dtype=float)
+
+        ax_corr.plot(x, corr, marker="o", linewidth=2.1, color=color, label=region)
+        if show_std:
+            ax_corr.fill_between(
+                x,
+                corr - corr_std,
+                corr + corr_std,
+                color=color,
+                alpha=0.14,
+                linewidth=0,
+            )
+
+        ax_eq.scatter(
+            corr,
+            dfr["equality"],
+            s=52,
+            color=color,
+            edgecolor="white",
+            linewidth=0.8,
+            alpha=0.9,
+            label=region,
+        )
+        ax_prod.scatter(
+            corr,
+            dfr["production"],
+            s=52,
+            color=color,
+            edgecolor="white",
+            linewidth=0.8,
+            alpha=0.9,
+            label=region,
+        )
+        for _, row in dfr.iterrows():
+            ax_eq.annotate(
+                str(int(row["tax_day_number"])),
+                (row["tax_count_corr"], row["equality"]),
+                fontsize=8,
+                xytext=(3, 3),
+                textcoords="offset points",
+                color=color,
+            )
+            ax_prod.annotate(
+                str(int(row["tax_day_number"])),
+                (row["tax_count_corr"], row["production"]),
+                fontsize=8,
+                xytext=(3, 3),
+                textcoords="offset points",
+                color=color,
+            )
+
+    for ax, metric in [(ax_eq, "equality"), (ax_prod, "production")]:
+        trend_df = summary[["tax_count_corr", metric]].dropna()
+        if len(trend_df) >= 2 and trend_df["tax_count_corr"].nunique() >= 2:
+            xfit = trend_df["tax_count_corr"].to_numpy(dtype=float)
+            yfit = trend_df[metric].to_numpy(dtype=float)
+            slope, intercept = np.polyfit(xfit, yfit, 1)
+            xs = np.linspace(float(np.nanmin(xfit)), float(np.nanmax(xfit)), 100)
+            ax.plot(xs, slope * xs + intercept, color="0.2", linewidth=1.8, linestyle="--")
+
+    ax_corr.axhline(0, color="0.25", linewidth=1.0, linestyle="--")
+    ax_corr.set_title("Tax-Count Correlation by Tax Period")
+    ax_corr.set_xlabel("tax period")
+    ax_corr.set_ylabel("corr(tax rate, n agents)")
+    ax_corr.set_ylim(-1.05, 1.05)
+    ax_corr.grid(True, alpha=0.25)
+    ax_corr.legend(frameon=True)
+
+    ax_eq.axvline(0, color="0.25", linewidth=1.0, linestyle="--")
+    ax_eq.set_title("Equality vs Tax-Count Correlation")
+    ax_eq.set_xlabel("corr(tax rate, n agents)")
+    ax_eq.set_ylabel("equality")
+    ax_eq.grid(True, alpha=0.25)
+    ax_eq.legend(frameon=True)
+
+    ax_prod.axvline(0, color="0.25", linewidth=1.0, linestyle="--")
+    ax_prod.set_title("Production vs Tax-Count Correlation")
+    ax_prod.set_xlabel("corr(tax rate, n agents)")
+    ax_prod.set_ylabel("production")
+    ax_prod.grid(True, alpha=0.25)
+    ax_prod.legend(frameon=True)
+
+    bracket_note = "excluding highest bracket" if exclude_highest_bracket else "including all brackets"
+    period_note = (
+        f", tax periods >= {int(min_tax_period)}"
+        if int(min_tax_period) > 1
+        else ""
+    )
+    fig.suptitle(
+        f"Tax Bracket Alignment vs Equality and Production ({bracket_note}{period_note})",
+        fontsize=14,
+        fontweight="bold",
+    )
+    return fig, summary, raw_df
 
 
 def _extract_tax_policy_from_actions(log, period=100, rate_disc=0.05):
@@ -11346,6 +11650,323 @@ def plot_tax_travel_counterfactuals(
     return fig, df
 
 
+def relocation_tax_event_study_table(
+    log_or_run,
+    period=100,
+    rate_disc=0.05,
+    pre_periods=3,
+    post_periods=3,
+):
+    """Build an event-study table of planner tax schedules around travel events."""
+    import numpy as np
+    import pandas as pd
+
+    rows = []
+    for rollout_id, log in _dense_log_items(log_or_run):
+        schedules, _ = _tax_schedules_by_region_period(
+            log,
+            period=period,
+            rate_disc=rate_disc,
+        )
+        states = log.get("states", [])
+        if not states:
+            continue
+        waterline = _infer_waterline(log)
+
+        for event_idx, event in enumerate(_iter_travel_events(log)):
+            if not isinstance(event, dict) or "agent" not in event:
+                continue
+            event_t = int(event.get("t", 0))
+            event_period = int(event_t // int(period)) + 1
+            aid = int(event["agent"])
+
+            if "from" in event:
+                origin_region = _region_from_loc(event["from"], waterline)
+            else:
+                before_t = max(0, min(event_t - 1, len(states) - 1))
+                origin_region = _location_region_from_state(states[before_t][str(aid)], waterline=waterline)
+
+            if "to" in event:
+                destination_region = _region_from_loc(event["to"], waterline)
+            else:
+                after_t = max(0, min(event_t, len(states) - 1))
+                destination_region = _location_region_from_state(states[after_t][str(aid)], waterline=waterline)
+
+            if origin_region == destination_region:
+                continue
+
+            for rel_period in range(-int(pre_periods), int(post_periods) + 1):
+                tax_period = event_period + rel_period
+                if tax_period < 1:
+                    continue
+                period_schedules = schedules.get(tax_period, {})
+                for response_role, region in [
+                    ("origin", origin_region),
+                    ("destination", destination_region),
+                ]:
+                    schedule = np.asarray(period_schedules.get(region, []), dtype=float)
+                    if schedule.size == 0:
+                        continue
+                    rows.append({
+                        "rollout_id": rollout_id,
+                        "event_id": f"{rollout_id}_{event_idx}",
+                        "agent": aid,
+                        "event_timestep": event_t,
+                        "event_tax_period": event_period,
+                        "tax_period": tax_period,
+                        "relative_period": rel_period,
+                        "response_role": response_role,
+                        "planner_region": region,
+                        "avg_marginal_rate": float(np.nanmean(schedule)),
+                        "top_marginal_rate": float(schedule[-1]),
+                        "bottom_marginal_rate": float(schedule[0]),
+                        "progressivity": float(schedule[-1] - schedule[0]),
+                    })
+
+    return pd.DataFrame(rows)
+
+
+def plot_relocation_tax_event_study(
+    log_or_run,
+    period=100,
+    rate_disc=0.05,
+    pre_periods=3,
+    post_periods=3,
+    figsize=(12, 6),
+):
+    """
+    Event study of planner tax schedules around relocation.
+
+    The origin line follows the planner in the region an agent leaves; the
+    destination line follows the planner in the region the agent enters.
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    df = relocation_tax_event_study_table(
+        log_or_run,
+        period=period,
+        rate_disc=rate_disc,
+        pre_periods=pre_periods,
+        post_periods=post_periods,
+    )
+    if df.empty:
+        raise ValueError("No relocation event-study rows could be constructed.")
+
+    summary = (
+        df
+        .groupby(["relative_period", "response_role"], as_index=False)
+        .agg(
+            avg_marginal_rate=("avg_marginal_rate", "mean"),
+            top_marginal_rate=("top_marginal_rate", "mean"),
+            progressivity=("progressivity", "mean"),
+            n_events=("event_id", "nunique"),
+        )
+    )
+
+    colors = {"origin": "#4c78a8", "destination": "#f58518"}
+    metrics = [
+        ("avg_marginal_rate", "Average marginal tax rate"),
+        ("top_marginal_rate", "Top-bracket marginal tax rate"),
+    ]
+    fig, axes = plt.subplots(1, 2, figsize=figsize, sharex=True, constrained_layout=True)
+
+    for ax, (metric, title) in zip(axes, metrics):
+        for role in ["origin", "destination"]:
+            dfr = summary[summary["response_role"] == role].sort_values("relative_period")
+            ax.plot(
+                dfr["relative_period"],
+                dfr[metric],
+                marker="o",
+                linewidth=2.2,
+                color=colors[role],
+                label=role,
+            )
+        ax.axvline(0, color="0.25", linestyle="--", linewidth=1)
+        ax.set_title(title)
+        ax.set_xlabel("tax periods relative to travel")
+        ax.set_ylabel("tax rate")
+        ax.grid(True, alpha=0.3)
+
+    axes[0].legend(title="planner role", frameon=True)
+    fig.suptitle("Planner Tax Response Around Relocation Events", fontsize=15, fontweight="bold")
+    return fig, df, summary
+
+
+def regional_composition_tax_coevolution_table(
+    log_or_run,
+    period=100,
+    visible_radius=5,
+    income_window=100,
+    rate_disc=0.05,
+    high_income_quantile=0.75,
+):
+    """Build tax-period regional composition, planner reward, and tax table."""
+    import numpy as np
+    import pandas as pd
+
+    rows = []
+    for rollout_id, log in _dense_log_items(log_or_run):
+        period_df = extract_tax_period_travel_context_table(
+            log,
+            period=period,
+            visible_radius=visible_radius,
+            income_window=income_window,
+        ).copy()
+        if period_df.empty:
+            continue
+        schedules, _ = _tax_schedules_by_region_period(
+            log,
+            period=period,
+            rate_disc=rate_disc,
+        )
+        income_values = period_df["period_coin_change"].to_numpy(dtype=float)
+        finite_income = income_values[np.isfinite(income_values)]
+        high_income_cutoff = (
+            float(np.nanquantile(finite_income, high_income_quantile))
+            if finite_income.size
+            else np.nan
+        )
+        planner_rewards = {
+            "top": np.asarray(log.get("planner_rewards", {}).get("p_top", []), dtype=float),
+            "bottom": np.asarray(log.get("planner_rewards", {}).get("p_bottom", []), dtype=float),
+        }
+
+        for tax_period in sorted(period_df["tax_period"].dropna().unique()):
+            tax_period_int = int(tax_period)
+            start_t = (tax_period_int - 1) * int(period)
+            end_t = tax_period_int * int(period)
+            period_rows = period_df[period_df["tax_period"] == tax_period]
+            period_schedules = schedules.get(tax_period_int, {})
+
+            for region, planner_id in [("top", "p_top"), ("bottom", "p_bottom")]:
+                dfr = period_rows[period_rows["location_region_end"] == region]
+                schedule = np.asarray(period_schedules.get(region, []), dtype=float)
+                reward_arr = planner_rewards[region]
+                reward_slice = reward_arr[start_t:min(end_t, len(reward_arr))]
+                reward_slice = reward_slice[np.isfinite(reward_slice)]
+
+                period_income = dfr["period_coin_change"].to_numpy(dtype=float) if len(dfr) else np.asarray([])
+                high_income_agents = (
+                    int(np.sum(period_income >= high_income_cutoff))
+                    if len(period_income) and np.isfinite(high_income_cutoff)
+                    else 0
+                )
+                rows.append({
+                    "rollout_id": rollout_id,
+                    "tax_period": tax_period_int,
+                    "planner_region": region,
+                    "planner_id": planner_id,
+                    "n_agents": int(len(dfr)),
+                    "n_travelers": int(dfr["did_travel"].sum()) if len(dfr) else 0,
+                    "high_income_agents": high_income_agents,
+                    "mean_period_coin_change": float(np.nanmean(period_income)) if len(period_income) else np.nan,
+                    "total_period_coin_change": float(np.nansum(period_income)) if len(period_income) else np.nan,
+                    "avg_marginal_rate": float(np.nanmean(schedule)) if schedule.size else np.nan,
+                    "top_marginal_rate": float(schedule[-1]) if schedule.size else np.nan,
+                    "progressivity": float(schedule[-1] - schedule[0]) if schedule.size else np.nan,
+                    "planner_reward_sum": float(np.sum(reward_slice)) if reward_slice.size else np.nan,
+                    "planner_reward_mean": float(np.mean(reward_slice)) if reward_slice.size else np.nan,
+                    "high_income_cutoff": high_income_cutoff,
+                })
+
+    return pd.DataFrame(rows)
+
+
+def plot_regional_composition_tax_coevolution(
+    log_or_run,
+    period=100,
+    visible_radius=5,
+    income_window=100,
+    rate_disc=0.05,
+    high_income_quantile=0.75,
+    figsize=(13, 9),
+):
+    """Plot regional composition, income, planner taxes, and planner rewards over time."""
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    df = regional_composition_tax_coevolution_table(
+        log_or_run,
+        period=period,
+        visible_radius=visible_radius,
+        income_window=income_window,
+        rate_disc=rate_disc,
+        high_income_quantile=high_income_quantile,
+    )
+    if df.empty:
+        raise ValueError("No regional co-evolution rows could be constructed.")
+
+    summary = (
+        df
+        .groupby(["tax_period", "planner_region"], as_index=False)
+        .agg(
+            n_agents=("n_agents", "mean"),
+            n_travelers=("n_travelers", "mean"),
+            high_income_agents=("high_income_agents", "mean"),
+            mean_period_coin_change=("mean_period_coin_change", "mean"),
+            total_period_coin_change=("total_period_coin_change", "mean"),
+            avg_marginal_rate=("avg_marginal_rate", "mean"),
+            top_marginal_rate=("top_marginal_rate", "mean"),
+            planner_reward_sum=("planner_reward_sum", "mean"),
+        )
+    )
+
+    colors = {"top": "#1f77b4", "bottom": "#ff7f0e"}
+    fig, axes = plt.subplots(4, 1, figsize=figsize, sharex=True, constrained_layout=True)
+
+    panels = [
+        ("high_income_agents", "High-income agents in region"),
+        ("mean_period_coin_change", "Mean period income / coin change"),
+        ("planner_reward_sum", "Planner reward over period"),
+    ]
+
+    for ax, (metric, ylabel) in zip(axes[:3], panels):
+        for region in ["top", "bottom"]:
+            dfr = summary[summary["planner_region"] == region].sort_values("tax_period")
+            ax.plot(
+                dfr["tax_period"],
+                dfr[metric],
+                marker="o",
+                linewidth=2,
+                color=colors[region],
+                label=region,
+            )
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+
+    ax_tax = axes[3]
+    for region in ["top", "bottom"]:
+        dfr = summary[summary["planner_region"] == region].sort_values("tax_period")
+        ax_tax.plot(
+            dfr["tax_period"],
+            dfr["avg_marginal_rate"],
+            marker="o",
+            linewidth=2,
+            color=colors[region],
+            label=f"{region} avg",
+        )
+        ax_tax.plot(
+            dfr["tax_period"],
+            dfr["top_marginal_rate"],
+            marker="^",
+            linewidth=1.7,
+            linestyle="--",
+            color=colors[region],
+            alpha=0.85,
+            label=f"{region} top bracket",
+        )
+    ax_tax.set_ylabel("tax rate")
+    ax_tax.set_xlabel("tax period")
+    ax_tax.grid(True, alpha=0.3)
+
+    axes[0].legend(title="region", ncol=2, frameon=True)
+    ax_tax.legend(title="tax series", ncol=2, frameon=True)
+    fig.suptitle("Regional Composition and Planner Tax Co-Evolution", fontsize=15, fontweight="bold")
+    return fig, df, summary
+
+
 def travel_regression_table_for_run(
     run,
     period=100,
@@ -12456,7 +13077,7 @@ def plot_region_residence_summary(obj, mode="auto", title=None, figsize=(11, 4.8
         labels=["top", "bottom"],
         autopct="%1.1f%%",
         startangle=90,
-        colors=["#1f77b4", "#ff7f0e"],
+        colors=["#1f77b4", "#d62728"],
         wedgeprops=dict(edgecolor="white", linewidth=1),
         textprops=dict(fontsize=10),
     )
@@ -12477,7 +13098,7 @@ def plot_region_residence_summary(obj, mode="auto", title=None, figsize=(11, 4.8
         x + width / 2,
         ordered["avg_stay_bottom"],
         width=width,
-        color="#ff7f0e",
+        color="#d62728",
         alpha=0.82,
         label="bottom",
     )
