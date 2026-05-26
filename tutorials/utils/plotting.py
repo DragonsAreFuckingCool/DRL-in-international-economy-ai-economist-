@@ -1982,13 +1982,12 @@ def compare_training_curves(
     elif isinstance(short_labels, list):
         short_labels = {name: short_labels[i] for i, name in enumerate(run_names)}
 
-    # Better contrast than default
+    # Run comparison palette: run 1 purple, run 2 orange, run 3 green.
     colors = [
-        "#1f77b4",  # blue
-        "#d62728",  # red
-        "#2ca02c",  # green
         "#9467bd",  # purple
         "#ff7f0e",  # orange
+        "#2ca02c",  # green
+        "#1f77b4",  # blue
         "#8c564b",  # brown
     ]
     linestyles = ["-"]
@@ -2042,7 +2041,7 @@ def compare_training_curves(
             y_all = []
             boundaries = []
             series_color = (
-                colors[(i * len(run_metric_series) + series_idx) % len(colors)]
+                colors[i % len(colors)]
                 if len(run_metric_series) > 1
                 else color
             )
@@ -2214,11 +2213,10 @@ def compare_equality_production_over_time(
         short_labels = {name: short_labels[i] for i, name in enumerate(run_names)}
 
     colors = [
-        "#1f77b4",
-        "#d62728",
-        "#2ca02c",
         "#9467bd",
         "#ff7f0e",
+        "#2ca02c",
+        "#1f77b4",
         "#8c564b",
     ]
 
@@ -2518,11 +2516,10 @@ def compare_redistribution_over_time(
                 )
 
     colors = [
-        "#1f77b4",
-        "#d62728",
-        "#2ca02c",
         "#9467bd",
         "#ff7f0e",
+        "#2ca02c",
+        "#1f77b4",
         "#8c564b",
     ]
 
@@ -3200,11 +3197,10 @@ def compare_summary_bars(
         short_labels = {name: short_labels[i] for i, name in enumerate(run_names)}
 
     colors_list = [
-        "#1f77b4",  # blue
-        "#d62728",  # red
-        "#2ca02c",  # green
         "#9467bd",  # purple
         "#ff7f0e",  # orange
+        "#2ca02c",  # green
+        "#1f77b4",  # blue
         "#8c564b",  # brown
     ]
     colors = {name: colors_list[i % len(colors_list)] for i, name in enumerate(run_names)}
@@ -3393,10 +3389,10 @@ def compare_trade_dynamics(
     elif isinstance(short_labels, list):
         short_labels = {name: short_labels[i] for i, name in enumerate(run_names)}
 
-    # consistent color palette (same as other plots)
+    # consistent run-comparison color palette
     colors_list = [
-        "#1f77b4", "#d62728", "#2ca02c", "#9467bd",
-        "#ff7f0e", "#8c564b", "#e377c2", "#17becf"
+        "#9467bd", "#ff7f0e", "#2ca02c", "#1f77b4",
+        "#8c564b", "#e377c2", "#17becf"
     ]
     colors = {name: colors_list[i % len(colors_list)] for i, name in enumerate(run_names)}
 
@@ -3626,8 +3622,8 @@ def compare_market_size_prices_trade_activity(
         short_labels = {name: short_labels[i] for i, name in enumerate(run_names)}
 
     colors_list = [
-        "#1f77b4", "#d62728", "#2ca02c", "#9467bd",
-        "#ff7f0e", "#8c564b", "#e377c2", "#17becf"
+        "#9467bd", "#ff7f0e", "#2ca02c", "#1f77b4",
+        "#8c564b", "#e377c2", "#17becf"
     ]
     colors = {name: colors_list[i % len(colors_list)] for i, name in enumerate(run_names)}
 
@@ -3829,6 +3825,141 @@ def extract_trade_region_distribution(log, volume_field="price"):
         ])
 
     return pd.DataFrame(rows)
+
+
+def _period_region_market_price_table(log, period=100):
+    """
+    Return period-region average market prices for within-region and cross-region trades.
+
+    ``local_market_price`` is the average price of within-region trades in the
+    agent's current region during the tax period. ``other_region_local_market_price``
+    is the corresponding within-region trade price in the other region.
+    ``other_minus_current_local_market_price`` is therefore the direct market-price
+    comparison between the destination/other region and the current region.
+    ``cross_region_market_price`` and ``cross_minus_local_market_price`` are also
+    retained as diagnostics for cross-region trades involving the current region.
+    """
+    import numpy as np
+    import pandas as pd
+
+    trades = extract_trade_region_distribution(log, volume_field="price")
+    regions = ["top", "bottom"]
+    n_steps = max(
+        len(log.get("states", [])),
+        len(log.get("Trade", [])),
+        1,
+    )
+    n_periods = int(np.ceil(n_steps / max(1, int(period))))
+
+    base = pd.DataFrame(
+        [
+            {"tax_period": tax_period, "location_region_start": region}
+            for tax_period in range(1, n_periods + 1)
+            for region in regions
+        ]
+    )
+
+    if trades.empty:
+        base["local_market_price"] = np.nan
+        base["cross_region_market_price"] = np.nan
+        base["period_local_market_price"] = np.nan
+        base["period_cross_region_market_price"] = np.nan
+        base["cross_minus_local_market_price"] = 0.0
+        return base
+
+    trades = trades.copy()
+    trades["tax_period"] = (trades["timestep"].astype(int) // int(period)) + 1
+    trades["price"] = pd.to_numeric(trades["price"], errors="coerce")
+    trades = trades.dropna(subset=["price"])
+    if trades.empty:
+        base["local_market_price"] = np.nan
+        base["cross_region_market_price"] = np.nan
+        base["period_local_market_price"] = np.nan
+        base["period_cross_region_market_price"] = np.nan
+        base["cross_minus_local_market_price"] = 0.0
+        return base
+
+    within = trades[trades["route_type"] == "within region"].copy()
+    if not within.empty:
+        within["location_region_start"] = within["buyer_region"].fillna(within["seller_region"])
+        within = (
+            within[within["location_region_start"].isin(regions)]
+            .groupby(["tax_period", "location_region_start"], as_index=False)
+            .agg(local_market_price=("price", "mean"))
+        )
+    else:
+        within = pd.DataFrame(columns=["tax_period", "location_region_start", "local_market_price"])
+
+    cross = trades[trades["route_type"] == "cross region"].copy()
+    cross_rows = []
+    for _, row in cross.iterrows():
+        involved = set()
+        if row.get("buyer_region") in regions:
+            involved.add(row["buyer_region"])
+        if row.get("seller_region") in regions:
+            involved.add(row["seller_region"])
+        for region in involved:
+            cross_rows.append(
+                {
+                    "tax_period": int(row["tax_period"]),
+                    "location_region_start": region,
+                    "price": float(row["price"]),
+                }
+            )
+    if cross_rows:
+        cross = (
+            pd.DataFrame(cross_rows)
+            .groupby(["tax_period", "location_region_start"], as_index=False)
+            .agg(cross_region_market_price=("price", "mean"))
+        )
+    else:
+        cross = pd.DataFrame(columns=["tax_period", "location_region_start", "cross_region_market_price"])
+
+    period_local = (
+        trades[trades["route_type"] == "within region"]
+        .groupby("tax_period", as_index=False)
+        .agg(period_local_market_price=("price", "mean"))
+    )
+    period_cross = (
+        trades[trades["route_type"] == "cross region"]
+        .groupby("tax_period", as_index=False)
+        .agg(period_cross_region_market_price=("price", "mean"))
+    )
+
+    out = base.merge(within, on=["tax_period", "location_region_start"], how="left")
+    out = out.merge(cross, on=["tax_period", "location_region_start"], how="left")
+    out = out.merge(period_local, on="tax_period", how="left")
+    out = out.merge(period_cross, on="tax_period", how="left")
+
+    other = within.rename(
+        columns={
+            "location_region_start": "other_region",
+            "local_market_price": "other_region_local_market_price",
+        }
+    )
+    out["other_region"] = out["location_region_start"].map({"top": "bottom", "bottom": "top"})
+    out = out.merge(
+        other[["tax_period", "other_region", "other_region_local_market_price"]],
+        on=["tax_period", "other_region"],
+        how="left",
+    )
+
+    local = out["local_market_price"].where(
+        out["local_market_price"].notna(),
+        out["period_local_market_price"],
+    )
+    other_local = out["other_region_local_market_price"].where(
+        out["other_region_local_market_price"].notna(),
+        out["period_local_market_price"],
+    )
+    cross_price = out["cross_region_market_price"].where(
+        out["cross_region_market_price"].notna(),
+        out["period_cross_region_market_price"],
+    )
+    out["other_minus_current_local_market_price"] = (other_local - local).fillna(0.0)
+    out["cross_minus_local_market_price"] = (cross_price - local).fillna(0.0)
+    return out
+
 
 def extract_planner_redistribution_table(log, period=100, rate_disc=0.05):
     """
@@ -5616,13 +5747,12 @@ def compare_gini(
     elif isinstance(short_labels, list):
         short_labels = {name: short_labels[i] for i, name in enumerate(run_names)}
 
-    # Same palette as other plots
+    # Run comparison palette: run 1 purple, run 2 orange, run 3 green.
     colors_list = [
-        "#1f77b4",  # blue
-        "#d62728",  # red
-        "#2ca02c",  # green
         "#9467bd",  # purple
         "#ff7f0e",  # orange
+        "#2ca02c",  # green
+        "#1f77b4",  # blue
         "#8c564b",  # brown
         "#e377c2",  # pink
         "#17becf",  # cyan
@@ -5815,11 +5945,10 @@ def compare_gini_over_tax_periods(
         short_labels = {name: short_labels[i] for i, name in enumerate(run_names)}
 
     colors_list = [
-        "#1f77b4",
-        "#d62728",
-        "#2ca02c",
         "#9467bd",
         "#ff7f0e",
+        "#2ca02c",
+        "#1f77b4",
         "#8c564b",
         "#e377c2",
         "#17becf",
@@ -6788,13 +6917,12 @@ def compare_avg_final_tax_schedules_two_planners(
 
     summary_rows = []
 
-    # high-contrast palette + distinct linestyles
+    # Run comparison palette + distinct linestyles.
     colors_list = [
-        "#1f77b4",  # blue
-        "#d62728",  # red
-        "#2ca02c",  # green
         "#9467bd",  # purple
         "#ff7f0e",  # orange
+        "#2ca02c",  # green
+        "#1f77b4",  # blue
         "#8c564b",  # brown
         "#e377c2",  # pink
         "#17becf",  # cyan
@@ -6971,6 +7099,248 @@ def compare_avg_final_tax_schedules_two_planners(
     return fig, out_df
 
 
+def compare_average_tax_schedules_by_setting(
+    runs,
+    env_obj,
+    brackets,
+    short_labels=None,
+    period=100,
+    top_first=True,
+    errorbar="std",
+    show_error=True,
+    figsize=(16, 7.5),
+):
+    """
+    Compare average marginal tax schedules across settings.
+
+    Panel A averages each bracket's marginal tax rate over tax periods and dense
+    logs. Panel B plots each non-baseline setting minus the first run.
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    run_names = [run.get("name", f"Run {i + 1}") for i, run in enumerate(runs)]
+    if short_labels is None:
+        defaults = ["Base", "Trade", "Travel"]
+        short_labels = {
+            name: defaults[i] if i < len(defaults) else f"Run {i + 1}"
+            for i, name in enumerate(run_names)
+        }
+    elif isinstance(short_labels, list):
+        short_labels = {name: short_labels[i] for i, name in enumerate(run_names)}
+
+    colors = [
+        "#9467bd",  # Base / run 1
+        "#ff7f0e",  # Trade / run 2
+        "#2ca02c",  # Travel / run 3
+        "#1f77b4",
+        "#8c564b",
+    ]
+
+    rows = []
+    for run_idx, run in enumerate(runs):
+        run_name = run_names[run_idx]
+        for rollout_id, dense_log in _dense_log_items(run):
+            ptop_rates, pbot_rates = _tax_rate_matrices(dense_log, env_obj, top_first=top_first)
+            states = dense_log.get("states", [])
+            tax_days = list(range(period - 1, len(states), period))
+            if not tax_days:
+                n_decisions = max(ptop_rates.shape[0], pbot_rates.shape[0])
+                tax_days = list(range(1, n_decisions + 1))
+
+            def tax_day_to_decision_idx(tax_day, rate_matrix):
+                if rate_matrix.shape[0] == len(tax_days):
+                    return min(int(tax_day) - 1, rate_matrix.shape[0] - 1)
+                if len(tax_days) == 1 or rate_matrix.shape[0] == 1:
+                    return 0
+                frac = (tax_day - tax_days[0]) / (tax_days[-1] - tax_days[0])
+                return int(np.clip(round(frac * (rate_matrix.shape[0] - 1)), 0, rate_matrix.shape[0] - 1))
+
+            for region, planner_id, rate_matrix in [
+                ("top", "p_top", ptop_rates),
+                ("bottom", "p_bottom", pbot_rates),
+            ]:
+                for tax_period, tax_day in enumerate(tax_days, start=1):
+                    decision_idx = tax_day_to_decision_idx(tax_day, rate_matrix)
+                    rates = np.asarray(rate_matrix[decision_idx], dtype=float)
+                    for bracket_idx, rate in enumerate(rates):
+                        rows.append({
+                            "run": run_name,
+                            "label": short_labels.get(run_name, run_name),
+                            "run_idx": run_idx,
+                            "rollout_id": rollout_id,
+                            "tax_period": tax_period,
+                            "planner_region": region,
+                            "planner_id": planner_id,
+                            "bracket_idx": bracket_idx,
+                            "rate": float(rate),
+                        })
+
+    raw_df = pd.DataFrame(rows)
+    if raw_df.empty:
+        raise ValueError("No tax schedules could be constructed from these runs.")
+
+    summary = (
+        raw_df
+        .groupby(["run", "label", "run_idx", "planner_region", "planner_id", "bracket_idx"], as_index=False)
+        .agg(
+            rate=("rate", "mean"),
+            rate_std=("rate", "std"),
+            n_observations=("rate", "count"),
+        )
+    )
+    summary["rate_std"] = summary["rate_std"].fillna(0.0)
+    summary["rate_sem"] = np.divide(
+        summary["rate_std"],
+        np.sqrt(summary["n_observations"].clip(lower=1)),
+    )
+    err_col = None
+    if errorbar == "std":
+        err_col = "rate_std"
+    elif errorbar == "sem":
+        err_col = "rate_sem"
+    elif errorbar is None:
+        err_col = None
+    else:
+        raise ValueError("errorbar must be None, 'std', or 'sem'.")
+
+    if len(run_names) < 2:
+        raise ValueError("Need at least two runs to plot difference from baseline.")
+
+    baseline_name = run_names[0]
+    baseline = (
+        summary[summary["run"] == baseline_name]
+        .set_index(["planner_region", "bracket_idx"])
+    )
+    diff_rows = []
+    for run_idx, run_name in enumerate(run_names[1:], start=1):
+        dfr = summary[summary["run"] == run_name]
+        for _, row in dfr.iterrows():
+            key = (row["planner_region"], row["bracket_idx"])
+            if key not in baseline.index:
+                continue
+            base_row = baseline.loc[key]
+            base_err = float(base_row[err_col]) if err_col is not None else 0.0
+            run_err = float(row[err_col]) if err_col is not None else 0.0
+            diff_rows.append({
+                "run": run_name,
+                "label": row["label"],
+                "run_idx": run_idx,
+                "planner_region": row["planner_region"],
+                "planner_id": row["planner_id"],
+                "bracket_idx": int(row["bracket_idx"]),
+                "rate_diff": float(row["rate"] - base_row["rate"]),
+                "rate_diff_error": float(np.sqrt(run_err ** 2 + base_err ** 2)),
+            })
+    diff_df = pd.DataFrame(diff_rows)
+
+    n_runs = len(run_names)
+    n_diff = max(1, n_runs - 1)
+    if figsize == (16, 7.5):
+        figsize = (14, 11)
+    fig = plt.figure(figsize=figsize, constrained_layout=True)
+    outer = fig.add_gridspec(2, 1, height_ratios=[1.0, 1.0], hspace=0.18)
+    gs_a = outer[0].subgridspec(2, n_runs, hspace=0.25, wspace=0.16)
+    gs_b = outer[1].subgridspec(2, n_diff, hspace=0.25, wspace=0.16)
+
+    axes_a = np.empty((2, n_runs), dtype=object)
+    axes_b = np.empty((2, n_diff), dtype=object)
+    regions = [("top", "Top planner"), ("bottom", "Bottom planner")]
+    bracket_count = int(raw_df["bracket_idx"].max()) + 1
+    x = np.arange(bracket_count)
+    tick_labels = [rf"$\tau^{{{i + 1}}}$" for i in range(bracket_count)]
+
+    for row_idx, (region, row_label) in enumerate(regions):
+        for run_idx, run_name in enumerate(run_names):
+            ax = fig.add_subplot(gs_a[row_idx, run_idx])
+            axes_a[row_idx, run_idx] = ax
+            dfr = (
+                summary[
+                    (summary["run"] == run_name)
+                    & (summary["planner_region"] == region)
+                ]
+                .sort_values("bracket_idx")
+            )
+            color = colors[run_idx % len(colors)]
+            y = dfr["rate"].to_numpy(dtype=float)
+            err = dfr[err_col].to_numpy(dtype=float) if err_col is not None else np.zeros_like(y)
+            ax.plot(x[:len(y)], y, marker="o", linewidth=2.1, color=color)
+            if show_error and err_col is not None:
+                ax.fill_between(x[:len(y)], y - err, y + err, color=color, alpha=0.16, linewidth=0)
+            ax.set_title(short_labels.get(run_name, run_name), fontsize=10)
+            if run_idx == 0:
+                ax.set_ylabel(f"{row_label}\nmarginal tax rate")
+            ax.set_xticks(x)
+            ax.set_xticklabels(tick_labels, fontsize=8)
+            ax.set_ylim(0, 1)
+            ax.grid(True, alpha=0.25)
+
+        for diff_idx, run_name in enumerate(run_names[1:]):
+            ax = fig.add_subplot(gs_b[row_idx, diff_idx])
+            axes_b[row_idx, diff_idx] = ax
+            dfr = (
+                diff_df[
+                    (diff_df["run"] == run_name)
+                    & (diff_df["planner_region"] == region)
+                ]
+                .sort_values("bracket_idx")
+            )
+            color = colors[(diff_idx + 1) % len(colors)]
+            y = dfr["rate_diff"].to_numpy(dtype=float)
+            err = dfr["rate_diff_error"].to_numpy(dtype=float)
+            avg_diff = float(np.nanmean(y)) if np.any(np.isfinite(y)) else np.nan
+            ax.axhline(0, color="0.25", linestyle="--", linewidth=1.0)
+            ax.plot(x[:len(y)], y, marker="o", linewidth=2.1, color=color)
+            if show_error and err_col is not None:
+                ax.fill_between(x[:len(y)], y - err, y + err, color=color, alpha=0.16, linewidth=0)
+            avg_text = "avg diff: n/a" if not np.isfinite(avg_diff) else f"avg diff: {avg_diff:+.3f}"
+            ax.text(
+                0.97,
+                0.94,
+                avg_text,
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=8.5,
+                bbox=dict(facecolor="white", edgecolor="none", alpha=0.78),
+            )
+            ax.set_title(f"{short_labels.get(run_name, run_name)} - {short_labels.get(baseline_name, baseline_name)}", fontsize=10)
+            if diff_idx == 0:
+                ax.set_ylabel(f"{row_label}\ndifference")
+            ax.set_xticks(x)
+            ax.set_xticklabels(tick_labels, fontsize=8)
+            finite = np.abs(y[np.isfinite(y)])
+            if len(finite):
+                lim = max(0.05, float(np.nanmax(finite)) * 1.25)
+                ax.set_ylim(-lim, lim)
+            ax.grid(True, alpha=0.25)
+
+    axes_a[0, max(0, n_runs // 2)].text(
+        0.5,
+        1.24,
+        "Panel A: average tax schedule by bracket",
+        transform=axes_a[0, max(0, n_runs // 2)].transAxes,
+        ha="center",
+        va="bottom",
+        fontsize=12,
+        fontweight="bold",
+    )
+    axes_b[0, max(0, n_diff // 2)].text(
+        0.5,
+        1.24,
+        "Panel B: difference from baseline",
+        transform=axes_b[0, max(0, n_diff // 2)].transAxes,
+        ha="center",
+        va="bottom",
+        fontsize=12,
+        fontweight="bold",
+    )
+    fig.suptitle("Tax Schedules Compared Across Settings", fontsize=15, fontweight="bold")
+
+    return fig, summary, diff_df, raw_df
+
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -6982,6 +7352,22 @@ except ModuleNotFoundError:
 
 
 def _extract_logs_from_run(run):
+    if isinstance(run, (list, tuple)):
+        logs = {}
+        for run_idx, item in enumerate(run):
+            if isinstance(item, dict) and isinstance(item.get("states"), list):
+                logs[f"run{run_idx}_log0"] = item
+                continue
+            for log_key, dense_log in _extract_logs_from_run(item).items():
+                logs[f"run{run_idx}_{log_key}"] = dense_log
+        return logs
+
+    if isinstance(run, dict) and isinstance(run.get("states"), list):
+        return {0: run}
+
+    if not isinstance(run, dict):
+        return {}
+
     if "dense_logs" in run:
         obj = run["dense_logs"]
     elif "dense_log" in run:
@@ -7295,6 +7681,22 @@ except ModuleNotFoundError:
 
 
 def _extract_logs_from_run(run):
+    if isinstance(run, (list, tuple)):
+        logs = {}
+        for run_idx, item in enumerate(run):
+            if isinstance(item, dict) and isinstance(item.get("states"), list):
+                logs[f"run{run_idx}_log0"] = item
+                continue
+            for log_key, dense_log in _extract_logs_from_run(item).items():
+                logs[f"run{run_idx}_{log_key}"] = dense_log
+        return logs
+
+    if isinstance(run, dict) and isinstance(run.get("states"), list):
+        return {0: run}
+
+    if not isinstance(run, dict):
+        return {}
+
     if "dense_logs" in run:
         obj = run["dense_logs"]
     elif "dense_log" in run:
@@ -9017,6 +9419,7 @@ def plot_tax_bracket_snapshots_compact_average(
     axes = np.asarray(axes).reshape(n_rows, n_cols)
 
     bracket_x = np.arange(len(labels))
+    bracket_tick_labels = [rf"$\tau^{{{i + 1}}}$" for i in range(len(labels))]
     max_count = max(1.0, float((counts["n_agents"] + counts["n_agents_std"]).max()))
 
     configs = [
@@ -9141,12 +9544,32 @@ def plot_tax_bracket_snapshots_compact_average(
                 )
                 axr.set_ylabel("tax rate")
 
-            ax.set_title(f"{planner_id}\ntax day {int(tax_day)}", fontsize=10)
+            ax.set_title(f"tax day {int(tax_day)}", fontsize=10)
             ax.set_xticks(bracket_x)
-            ax.set_xticklabels([f"b{i}" for i in range(len(labels))], fontsize=8)
+            ax.set_xticklabels(bracket_tick_labels, fontsize=8)
             ax.grid(True, axis="y", alpha=0.25)
 
     suffix = "mean +/- SD" if show_std else "mean"
+    axes[0, n_cols // 2].text(
+        0.5,
+        1.12,
+        "p_top",
+        transform=axes[0, n_cols // 2].transAxes,
+        ha="center",
+        va="bottom",
+        fontsize=13,
+        fontweight="bold",
+    )
+    axes[2, n_cols // 2].text(
+        0.5,
+        1.12,
+        "p_bottom",
+        transform=axes[2, n_cols // 2].transAxes,
+        ha="center",
+        va="bottom",
+        fontsize=13,
+        fontweight="bold",
+    )
     fig.suptitle(
         f"Average Tax-Day Snapshots Across Dense Logs ({suffix})",
         fontsize=14,
@@ -9437,6 +9860,138 @@ def plot_tax_bracket_correlation_outcomes_average(
         fontsize=14,
         fontweight="bold",
     )
+    return fig, summary, raw_df
+
+
+def plot_average_tax_rate_outcomes_average(
+    run,
+    env_obj,
+    brackets,
+    period=100,
+    top_first=True,
+    exclude_highest_bracket=True,
+    min_tax_period=1,
+    figsize=(12, 5),
+):
+    """
+    Plot equality/production against the average marginal tax rate.
+
+    The average tax rate is computed across the included tax brackets for each
+    rollout, tax period, and planner region, then averaged across dense logs.
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    _, raw_df = tax_bracket_correlation_outcome_table_average(
+        run,
+        env_obj,
+        brackets,
+        period=period,
+        top_first=top_first,
+        exclude_highest_bracket=exclude_highest_bracket,
+        min_tax_period=min_tax_period,
+    )
+
+    summary = (
+        raw_df
+        .groupby(["tax_day_number", "planner_region", "planner_id"], as_index=False)
+        .agg(
+            avg_tax_rate=("mean_tax_rate_included", "mean"),
+            avg_tax_rate_std=("mean_tax_rate_included", "std"),
+            equality=("equality", "mean"),
+            equality_std=("equality", "std"),
+            production=("production", "mean"),
+            production_std=("production", "std"),
+            n_dense_logs=("mean_tax_rate_included", "count"),
+            n_brackets_included=("n_brackets_included", "max"),
+        )
+    )
+    for col in [c for c in summary.columns if c.endswith("_std")]:
+        summary[col] = summary[col].fillna(0.0)
+
+    colors = {"top": "#1f77b4", "bottom": "#d62728"}
+    fig, (ax_eq, ax_prod) = plt.subplots(1, 2, figsize=figsize, constrained_layout=True)
+
+    for region in ["top", "bottom"]:
+        dfr = summary[summary["planner_region"] == region].sort_values("tax_day_number")
+        if dfr.empty:
+            continue
+        color = colors[region]
+        x = dfr["avg_tax_rate"].to_numpy(dtype=float)
+
+        ax_eq.scatter(
+            x,
+            dfr["equality"],
+            s=54,
+            color=color,
+            edgecolor="white",
+            linewidth=0.8,
+            alpha=0.9,
+            label=region,
+        )
+        ax_prod.scatter(
+            x,
+            dfr["production"],
+            s=54,
+            color=color,
+            edgecolor="white",
+            linewidth=0.8,
+            alpha=0.9,
+            label=region,
+        )
+
+        for _, row in dfr.iterrows():
+            ax_eq.annotate(
+                str(int(row["tax_day_number"])),
+                (row["avg_tax_rate"], row["equality"]),
+                fontsize=8,
+                xytext=(3, 3),
+                textcoords="offset points",
+                color=color,
+            )
+            ax_prod.annotate(
+                str(int(row["tax_day_number"])),
+                (row["avg_tax_rate"], row["production"]),
+                fontsize=8,
+                xytext=(3, 3),
+                textcoords="offset points",
+                color=color,
+            )
+
+    for ax, metric in [(ax_eq, "equality"), (ax_prod, "production")]:
+        trend_df = summary[["avg_tax_rate", metric]].dropna()
+        if len(trend_df) >= 2 and trend_df["avg_tax_rate"].nunique() >= 2:
+            xfit = trend_df["avg_tax_rate"].to_numpy(dtype=float)
+            yfit = trend_df[metric].to_numpy(dtype=float)
+            slope, intercept = np.polyfit(xfit, yfit, 1)
+            xs = np.linspace(float(np.nanmin(xfit)), float(np.nanmax(xfit)), 100)
+            ax.plot(xs, slope * xs + intercept, color="0.2", linewidth=1.8, linestyle="--")
+
+    ax_eq.set_title("Equality vs Average Tax Rate")
+    ax_eq.set_xlabel("average tax rate across included brackets")
+    ax_eq.set_ylabel("equality")
+    ax_eq.grid(True, alpha=0.25)
+    ax_eq.legend(frameon=True)
+
+    ax_prod.set_title("Production vs Average Tax Rate")
+    ax_prod.set_xlabel("average tax rate across included brackets")
+    ax_prod.set_ylabel("production")
+    ax_prod.grid(True, alpha=0.25)
+    ax_prod.legend(frameon=True)
+
+    bracket_note = "excluding highest bracket" if exclude_highest_bracket else "including all brackets"
+    period_note = (
+        f", tax periods >= {int(min_tax_period)}"
+        if int(min_tax_period) > 1
+        else ""
+    )
+    fig.suptitle(
+        f"Average Tax Rate vs Equality and Production ({bracket_note}{period_note})",
+        fontsize=14,
+        fontweight="bold",
+    )
+
     return fig, summary, raw_df
 
 
@@ -11082,6 +11637,37 @@ def extract_tax_period_travel_context_table(
     )
     agg["period_coin_change"] = agg["period_end_coin"] - agg["period_start_coin"]
     agg["did_travel"] = agg["did_travel"].astype(bool)
+
+    market_df = _period_region_market_price_table(log, period=period)
+    if not market_df.empty:
+        agg = agg.merge(
+            market_df[
+                [
+                    "tax_period",
+                    "location_region_start",
+                    "local_market_price",
+                    "other_region_local_market_price",
+                    "other_minus_current_local_market_price",
+                    "cross_region_market_price",
+                    "cross_minus_local_market_price",
+                ]
+            ],
+            on=["tax_period", "location_region_start"],
+            how="left",
+        )
+    for col in [
+        "local_market_price",
+        "other_region_local_market_price",
+        "other_minus_current_local_market_price",
+        "cross_region_market_price",
+        "cross_minus_local_market_price",
+    ]:
+        if col not in agg:
+            agg[col] = np.nan
+    agg["other_minus_current_local_market_price"] = agg[
+        "other_minus_current_local_market_price"
+    ].fillna(0.0)
+    agg["cross_minus_local_market_price"] = agg["cross_minus_local_market_price"].fillna(0.0)
     return agg
 
 
@@ -11111,11 +11697,14 @@ def _dense_log_items(log_or_run):
         ]
 
     if isinstance(log_or_run, (list, tuple)):
-        return [
-            (i, v)
-            for i, v in enumerate(log_or_run)
-            if isinstance(v, dict) and isinstance(v.get("states"), list)
-        ]
+        items = []
+        for outer_idx, value in enumerate(log_or_run):
+            if isinstance(value, dict) and isinstance(value.get("states"), list):
+                items.append((f"run{outer_idx}_log0", value))
+                continue
+            for inner_key, dense_log in _dense_log_items(value):
+                items.append((f"run{outer_idx}_{inner_key}", dense_log))
+        return items
 
     return []
 
@@ -11394,6 +11983,143 @@ def plot_travel_timeline_by_agent(log, figsize=(12, 3.5)):
     return fig
 
 
+def average_travel_count_table(run_or_log):
+    """Return per-rollout, per-agent travel counts with build skill labels."""
+    import numpy as np
+    import pandas as pd
+
+    log_items = _dense_log_items(run_or_log)
+    if not log_items:
+        raise ValueError("No dense logs found. Pass a run dict, dense_logs, or a dense log.")
+
+    first_log = log_items[0][1]
+    first_aids = _numeric_agent_ids(first_log)
+    skill_values = sorted({
+        float(first_log["states"][0][str(aid)].get("build_payment", np.nan))
+        for aid in first_aids
+        if np.isfinite(float(first_log["states"][0][str(aid)].get("build_payment", np.nan)))
+    })
+    skill_rank = {skill: i + 1 for i, skill in enumerate(skill_values)}
+
+    rows = []
+    for rollout_id, log in log_items:
+        aids = _numeric_agent_ids(log)
+        travel_by_agent = _travel_events_by_agent(log)
+        for aid in aids:
+            skill = float(log["states"][0][str(aid)].get("build_payment", np.nan))
+            if np.isfinite(skill) and skill in skill_rank:
+                skill_group = f"skill {skill_rank[skill]} ({skill:.0f})"
+            elif np.isfinite(skill):
+                skill_group = f"skill ? ({skill:.0f})"
+            else:
+                skill_group = "skill ?"
+            rows.append({
+                "rollout_id": rollout_id,
+                "agent": int(aid),
+                "build_payment": skill,
+                "skill_group": skill_group,
+                "travel_count": int(len(travel_by_agent.get(int(aid), []))),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def plot_average_travel_count(
+    run_or_log,
+    group_by="agent",
+    show_std=True,
+    figsize=(10, 4.8),
+):
+    """
+    Plot average travel count across dense logs by agent or build-skill group.
+
+    Parameters
+    ----------
+    run_or_log : run dict, dense_logs object, or dense log
+    group_by : {"agent", "skill"}
+        ``agent`` averages each agent's travel count across dense logs.
+        ``skill`` first sums travel counts within each skill group per rollout,
+        then averages those group totals across dense logs.
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    raw_df = average_travel_count_table(run_or_log)
+    if raw_df.empty:
+        raise ValueError("No travel-count rows could be constructed.")
+
+    group_by = str(group_by).lower()
+    if group_by not in {"agent", "skill"}:
+        raise ValueError("group_by must be 'agent' or 'skill'.")
+
+    if group_by == "agent":
+        summary = (
+            raw_df
+            .groupby(["agent", "build_payment", "skill_group"], as_index=False)
+            .agg(
+                travel_count=("travel_count", "mean"),
+                travel_count_std=("travel_count", "std"),
+                n_dense_logs=("travel_count", "count"),
+            )
+            .sort_values("agent")
+        )
+        summary["travel_count_std"] = summary["travel_count_std"].fillna(0.0)
+        labels = [str(int(a)) for a in summary["agent"]]
+        colors = [
+            _make_agent_colors(summary["agent"].astype(int).tolist()).get(int(a), "0.5")
+            for a in summary["agent"]
+        ]
+        title = "Average Travel Count by Agent"
+        xlabel = "agent"
+    else:
+        per_rollout_skill = (
+            raw_df
+            .groupby(["rollout_id", "build_payment", "skill_group"], as_index=False)
+            .agg(travel_count=("travel_count", "sum"))
+        )
+        summary = (
+            per_rollout_skill
+            .groupby(["build_payment", "skill_group"], as_index=False)
+            .agg(
+                travel_count=("travel_count", "mean"),
+                travel_count_std=("travel_count", "std"),
+                n_dense_logs=("travel_count", "count"),
+            )
+            .sort_values("build_payment")
+        )
+        summary["travel_count_std"] = summary["travel_count_std"].fillna(0.0)
+        labels = summary["skill_group"].tolist()
+        colors = _make_agent_colors(range(max(1, len(summary))))
+        title = "Average Total Travel Count by Skill Group"
+        xlabel = "skill group"
+
+    x = np.arange(len(summary))
+    y = summary["travel_count"].to_numpy(dtype=float)
+    yerr = summary["travel_count_std"].to_numpy(dtype=float)
+
+    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+    ax.bar(
+        x,
+        y,
+        yerr=yerr if show_std else None,
+        color=colors,
+        alpha=0.84,
+        edgecolor="white",
+        linewidth=0.8,
+        capsize=4 if show_std else 0,
+        ecolor="0.25",
+    )
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("travel events")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=0)
+    ax.grid(True, axis="y", alpha=0.25)
+
+    return fig, summary, raw_df
+
+
 def _tax_schedules_by_region_period(log, period=100, rate_disc=0.05):
     """Return regional schedules keyed by tax period using tax logs when present."""
     import numpy as np
@@ -11648,6 +12374,215 @@ def plot_tax_travel_counterfactuals(
 
     fig.suptitle("Tax Context of Travel Decisions", fontsize=16, fontweight="bold")
     return fig, df
+
+
+def plot_tax_period_travel_combined_dashboard(
+    log,
+    period=100,
+    visible_radius=5,
+    income_window=100,
+    rate_disc=0.05,
+    figsize=(17, 15),
+):
+    """
+    Combined tax-period travel context figure.
+
+    The top panels contain boxplots comparing travel and non-travel periods.
+    The bottom panel shows the current-region versus other-region tax-due scatter plot.
+
+    Usage:
+        fig, df, summary_df = plotting.plot_tax_period_travel_combined_dashboard(run)
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    df = tax_period_travel_counterfactual_table_from_dense_logs(
+        log,
+        period=period,
+        visible_radius=visible_radius,
+        income_window=income_window,
+        rate_disc=rate_disc,
+    )
+    if df.empty:
+        raise ValueError("No agent-period counterfactual tax rows could be constructed.")
+
+    box_features = [
+        "skill_build_payment",
+        "period_coin_change",
+        "mean_coin",
+        "current_region_avg_tax",
+        "other_minus_current_local_market_price",
+        "mean_visible_resources",
+        "mean_visible_own_houses",
+        "mean_visible_other_houses",
+    ]
+    feature_labels = {
+        "skill_build_payment": "skill level",
+        "period_coin_change": "period income / coin change",
+        "mean_coin": "mean coin",
+        "current_region_avg_tax": "average tax faced",
+        "other_minus_current_local_market_price": "other minus current local market price",
+        "mean_visible_resources": "visible resources during period",
+        "mean_visible_own_houses": "visible own houses during period",
+        "mean_visible_other_houses": "visible other agents' houses during period",
+    }
+    box_titles = {
+        "skill_build_payment": "Skill Level",
+        "period_coin_change": "Period Income / Coin Change",
+        "mean_coin": "Mean Coin",
+        "current_region_avg_tax": "Average Tax Faced",
+        "other_minus_current_local_market_price": "Other Minus Current Local Market Price",
+        "mean_visible_resources": "Visible Resources During Period",
+        "mean_visible_own_houses": "Visible Own Houses During Period",
+        "mean_visible_other_houses": "Visible Other Agents' Houses During Period",
+    }
+    ylabels = {
+        "skill_build_payment": "skill",
+        "period_coin_change": "coin change",
+        "mean_coin": "coin",
+        "current_region_avg_tax": "average marginal tax rate",
+        "other_minus_current_local_market_price": "price difference",
+        "mean_visible_resources": "wood + stone",
+        "mean_visible_own_houses": "count",
+        "mean_visible_other_houses": "count",
+    }
+
+    travel_color = "#c92a2a"
+    nontravel_color = "0.72"
+
+    fig = plt.figure(figsize=figsize, constrained_layout=True)
+    gs = fig.add_gridspec(
+        3,
+        4,
+        height_ratios=[1.0, 1.0, 1.35],
+        width_ratios=[1.0, 1.0, 1.0, 1.0],
+    )
+
+    n_rollouts = df["rollout_id"].nunique()
+    box_df = df
+    if n_rollouts > 1:
+        box_df = (
+            df.groupby(["rollout_id", "did_travel"], as_index=False)[box_features]
+            .mean()
+        )
+
+    summary_df = (
+        box_df
+        .groupby("did_travel", as_index=False)[box_features]
+        .mean()
+        .rename(columns={False: "no_travel", True: "travel"})
+    )
+
+    def grouped_box(ax, feature):
+        data = [
+            box_df.loc[~box_df["did_travel"], feature].dropna().to_numpy(dtype=float),
+            box_df.loc[box_df["did_travel"], feature].dropna().to_numpy(dtype=float),
+        ]
+        bp = ax.boxplot(
+            data,
+            labels=["no travel\nin period", "travel\nin period"],
+            patch_artist=True,
+            showfliers=False,
+            showmeans=True,
+            meanline=True,
+            meanprops=dict(color="black", linewidth=2.4, linestyle="-"),
+            medianprops=dict(linewidth=0),
+        )
+        for patch, color in zip(bp["boxes"], [nontravel_color, travel_color]):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.55)
+        ax.set_title(box_titles[feature])
+        ax.set_ylabel(ylabels[feature])
+        ax.grid(True, axis="y", alpha=0.25)
+
+    for idx, feature in enumerate(box_features):
+        row = idx // 4
+        col = idx % 4
+        ax = fig.add_subplot(gs[row, col])
+        grouped_box(ax, feature)
+
+    ax_scatter = fig.add_subplot(gs[2, :])
+    plot_df = df.dropna(
+        subset=["current_region_tax_due", "other_region_tax_due", "taxable_period_income"]
+    )
+    if not plot_df.empty:
+        sc = None
+        for did_travel, size, edgecolor, linewidth, alpha in [
+            (False, 32, "white", 0.5, 0.35),
+            (True, 70, travel_color, 1.5, 0.9),
+        ]:
+            dfr = plot_df[plot_df["did_travel"] == did_travel]
+            if dfr.empty:
+                continue
+            sc = ax_scatter.scatter(
+                dfr["current_region_tax_due"],
+                dfr["other_region_tax_due"],
+                c=dfr["taxable_period_income"],
+                cmap="viridis",
+                s=size,
+                marker="o",
+                edgecolor=edgecolor,
+                linewidth=linewidth,
+                alpha=alpha,
+            )
+        lo = float(
+            np.nanmin(
+                [
+                    plot_df["current_region_tax_due"].min(),
+                    plot_df["other_region_tax_due"].min(),
+                ]
+            )
+        )
+        hi = float(
+            np.nanmax(
+                [
+                    plot_df["current_region_tax_due"].max(),
+                    plot_df["other_region_tax_due"].max(),
+                ]
+            )
+        )
+        pad = max(1.0, 0.05 * (hi - lo))
+        ax_scatter.plot(
+            [lo - pad, hi + pad],
+            [lo - pad, hi + pad],
+            color="0.35",
+            linestyle="--",
+            linewidth=1,
+        )
+        ax_scatter.set_xlim(lo - pad, hi + pad)
+        ax_scatter.set_ylim(lo - pad, hi + pad)
+        trend = plot_df.loc[
+            plot_df["did_travel"],
+            ["current_region_tax_due", "other_region_tax_due"],
+        ].dropna()
+        if len(trend) >= 2 and trend["current_region_tax_due"].nunique() >= 2:
+            xfit = trend["current_region_tax_due"].to_numpy(dtype=float)
+            yfit = trend["other_region_tax_due"].to_numpy(dtype=float)
+            slope, intercept = np.polyfit(xfit, yfit, 1)
+            xs = np.linspace(float(np.min(xfit)), float(np.max(xfit)), 100)
+            ax_scatter.plot(
+                xs,
+                slope * xs + intercept,
+                color="0.15",
+                linewidth=2.2,
+                alpha=0.9,
+                label="travel-point least-squares fit",
+            )
+            ax_scatter.legend(loc="best", frameon=True)
+        if sc is not None:
+            fig.colorbar(sc, ax=ax_scatter, label="period income / coin change")
+
+    ax_scatter.set_title("Current-Region Tax Due vs Other-Region Tax Due")
+    ax_scatter.set_xlabel("tax due in current region")
+    ax_scatter.set_ylabel("tax due in other region")
+    ax_scatter.grid(True, alpha=0.25)
+
+    fig.suptitle(
+        "Tax-Period Travel Context and Counterfactual Tax Burden",
+        fontsize=16,
+        fontweight="bold",
+    )
+    return fig, df, summary_df
 
 
 def relocation_tax_event_study_table(
@@ -12092,6 +13027,7 @@ def plot_travel_probability_regression(
     base_features = [
         "mean_coin",
         "period_coin_change",
+        "other_minus_current_local_market_price",
         "mean_visible_resources",
         "mean_visible_other_houses",
         "mean_visible_own_houses",
@@ -12100,6 +13036,7 @@ def plot_travel_probability_regression(
     within_agent_features = [
         "mean_coin",
         "period_coin_change",
+        "other_minus_current_local_market_price",
         "mean_visible_resources",
         "mean_visible_other_houses",
         "mean_visible_own_houses",
@@ -12107,6 +13044,7 @@ def plot_travel_probability_regression(
     feature_labels = {
         "mean_coin": "Mean coin",
         "period_coin_change": "Period income / coin change",
+        "other_minus_current_local_market_price": "Other minus current local market price",
         "mean_visible_resources": "Visible resources",
         "mean_visible_other_houses": "Visible other houses",
         "mean_visible_own_houses": "Visible own houses",
@@ -12894,7 +13832,7 @@ def plot_travel_probability_by_skill(
     coefficient_table["feature_label"] = coefficient_table["feature"].map(labels)
 
     n_cols = 3
-    n_rows = 2
+    n_rows = int(np.ceil(len(features) / n_cols))
     fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False, constrained_layout=True)
     axes_flat = axes.ravel()
     colors = _make_agent_colors(range(max(1, len(skill_values))))
@@ -13129,6 +14067,171 @@ def plot_region_residence_summary(obj, mode="auto", title=None, figsize=(11, 4.8
     fig.suptitle(f"Region Residence Summary: {title}", fontsize=14, fontweight="bold")
 
     return fig, df, raw_df
+
+
+def plot_region_residence_summary_for_runs(
+    runs,
+    short_labels=None,
+    mode="average",
+    figsize_per_run=(11, 4.2),
+):
+    """
+    Plot region residence summaries for every run in a list.
+
+    Each row is one run and contains the same two panels as
+    ``plot_region_residence_summary``: total top/bottom residence share and
+    average stay length by agent. The number of rows follows ``len(runs)``.
+    """
+    import math
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    if not isinstance(runs, (list, tuple)) or len(runs) == 0:
+        raise ValueError("Pass a non-empty list of runs, e.g. runs_travel.")
+
+    run_names = [
+        run.get("name", f"Run {i + 1}") if isinstance(run, dict) else f"Run {i + 1}"
+        for i, run in enumerate(runs)
+    ]
+    if short_labels is None:
+        short_labels = {name: f"Run {i + 1}" for i, name in enumerate(run_names)}
+    elif isinstance(short_labels, list):
+        short_labels = {name: short_labels[i] for i, name in enumerate(run_names)}
+
+    if mode not in {"single", "average"}:
+        raise ValueError("mode must be 'single' or 'average'.")
+
+    summary_frames = []
+    raw_frames = []
+
+    for run_idx, run in enumerate(runs):
+        run_name = run_names[run_idx]
+        logs = _extract_logs_from_run(run)
+        if not logs and isinstance(run, dict) and "states" in run:
+            logs = {0: run}
+        if not logs:
+            continue
+
+        selected_logs = {next(iter(logs)): logs[next(iter(logs))]} if mode == "single" else logs
+        tables = [
+            region_residence_table(log).assign(
+                run=run_name,
+                label=short_labels.get(run_name, run_name),
+                run_idx=run_idx,
+                log_key=log_key,
+            )
+            for log_key, log in selected_logs.items()
+        ]
+        if not tables:
+            continue
+
+        raw_one = pd.concat(tables, ignore_index=True)
+        raw_frames.append(raw_one)
+
+        if mode == "average":
+            summary_one = (
+                raw_one
+                .groupby(["run", "label", "run_idx", "agent"], as_index=False)
+                .agg(
+                    time_top=("time_top", "mean"),
+                    time_bottom=("time_bottom", "mean"),
+                    share_top=("share_top", "mean"),
+                    share_bottom=("share_bottom", "mean"),
+                    avg_stay_top=("avg_stay_top", "mean"),
+                    avg_stay_bottom=("avg_stay_bottom", "mean"),
+                    n_stays_top=("n_stays_top", "mean"),
+                    n_stays_bottom=("n_stays_bottom", "mean"),
+                    n_dense_logs=("log_key", "nunique"),
+                )
+            )
+        else:
+            summary_one = raw_one.drop(columns=["log_key"]).copy()
+            summary_one["n_dense_logs"] = 1
+
+        summary_frames.append(summary_one)
+
+    if not summary_frames:
+        raise ValueError("No dense logs found in the supplied runs.")
+
+    summary_df = pd.concat(summary_frames, ignore_index=True)
+    raw_df = pd.concat(raw_frames, ignore_index=True)
+
+    n_runs = len(run_names)
+    fig, axes = plt.subplots(
+        n_runs,
+        2,
+        figsize=(figsize_per_run[0], max(2.8, figsize_per_run[1]) * n_runs),
+        gridspec_kw={"width_ratios": [0.85, 1.6]},
+        squeeze=False,
+        constrained_layout=True,
+    )
+
+    for run_idx, run_name in enumerate(run_names):
+        ax_pie, ax_bar = axes[run_idx]
+        df = summary_df[summary_df["run"] == run_name].sort_values("agent").reset_index(drop=True)
+        if df.empty:
+            ax_pie.axis("off")
+            ax_bar.axis("off")
+            ax_bar.text(0.5, 0.5, "no dense logs", transform=ax_bar.transAxes, ha="center", va="center")
+            continue
+
+        top_total = float(df["time_top"].sum())
+        bottom_total = float(df["time_bottom"].sum())
+        agent_colors = _make_agent_colors(df["agent"].astype(int).tolist())
+
+        ax_pie.pie(
+            [top_total, bottom_total],
+            labels=["top", "bottom"],
+            autopct="%1.1f%%",
+            startangle=90,
+            colors=["#1f77b4", "#d62728"],
+            wedgeprops=dict(edgecolor="white", linewidth=1),
+            textprops=dict(fontsize=9),
+        )
+        ax_pie.set_title(f"{short_labels.get(run_name, run_name)}\nTime Spent by Region", fontsize=10)
+
+        x = np.arange(len(df))
+        width = 0.38
+        ax_bar.bar(
+            x - width / 2,
+            df["avg_stay_top"],
+            width=width,
+            color="#1f77b4",
+            alpha=0.82,
+            label="top",
+        )
+        ax_bar.bar(
+            x + width / 2,
+            df["avg_stay_bottom"],
+            width=width,
+            color="#d62728",
+            alpha=0.82,
+            label="bottom",
+        )
+        for xpos, aid in zip(x, df["agent"]):
+            ax_bar.scatter(
+                [xpos],
+                [0],
+                marker="s",
+                s=42,
+                color=agent_colors.get(int(aid), "0.4"),
+                clip_on=False,
+                zorder=4,
+            )
+
+        ax_bar.set_title("Average Stay Length by Agent", fontsize=10)
+        ax_bar.set_xlabel("agent")
+        ax_bar.set_ylabel("timesteps per stay")
+        ax_bar.set_xticks(x)
+        ax_bar.set_xticklabels([str(int(a)) for a in df["agent"]])
+        ax_bar.grid(True, axis="y", alpha=0.25)
+        ax_bar.legend(frameon=True, fontsize=8)
+
+    title_mode = "Average Across Dense Logs" if mode == "average" else "Single Dense Log"
+    fig.suptitle(f"Region Residence Summary Across Runs ({title_mode})", fontsize=14, fontweight="bold")
+
+    return fig, summary_df, raw_df
 
 
 def plot_regional_composition_tax_phase(
