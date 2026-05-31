@@ -1847,6 +1847,142 @@ def load_experiment_run(run_dir):
 def load_experiment_runs(run_dirs):
     return [load_experiment_run(rd) for rd in run_dirs]
 
+
+def combine_run_groups_for_comparison(*run_groups, labels=None):
+    """
+    Combine several lists of loaded runs into one comparison-ready run per group.
+
+    This lets existing ``compare_...`` functions be called with grouped settings:
+
+        comparison_runs = combine_run_groups_for_comparison(
+            runs_base,
+            runs_trade,
+            runs_travel,
+            labels=["Base", "Trade", "Travel"],
+        )
+
+        fig = compare_training_curves(comparison_runs, metric="mean_tax")
+
+    Each returned item has merged dense logs, averaged numeric summary metrics,
+    and training metrics averaged by ``phase``/``iter`` when available.
+    """
+    import os
+    import numpy as np
+    import pandas as pd
+
+    if len(run_groups) == 1 and isinstance(run_groups[0], (list, tuple)):
+        first = run_groups[0]
+        if first and all(isinstance(item, (list, tuple)) for item in first):
+            run_groups = tuple(first)
+
+    if labels is None:
+        default_labels = ["Base", "Trade", "Travel"]
+        labels = [
+            default_labels[i] if i < len(default_labels) else f"Group {i + 1}"
+            for i in range(len(run_groups))
+        ]
+    if len(labels) != len(run_groups):
+        raise ValueError("labels must have the same length as the number of run groups.")
+
+    def as_loaded_run(item):
+        if isinstance(item, (str, os.PathLike)):
+            return load_experiment_run(item)
+        return item
+
+    def as_run_list(group):
+        if isinstance(group, (str, os.PathLike)):
+            return [load_experiment_run(group)]
+        if isinstance(group, dict):
+            return [group]
+        if isinstance(group, (list, tuple)):
+            return [as_loaded_run(item) for item in group]
+        raise ValueError("Each run group must be a run dict, path, or list of run dicts/paths.")
+
+    def average_summary(runs):
+        rows = []
+        non_numeric = {}
+        for run in runs:
+            summary = run.get("summary", {}) if isinstance(run, dict) else {}
+            flat = {}
+            for key, value in summary.items():
+                if isinstance(value, (int, float, np.number)) and np.isfinite(value):
+                    flat[key] = float(value)
+                elif key not in non_numeric:
+                    non_numeric[key] = value
+            if flat:
+                rows.append(flat)
+        if rows:
+            out = pd.DataFrame(rows).mean(numeric_only=True).to_dict()
+        else:
+            out = {}
+        out.update({k: v for k, v in non_numeric.items() if k not in out})
+        return out
+
+    def average_metrics(runs):
+        frames = []
+        for run_idx, run in enumerate(runs):
+            metrics = run.get("metrics", None) if isinstance(run, dict) else None
+            if metrics is None or not isinstance(metrics, pd.DataFrame) or metrics.empty:
+                continue
+            df = metrics.copy()
+            df["_source_run_idx"] = run_idx
+            frames.append(df)
+        if not frames:
+            return pd.DataFrame()
+        raw = pd.concat(frames, ignore_index=True, sort=False)
+        if "phase" not in raw.columns or "iter" not in raw.columns:
+            numeric_cols = raw.select_dtypes(include=[np.number]).columns.tolist()
+            numeric_cols = [c for c in numeric_cols if c != "_source_run_idx"]
+            return raw[numeric_cols].mean(numeric_only=True).to_frame().T
+        numeric_cols = raw.select_dtypes(include=[np.number]).columns.tolist()
+        numeric_cols = [c for c in numeric_cols if c != "_source_run_idx"]
+        averaged = (
+            raw
+            .groupby(["phase", "iter"], as_index=False, sort=False)[numeric_cols]
+            .mean()
+        )
+        return averaged
+
+    combined = []
+    for group_idx, (group, label) in enumerate(zip(run_groups, labels)):
+        runs = as_run_list(group)
+        dense_logs = {}
+        first_dense_log = None
+        for run_idx, run in enumerate(runs):
+            run_name = (
+                run.get("name", f"run{run_idx}")
+                if isinstance(run, dict)
+                else f"run{run_idx}"
+            )
+            logs = _extract_logs_from_run(run)
+            for log_key, dense_log in logs.items():
+                merged_key = f"run{run_idx}_{log_key}"
+                dense_logs[merged_key] = dense_log
+                if first_dense_log is None:
+                    first_dense_log = dense_log
+
+        if not dense_logs:
+            raise ValueError(f"No dense logs found for group {label!r}.")
+
+        summary = average_summary(runs)
+        summary["experiment_name"] = label
+        summary["n_group_runs"] = len(runs)
+        summary["n_dense_logs"] = len(dense_logs)
+
+        combined.append({
+            "run_dir": None,
+            "name": label,
+            "summary": summary,
+            "config": runs[0].get("config", {}) if isinstance(runs[0], dict) else {},
+            "metrics": average_metrics(runs),
+            "dense_logs": dense_logs,
+            "dense_log": first_dense_log,
+            "group_runs": runs,
+        })
+
+    return combined
+
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -1923,6 +2059,7 @@ def compare_training_curves(
     smooth_window=1,
     episode_range=None,
     figsize=(10, 5),
+    phase_boundary_iterations=(500, 2000, 2500),
 ):
     """
     Compare training curves across runs on a shared x-axis.
@@ -1953,6 +2090,9 @@ def compare_training_curves(
     episode_range : None or tuple
         Optional cumulative training-iteration window to show, e.g.
         ``(2500, 4000)`` for the final 1500 iterations.
+
+    phase_boundary_iterations : tuple/list or None
+        Cumulative training iterations to mark with vertical dashed lines.
 
     figsize : tuple
         Figure size.
@@ -2111,12 +2251,20 @@ def compare_training_curves(
             if all_boundaries is None:
                 all_boundaries = boundaries
 
-    # Draw phase boundaries once
-    if show_phase_boundaries and all_boundaries is not None:
-        for b in all_boundaries[:-1]:
+    # Draw phase boundaries once. Prefer the explicit training phase cut points
+    # used by the experiment setup; fall back to inferred boundaries otherwise.
+    if show_phase_boundaries:
+        if phase_boundary_iterations is not None:
+            boundaries_to_draw = list(phase_boundary_iterations)
+        elif all_boundaries is not None:
+            boundaries_to_draw = list(all_boundaries[:-1])
+        else:
+            boundaries_to_draw = []
+
+        for b in boundaries_to_draw:
             if episode_range is not None and not (episode_start <= b <= episode_end):
                 continue
-            ax.axvline(b, linestyle="--", alpha=0.35, color="gray", linewidth=1)
+            ax.axvline(b, linestyle="--", alpha=0.5, color="gray", linewidth=1)
 
     # Nicer labels
     pretty_title = metric_title
@@ -2361,6 +2509,7 @@ def compare_redistribution_over_time(
     import numpy as np
     import pandas as pd
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
 
     def dense_logs_for_run(run):
         if isinstance(run, dict):
@@ -2743,6 +2892,8 @@ def compare_skill_group_mechanisms(
     import numpy as np
     import pandas as pd
     import matplotlib.pyplot as plt
+    from matplotlib.legend_handler import HandlerTuple
+    from matplotlib.patches import Patch
 
     def dense_logs_for_run(run):
         if isinstance(run, dict):
@@ -2989,7 +3140,8 @@ def compare_skill_group_mechanisms(
 
     n_cols = 3
     n_rows = 2
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False, constrained_layout=True)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False, constrained_layout=False)
+    fig.subplots_adjust(left=0.06, right=0.98, top=0.90, bottom=0.22, wspace=0.22, hspace=0.32)
     axes_flat = axes.ravel()
 
     x = np.arange(len(run_names), dtype=float)
@@ -2997,7 +3149,11 @@ def compare_skill_group_mechanisms(
     total_width = 0.82
     bar_width = total_width / max(1, n_skills)
     offsets = (np.arange(n_skills) - (n_skills - 1) / 2.0) * bar_width
-    colors = _make_agent_colors(range(n_skills))
+    setting_gradients = [
+        ["#d9c6f0", "#aa7fd6", "#7d4bb2", "#4e257c"],  # Base: purple
+        ["#ffd0a3", "#ff9f45", "#d96b16", "#8f3f08"],  # Trade: orange
+        ["#c9e8c4", "#7bcf75", "#35a64a", "#176b2c"],  # Travel: green
+    ]
 
     for ax, (metric, title, ylabel) in zip(axes_flat, metric_specs):
         for skill_idx, skill in enumerate(skill_values):
@@ -3014,7 +3170,11 @@ def compare_skill_group_mechanisms(
                 x + offsets[skill_idx],
                 vals,
                 width=bar_width * 0.92,
-                color=colors[skill_idx % len(colors)],
+                color=[
+                    setting_gradients[run_idx % len(setting_gradients)][skill_idx % len(setting_gradients[run_idx % len(setting_gradients)])]
+                    for run_idx in range(len(run_names))
+                ],
+                alpha=1.0,
                 edgecolor="white",
                 linewidth=0.7,
                 label=skill_labels[skill],
@@ -3030,16 +3190,41 @@ def compare_skill_group_mechanisms(
     for ax in axes_flat[len(metric_specs):]:
         ax.set_visible(False)
 
-    handles, labels = axes_flat[0].get_legend_handles_labels()
-    if handles:
-        fig.legend(
-            handles,
-            labels,
-            loc="lower center",
-            bbox_to_anchor=(0.5, -0.02),
-            ncol=min(4, len(labels)),
-            frameon=True,
+    setting_handles = [
+        Patch(
+            facecolor=setting_gradients[run_idx % len(setting_gradients)][min(1, n_skills - 1)],
+            edgecolor="white",
+            label=short_labels.get(run_name, run_name),
         )
+        for run_idx, run_name in enumerate(run_names)
+    ]
+    skill_handles = [
+        Patch(
+            facecolor=str(0.86 - 0.52 * (skill_idx / max(1, n_skills - 1))),
+            edgecolor="white",
+            label=f"skill {skill_idx + 1}",
+        )
+        for skill_idx in range(n_skills)
+    ]
+    legend_settings = fig.legend(
+        setting_handles,
+        [h.get_label() for h in setting_handles],
+        title="setting color",
+        loc="lower center",
+        bbox_to_anchor=(0.33, 0.02),
+        ncol=len(setting_handles),
+        frameon=True,
+    )
+    fig.add_artist(legend_settings)
+    fig.legend(
+        skill_handles,
+        [h.get_label() for h in skill_handles],
+        title="shade order",
+        loc="lower center",
+        bbox_to_anchor=(0.72, 0.02),
+        ncol=min(n_skills, 4),
+        frameon=True,
+    )
     fig.suptitle("Skill-Group Mechanisms Across Runs", fontsize=14, fontweight="bold")
     return fig, summary_df, raw_df
 
@@ -3070,18 +3255,46 @@ def compare_summary_bars(
     short_labels=None,
     show_legend=True,
     errorbar="std",   # "std", "sem", or None
+    start_y_at_zero=True,
+    env_obj=None,
+    top_first=True,
+    percent_change_from_baseline=False,
+    show_group_members=False,
 ):
+    """
+    Compare summary metrics across runs.
+
+    Set ``start_y_at_zero=False`` to let each subplot zoom to its own data range.
+    Keep ``start_y_at_zero=True`` for bar-chart axes that include zero.
+
+    ``avg_tax_rate`` is always recomputed from all dense logs. When planner
+    actions are available, it uses the same action-to-rate conversion as the tax
+    schedule plots; otherwise it falls back to logged PeriodicTax schedules.
+
+    Set ``percent_change_from_baseline=True`` to plot each metric as percentage
+    change from the first run:
+    ``100 * (setting - baseline) / abs(baseline)``.
+
+    If ``runs`` was created with ``combine_run_groups_for_comparison(...)``, set
+    ``show_group_members=True`` to plot each original run inside each grouped
+    setting instead of only the grouped average.
+    """
     import numpy as np
     import pandas as pd
     import matplotlib.pyplot as plt
+    from matplotlib.legend_handler import HandlerTuple
+    from matplotlib.patches import Patch
     from matplotlib.patches import Patch
 
     if metrics is None:
         metrics = [
             "mean_final_coin",
+            "mean_coin",
             "gini_final_coin",
             "avg_social_welfare",
             "mean_final_labor",
+            "mean_labor",
+            "avg_tax_rate",
             "n_trades",
             "n_builds",
         ]
@@ -3100,6 +3313,38 @@ def compare_summary_bars(
         n = len(values)
         return float((2 * np.sum((np.arange(1, n + 1) * values))) / (n * total) - (n + 1) / n)
 
+    def dense_log_avg_tax_rate(log):
+        if (
+            isinstance(log, dict)
+            and isinstance(log.get("planner_actions"), dict)
+            and "p_top" in log["planner_actions"]
+            and "p_bottom" in log["planner_actions"]
+        ):
+            try:
+                ptop_rates, pbot_rates = _tax_rate_matrices(log, env_obj, top_first=top_first)
+                values = np.concatenate([
+                    np.asarray(ptop_rates, dtype=float).ravel(),
+                    np.asarray(pbot_rates, dtype=float).ravel(),
+                ])
+                values = values[np.isfinite(values)]
+                if len(values):
+                    return float(np.nanmean(values))
+            except Exception:
+                pass
+
+        tax_rates = []
+        for tax_key in ["PeriodicTax-p_top", "PeriodicTax-p_bottom", "PeriodicTax"]:
+            for event in log.get(tax_key, []) or []:
+                if isinstance(event, dict) and "schedule" in event:
+                    schedule = np.asarray(event.get("schedule", []), dtype=float)
+                    tax_rates.extend(schedule[np.isfinite(schedule)].tolist())
+                elif isinstance(event, list):
+                    for item in event:
+                        if isinstance(item, dict) and "schedule" in item:
+                            schedule = np.asarray(item.get("schedule", []), dtype=float)
+                            tax_rates.extend(schedule[np.isfinite(schedule)].tolist())
+        return float(np.nanmean(tax_rates)) if tax_rates else np.nan
+
     def summarize_one_dense_log(log):
         states = log["states"]
         last_state = states[-1]
@@ -3108,6 +3353,8 @@ def compare_summary_bars(
 
         final_coin = []
         final_labor = []
+        coin_over_time = []
+        labor_over_time = []
 
         for aid in agent_ids:
             s = last_state[str(aid)]
@@ -3116,6 +3363,17 @@ def compare_summary_bars(
 
             final_coin.append(float(coin))
             final_labor.append(float(labor))
+
+        for state in states:
+            for aid in agent_ids:
+                agent_state = state.get(str(aid), {})
+                inventory = agent_state.get("inventory", {})
+                escrow = agent_state.get("escrow", {})
+                endogenous = agent_state.get("endogenous", {})
+                coin_over_time.append(
+                    float(inventory.get("Coin", 0.0)) + float(escrow.get("Coin", 0.0))
+                )
+                labor_over_time.append(float(endogenous.get("Labor", np.nan)))
 
         def social_welfare_from_coins(coins):
             coins = np.asarray(coins, dtype=float)
@@ -3156,12 +3414,15 @@ def compare_summary_bars(
 
         return {
             "mean_final_coin": float(np.mean(final_coin)) if final_coin else np.nan,
+            "mean_coin": float(np.nanmean(coin_over_time)) if coin_over_time else np.nan,
             "std_final_coin": float(np.std(final_coin)) if final_coin else np.nan,
             "gini_final_coin": gini(final_coin),
             "avg_social_welfare": mean_social_welfare,
             "mean_social_welfare": mean_social_welfare,
             "final_social_welfare": final_social_welfare,
             "mean_final_labor": float(np.mean(final_labor)) if final_labor else np.nan,
+            "mean_labor": float(np.nanmean(labor_over_time)) if labor_over_time else np.nan,
+            "avg_tax_rate": dense_log_avg_tax_rate(log),
             "n_trades": float(n_trades),
             "n_builds": float(n_builds),
         }
@@ -3185,16 +3446,53 @@ def compare_summary_bars(
 
         return []
 
-    # Main summary dataframe
-    summary_df = pd.DataFrame(
-        [{"name": r["name"], **r["summary"]} for r in runs]
-    ).set_index("name")
-    run_names = list(summary_df.index)
+    original_run_names = [r["name"] for r in runs]
 
     if short_labels is None:
-        short_labels = {name: f"E{i+1}" for i, name in enumerate(run_names)}
+        short_labels = {name: f"E{i+1}" for i, name in enumerate(original_run_names)}
     elif isinstance(short_labels, list):
-        short_labels = {name: short_labels[i] for i, name in enumerate(run_names)}
+        short_labels = {name: short_labels[i] for i, name in enumerate(original_run_names)}
+
+    plot_runs = []
+    plot_meta = {}
+    if show_group_members:
+        for group_idx, group_run in enumerate(runs):
+            group_name = group_run["name"]
+            group_label = short_labels.get(group_name, group_name)
+            members = group_run.get("group_runs", None)
+            if not isinstance(members, (list, tuple)) or len(members) == 0:
+                members = [group_run]
+            for member_idx, member in enumerate(members):
+                member_copy = dict(member)
+                plot_name = f"{group_name} run {member_idx + 1}"
+                member_copy["name"] = plot_name
+                plot_runs.append(member_copy)
+                plot_meta[plot_name] = {
+                    "group_idx": group_idx,
+                    "member_idx": member_idx,
+                    "group_name": group_name,
+                    "group_label": group_label,
+                    "label": f"{group_label} {member_idx + 1}",
+                    "n_members": len(members),
+                }
+    else:
+        plot_runs = runs
+        for run_idx, run in enumerate(plot_runs):
+            run_name = run["name"]
+            plot_meta[run_name] = {
+                "group_idx": run_idx,
+                "member_idx": 0,
+                "group_name": run_name,
+                "group_label": short_labels.get(run_name, run_name),
+                "label": short_labels.get(run_name, run_name),
+                "n_members": 1,
+            }
+
+    # Main summary dataframe
+    summary_df = pd.DataFrame(
+        [{"name": r["name"], **r.get("summary", {})} for r in plot_runs]
+    ).set_index("name")
+    run_names = list(summary_df.index)
 
     colors_list = [
         "#9467bd",  # purple
@@ -3203,13 +3501,25 @@ def compare_summary_bars(
         "#1f77b4",  # blue
         "#8c564b",  # brown
     ]
-    colors = {name: colors_list[i % len(colors_list)] for i, name in enumerate(run_names)}
+    member_hatches = ["", "///", "...", "xxx", "\\\\\\", "++", "ooo", "---"]
+    if show_group_members:
+        colors = {
+            name: colors_list[plot_meta[name]["group_idx"] % len(colors_list)]
+            for name in run_names
+        }
+        hatches = {
+            name: member_hatches[plot_meta[name]["member_idx"] % len(member_hatches)]
+            for name in run_names
+        }
+    else:
+        colors = {name: colors_list[i % len(colors_list)] for i, name in enumerate(run_names)}
+        hatches = {name: "" for name in run_names}
 
     # Compute episode-level metric variability for each run
     err_lookup = {name: {} for name in run_names}
     dense_summary_lookup = {}
 
-    for run in runs:
+    for run in plot_runs:
         run_name = run["name"]
 
         dense_logs_obj = None
@@ -3254,85 +3564,181 @@ def compare_summary_bars(
         if metric not in summary_df.columns:
             summary_df[metric] = np.nan
         for run_name in run_names:
-            if pd.isna(summary_df.at[run_name, metric]):
+            if metric == "avg_tax_rate":
+                summary_df.at[run_name, metric] = dense_summary_lookup.get(run_name, {}).get(metric, np.nan)
+            elif pd.isna(summary_df.at[run_name, metric]):
                 summary_df.at[run_name, metric] = dense_summary_lookup.get(run_name, {}).get(metric, np.nan)
 
     metrics = [m for m in metrics if m in summary_df.columns and summary_df[m].notna().any()]
 
-    fig_width = max(8, 1.25 * len(metrics))
-    fig, ax = plt.subplots(1, 1, figsize=(fig_width, 4.8), constrained_layout=False)
-    welfare_metrics = {
-        "avg_social_welfare",
-        "mean_social_welfare",
-        "final_social_welfare",
-        "social_welfare_coin_eq_times_prod",
-    }
-    social_metrics = [m for m in metrics if m in welfare_metrics]
-    ax_social = ax.twinx() if social_metrics else None
+    n_cols = min(3, max(1, len(metrics)))
+    n_rows = int(np.ceil(len(metrics) / n_cols))
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(4.4 * n_cols, 3.4 * n_rows),
+        squeeze=False,
+        constrained_layout=False,
+    )
+    axes_flat = axes.ravel()
 
-    x = np.arange(len(metrics))
-    group_width = 0.62
-    bar_width = group_width / max(1, len(run_names))
-    offsets = (np.arange(len(run_names)) - (len(run_names) - 1) / 2) * bar_width
+    x = np.arange(len(run_names), dtype=float)
+    bar_width = 0.66
+    baseline_name = run_names[0] if run_names else None
 
-    for run_i, name in enumerate(run_names):
-        for target_ax, target_metrics, alpha in [
-            (ax, [m for m in metrics if m not in welfare_metrics], 0.9),
-            (ax_social, social_metrics, 0.72),
-        ]:
-            if target_ax is None or not target_metrics:
-                continue
-            positions = np.array([metrics.index(metric) for metric in target_metrics], dtype=float)
-            vals = summary_df.loc[name, target_metrics].to_numpy(dtype=float)
-            yerr = np.array(
-                [err_lookup[name].get(metric, np.nan) for metric in target_metrics],
-                dtype=float,
-            )
-            yerr = np.where(np.isfinite(yerr), yerr, 0.0)
+    for ax, metric in zip(axes_flat, metrics):
+        raw_vals = summary_df.loc[run_names, metric].to_numpy(dtype=float)
+        yerr = np.array(
+            [err_lookup[name].get(metric, np.nan) for name in run_names],
+            dtype=float,
+        )
+        yerr = np.where(np.isfinite(yerr), yerr, 0.0)
+        if percent_change_from_baseline:
+            baseline = float(summary_df.at[baseline_name, metric])
+            if np.isfinite(baseline) and abs(baseline) > 1e-12:
+                vals = 100.0 * (raw_vals - baseline) / abs(baseline)
+                yerr = 100.0 * yerr / abs(baseline)
+            else:
+                vals = np.full_like(raw_vals, np.nan, dtype=float)
+                yerr = np.zeros_like(raw_vals, dtype=float)
+        else:
+            vals = raw_vals
 
-            target_ax.bar(
-                positions + offsets[run_i],
-                vals,
-                color=colors[name],
-                width=bar_width * 0.82,
-                alpha=alpha,
-                yerr=None if errorbar is None else yerr,
-                capsize=3 if errorbar is not None else 0,
-                ecolor="black",
-                linewidth=0,
-                label=short_labels[name],
-            )
+        bars = ax.bar(
+            x,
+            vals,
+            color=[colors[name] for name in run_names],
+            width=bar_width,
+            alpha=0.9,
+            yerr=None if errorbar is None else yerr,
+            capsize=3 if errorbar is not None else 0,
+            ecolor="black",
+            edgecolor="0.25" if show_group_members else "none",
+            linewidth=0.7 if show_group_members else 0,
+        )
+        if show_group_members:
+            for bar, name in zip(bars, run_names):
+                bar.set_hatch(hatches[name])
+        ax.set_title(metric.replace("_", " ").title())
+        if percent_change_from_baseline:
+            ax.axhline(0, color="0.25", linestyle="--", linewidth=0.9)
+            ax.set_ylabel("% change")
+        ax.set_xticks(x)
+        ax.set_xticklabels([plot_meta[name]["label"] for name in run_names], rotation=0)
+        ax.grid(True, axis="y", alpha=0.3)
 
-    ax.set_title("Summary Metrics")
-    ax.set_xticks(x)
-    ax.set_xticklabels([metric.replace("_", " ").title() for metric in metrics], rotation=20, ha="right")
-    ax.set_ylabel("Summary metrics")
-    ax.grid(True, axis="y", alpha=0.3)
-    if ax_social is not None:
-        ax_social.set_ylabel("Social welfare")
-        ax_social.grid(False)
+        finite_vals = vals[np.isfinite(vals)]
+        finite_err = yerr[np.isfinite(vals)] if errorbar is not None else np.zeros_like(finite_vals)
+        finite_err = np.where(np.isfinite(finite_err), finite_err, 0.0)
+        if len(finite_vals):
+            lows = finite_vals - finite_err
+            highs = finite_vals + finite_err
+            data_min = float(np.nanmin(lows))
+            data_max = float(np.nanmax(highs))
+            if start_y_at_zero:
+                if data_min >= 0:
+                    upper = data_max if data_max > 0 else 1.0
+                    ax.set_ylim(0, upper * 1.10)
+                elif data_max <= 0:
+                    lower = data_min if data_min < 0 else -1.0
+                    ax.set_ylim(lower * 1.10, 0)
+                else:
+                    span = data_max - data_min
+                    pad = 0.08 * span if span > 0 else 1.0
+                    ax.set_ylim(data_min - pad, data_max + pad)
+            else:
+                span = data_max - data_min
+                pad = 0.10 * span if span > 0 else max(0.5, abs(data_max) * 0.10)
+                ax.set_ylim(data_min - pad, data_max + pad)
+
+    for ax in axes_flat[len(metrics):]:
+        ax.set_visible(False)
+
+    title = "Summary Metrics"
+    if percent_change_from_baseline:
+        title = f"Summary Metrics: Percent Change from {plot_meta[baseline_name]['label']}"
+    fig.suptitle(title, fontsize=14, fontweight="bold")
 
     if show_legend:
-        legend_handles = [
-            Patch(facecolor=colors[name], label=f"{short_labels[name]}")
-            for name in run_names
-        ]
+        if show_group_members:
+            group_order = []
+            for name in run_names:
+                group_idx = plot_meta[name]["group_idx"]
+                if group_idx not in group_order:
+                    group_order.append(group_idx)
+            setting_handles = []
+            for group_idx in group_order:
+                example_name = next(
+                    name for name in run_names
+                    if plot_meta[name]["group_idx"] == group_idx
+                )
+                setting_handles.append(Patch(
+                    facecolor=colors[example_name],
+                    edgecolor="0.25",
+                    label=plot_meta[example_name]["group_label"],
+                ))
 
-        fig.legend(
-            handles=legend_handles,
-            loc="lower center",
-            bbox_to_anchor=(0.5, 0.01),
-            ncol=min(len(run_names), 6),
-            frameon=True,
-            fontsize=10,
-        )
+            max_members = max(plot_meta[name]["n_members"] for name in run_names)
+            member_handles = [
+                Patch(
+                    facecolor="white",
+                    edgecolor="0.25",
+                    hatch=member_hatches[idx % len(member_hatches)],
+                    label=f"run {idx + 1}",
+                )
+                for idx in range(max_members)
+            ]
+            legend_settings = fig.legend(
+                handles=setting_handles,
+                title="setting",
+                loc="lower center",
+                bbox_to_anchor=(0.34, 0.02),
+                ncol=len(setting_handles),
+                frameon=True,
+                fontsize=10,
+            )
+            fig.add_artist(legend_settings)
+            fig.legend(
+                handles=member_handles,
+                title="member overlay",
+                loc="lower center",
+                bbox_to_anchor=(0.72, 0.02),
+                ncol=min(max_members, 4),
+                frameon=True,
+                fontsize=10,
+            )
+            fig.subplots_adjust(bottom=0.20, top=0.90, left=0.06, right=0.98, hspace=0.42, wspace=0.25)
+        else:
+            legend_handles = [
+                Patch(facecolor=colors[name], label=f"{plot_meta[name]['label']}")
+                for name in run_names
+            ]
 
-        fig.subplots_adjust(bottom=0.28, top=0.90, left=0.08, right=0.98)
+            fig.legend(
+                handles=legend_handles,
+                loc="lower center",
+                bbox_to_anchor=(0.5, 0.01),
+                ncol=min(len(run_names), 6),
+                frameon=True,
+                fontsize=10,
+            )
+
+            fig.subplots_adjust(bottom=0.16, top=0.90, left=0.06, right=0.98, hspace=0.42, wspace=0.25)
     else:
-        fig.tight_layout()
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
 
     out_df = summary_df.copy()
-    out_df.insert(0, "label", [short_labels[name] for name in out_df.index])
+    out_df.insert(0, "label", [plot_meta[name]["label"] for name in out_df.index])
+    out_df.insert(1, "group", [plot_meta[name]["group_label"] for name in out_df.index])
+    out_df.insert(2, "group_member", [plot_meta[name]["member_idx"] + 1 for name in out_df.index])
+    if percent_change_from_baseline and baseline_name is not None:
+        for metric in metrics:
+            baseline = float(summary_df.at[baseline_name, metric])
+            col = f"{metric}_pct_change_from_baseline"
+            if np.isfinite(baseline) and abs(baseline) > 1e-12:
+                out_df[col] = 100.0 * (summary_df[metric] - baseline) / abs(baseline)
+            else:
+                out_df[col] = np.nan
 
     return fig, out_df
 
@@ -4218,8 +4624,21 @@ def plot_trade_enabled_run_trade_and_redistribution(
     import pandas as pd
     import matplotlib.pyplot as plt
 
+    aggregation_mode = "average" if isinstance(run, (list, tuple)) and mode == "single" else mode
+
     def episode_logs_from_run(run):
-        if mode == "single":
+        if isinstance(run, (list, tuple)):
+            logs_by_key = _extract_logs_from_run(run)
+            if dense_log_key is not None and dense_log_key in logs_by_key:
+                return [(dense_log_key, logs_by_key[dense_log_key])]
+            if aggregation_mode == "single":
+                return [next(iter(logs_by_key.items()))] if logs_by_key else []
+            return [(k, v) for k, v in logs_by_key.items() if isinstance(v, dict)]
+
+        if isinstance(run, dict) and isinstance(run.get("states"), list):
+            return [(0, run)]
+
+        if aggregation_mode == "single":
             if dense_log_key is not None and isinstance(run.get("dense_logs"), dict):
                 return [(dense_log_key, run["dense_logs"][dense_log_key])]
             return [(0, run["dense_log"])]
@@ -4235,10 +4654,13 @@ def plot_trade_enabled_run_trade_and_redistribution(
     if not logs:
         raise ValueError("No dense logs found for this run.")
 
-    run_summary = run.get("summary", {}) if isinstance(run, dict) else {}
+    config_source = run[0] if isinstance(run, (list, tuple)) and len(run) else run
+    run_summary = config_source.get("summary", {}) if isinstance(config_source, dict) else {}
     run_config = run_summary.get("config", {}) if isinstance(run_summary, dict) else {}
-    if not run_config and isinstance(run, dict) and run.get("run_dir"):
-        config_path = os.path.join(run["run_dir"], "config.json")
+    if not run_config and isinstance(config_source, dict) and config_source.get("config"):
+        run_config = config_source.get("config", {})
+    if not run_config and isinstance(config_source, dict) and config_source.get("run_dir"):
+        config_path = os.path.join(config_source["run_dir"], "config.json")
         if os.path.exists(config_path):
             with open(config_path, "r") as f:
                 run_config = json.load(f)
@@ -4310,8 +4732,11 @@ def plot_trade_enabled_run_trade_and_redistribution(
 
     if trade_raw.empty:
         trade_units = pd.DataFrame(columns=["tax_period", "commodity", "route_group", "units", "units_std"])
-        price_summary = pd.DataFrame(columns=["commodity", "route_group", "avg_price", "avg_price_std"])
-    elif mode == "average":
+        price_summary = pd.DataFrame(columns=[
+            "commodity", "route_group", "avg_price", "avg_price_std",
+            "avg_price_excl_tariff", "avg_price_excl_tariff_std",
+        ])
+    elif aggregation_mode == "average":
         per_rollout_units = (
             trade_raw
             .groupby(["rollout_id", "tax_period", "commodity", "route_group"], as_index=False)
@@ -4326,14 +4751,24 @@ def plot_trade_enabled_run_trade_and_redistribution(
         per_rollout_prices = (
             trade_raw
             .groupby(["rollout_id", "commodity", "route_group"], as_index=False)
-            .agg(avg_price=("price_with_cross_tariff", "mean"))
+            .agg(
+                avg_price=("price_with_cross_tariff", "mean"),
+                avg_price_excl_tariff=("price", "mean"),
+            )
         )
         price_summary = (
             per_rollout_prices
             .groupby(["commodity", "route_group"], as_index=False)
-            .agg(avg_price=("avg_price", "mean"), avg_price_std=("avg_price", "std"))
+            .agg(
+                avg_price=("avg_price", "mean"),
+                avg_price_std=("avg_price", "std"),
+                avg_price_excl_tariff=("avg_price_excl_tariff", "mean"),
+                avg_price_excl_tariff_std=("avg_price_excl_tariff", "std"),
+            )
         )
-        price_summary["avg_price_std"] = price_summary["avg_price_std"].fillna(0.0)
+        price_summary[["avg_price_std", "avg_price_excl_tariff_std"]] = (
+            price_summary[["avg_price_std", "avg_price_excl_tariff_std"]].fillna(0.0)
+        )
     else:
         trade_units = (
             trade_raw
@@ -4344,9 +4779,13 @@ def plot_trade_enabled_run_trade_and_redistribution(
         price_summary = (
             trade_raw
             .groupby(["commodity", "route_group"], as_index=False)
-            .agg(avg_price=("price_with_cross_tariff", "mean"))
+            .agg(
+                avg_price=("price_with_cross_tariff", "mean"),
+                avg_price_excl_tariff=("price", "mean"),
+            )
         )
         price_summary["avg_price_std"] = 0.0
+        price_summary["avg_price_excl_tariff_std"] = 0.0
 
     if redist_raw.empty:
         redist = pd.DataFrame(columns=[
@@ -4354,7 +4793,7 @@ def plot_trade_enabled_run_trade_and_redistribution(
             "travel_tax_funded_redistribution", "trade_tariff_funded_redistribution",
             "non_income_tax_redistribution", "redistributed", "redistributed_std"
         ])
-    elif mode == "average":
+    elif aggregation_mode == "average":
         redist = (
             redist_raw
             .groupby(["tax_period", "planner_region"], as_index=False)
@@ -4408,7 +4847,7 @@ def plot_trade_enabled_run_trade_and_redistribution(
         ].copy()
         if buyer_raw.empty:
             buyer_route = pd.DataFrame(columns=buyer_route_cols)
-        elif mode == "average":
+        elif aggregation_mode == "average":
             per_rollout_buyer_route = (
                 buyer_raw
                 .groupby(["rollout_id", "tax_period", "buyer_region", "route_group"], as_index=False)
@@ -4512,7 +4951,7 @@ def plot_trade_enabled_run_trade_and_redistribution(
             edgecolor="0.25",
             linewidth=0.5,
             label=f"{commodity}: within",
-            yerr=within_err if mode == "average" and show_std else None,
+            yerr=within_err if aggregation_mode == "average" and show_std else None,
             error_kw=dict(ecolor="0.25", elinewidth=0.8, capsize=2, capthick=0.8),
         )
         ax_trade.bar(
@@ -4526,11 +4965,11 @@ def plot_trade_enabled_run_trade_and_redistribution(
             linewidth=0.5,
             hatch="//",
             label=f"{commodity}: cross",
-            yerr=cross_err if mode == "average" and show_std else None,
+            yerr=cross_err if aggregation_mode == "average" and show_std else None,
             error_kw=dict(ecolor="0.25", elinewidth=0.8, capsize=2, capthick=0.8),
         )
 
-    title_suffix = "single dense log" if mode == "single" else "average across dense logs"
+    title_suffix = "single dense log" if aggregation_mode == "single" else "average across dense logs"
     ax_trade.set_title(f"Units Traded by Tax Period ({title_suffix})")
     ax_trade.set_ylabel("Units traded")
     ax_trade.set_xlabel("Tax period")
@@ -4561,12 +5000,29 @@ def plot_trade_enabled_run_trade_and_redistribution(
             price_label = "within" if route_group == "within region" else "cross"
             if pd.isna(price):
                 price_text = "n/a"
-            elif show_std and mode == "average" and not pd.isna(price_std):
+            elif show_std and aggregation_mode == "average" and not pd.isna(price_std):
                 price_text = f"{price:.2f} +/- {price_std:.2f}"
             else:
                 price_text = f"{price:.2f}"
             if route_group == "cross region":
+                price_excl = (
+                    float(price_match["avg_price_excl_tariff"].mean())
+                    if len(price_match) and "avg_price_excl_tariff" in price_match
+                    else np.nan
+                )
+                price_excl_std = (
+                    float(price_match["avg_price_excl_tariff_std"].mean())
+                    if len(price_match) and "avg_price_excl_tariff_std" in price_match
+                    else np.nan
+                )
+                if pd.isna(price_excl):
+                    price_excl_text = "n/a"
+                elif show_std and aggregation_mode == "average" and not pd.isna(price_excl_std):
+                    price_excl_text = f"{price_excl:.2f} +/- {price_excl_std:.2f}"
+                else:
+                    price_excl_text = f"{price_excl:.2f}"
                 price_lines.append(f"{price_label} avg price incl tariff: {price_text}")
+                price_lines.append(f"{price_label} avg seller price excl tariff: {price_excl_text}")
             else:
                 price_lines.append(f"{price_label} avg seller price: {price_text}")
 
@@ -4637,7 +5093,7 @@ def plot_trade_enabled_run_trade_and_redistribution(
             )
             bottoms += vals
 
-        if show_std and mode == "average" and "redistributed_std" in planner_df:
+        if show_std and aggregation_mode == "average" and "redistributed_std" in planner_df:
             total_err = []
             for tax_period in tax_periods:
                 match = planner_df[planner_df["tax_period"] == tax_period]
@@ -4742,7 +5198,7 @@ def plot_trade_enabled_run_trade_and_redistribution(
                 linewidth=0.6,
                 hatch="//" if route_group == "cross region" else "",
                 label=f"{buyer_region} buys {route_label[route_group]}",
-                yerr=errs if show_std and mode == "average" else None,
+                yerr=errs if show_std and aggregation_mode == "average" else None,
                 error_kw=dict(ecolor="0.25", elinewidth=0.8, capsize=2, capthick=0.8),
             )
             ax_price.plot(
@@ -4754,7 +5210,7 @@ def plot_trade_enabled_run_trade_and_redistribution(
                 linestyle="--" if route_group == "cross region" else "-",
                 label=f"{buyer_region} {route_label[route_group]} price",
             )
-            if show_std and mode == "average":
+            if show_std and aggregation_mode == "average":
                 ax_price.fill_between(
                     buyer_x,
                     prices - price_errs,
@@ -5380,6 +5836,22 @@ def plot_agent_labor_allocation(
         )
     agent_ids = [int(a) for a in agent_ids]
 
+    first_state = episode_logs[0]["states"][0]
+    agent_skill_value = {
+        aid: float(first_state.get(str(aid), {}).get("build_payment", np.nan))
+        for aid in agent_ids
+    }
+    finite_skill_values = sorted(
+        {skill for skill in agent_skill_value.values() if np.isfinite(skill)}
+    )
+    skill_rank = {skill: idx + 1 for idx, skill in enumerate(finite_skill_values)}
+
+    def skill_label_for_agent(aid):
+        skill = agent_skill_value.get(aid, np.nan)
+        if not np.isfinite(skill):
+            return "skill ?"
+        return f"skill {skill_rank.get(skill, '?')} ({skill:.0f})"
+
     if activity_colors is None:
         activity_colors = {
             "Move": "#1f77b4",
@@ -5489,6 +5961,8 @@ def plot_agent_labor_allocation(
                     summary_rows.append(
                         {
                             "agent": aid,
+                            "skill_group": skill_label_for_agent(aid),
+                            "build_payment": agent_skill_value.get(aid, np.nan),
                             "bin": float(b),
                             "activity": activity,
                             "labor_mean": float(value),
@@ -5599,6 +6073,8 @@ def plot_agent_labor_allocation(
                     summary_rows.append(
                         {
                             "agent": aid,
+                            "skill_group": skill_label_for_agent(aid),
+                            "build_payment": agent_skill_value.get(aid, np.nan),
                             "bin": float(b),
                             "activity": activity,
                             "labor_mean": float(value),
@@ -5622,6 +6098,28 @@ def plot_agent_labor_allocation(
 
     for panel_idx in range(n_agents, n_rows * n_cols):
         axes[panel_idx // n_cols, panel_idx % n_cols].axis("off")
+
+    for col in range(n_cols):
+        col_agent_ids = [
+            agent_ids[idx]
+            for idx in range(col, n_agents, n_cols)
+        ]
+        col_skill_labels = {
+            skill_label_for_agent(aid)
+            for aid in col_agent_ids
+        }
+        if len(col_skill_labels) == 1:
+            axes[0, col].text(
+                0.5,
+                1.22,
+                next(iter(col_skill_labels)),
+                transform=axes[0, col].transAxes,
+                ha="center",
+                va="bottom",
+                fontsize=11,
+                fontweight="bold",
+                clip_on=False,
+            )
 
     max_bar_y = 0.0
     for bar_ax in bar_axes:
@@ -5663,7 +6161,7 @@ def plot_agent_labor_allocation(
 
     fig.subplots_adjust(
         bottom=0.12,
-        top=0.91,
+        top=0.86,
         hspace=0.35,
         wspace=0.35,
     )
@@ -6685,15 +7183,18 @@ def extract_periodic_tax_streams(log, tax_keys=("PeriodicTax-p_top", "PeriodicTa
     return pd.DataFrame(rows)
 
 
-def plot_periodic_tax_streams_from_result_folder(result_dir, episode_key=0, figsize=(10, 8)):
+def plot_periodic_tax_streams_from_result_folder(source, episode_key=0, figsize=(10, 8)):
     """
     Simple plot for dense_log["PeriodicTax-p_top"] and
-    dense_log["PeriodicTax-p_bottom"] from one result folder.
+    dense_log["PeriodicTax-p_bottom"].
+
+    ``source`` can be a result folder path, a loaded run dict, a list of runs
+    such as ``runs_fixed``, a dense_logs object, or one dense log.
     """
     import numpy as np
     import matplotlib.pyplot as plt
 
-    dense_log, dense_logs = get_dense_log_from_result_folder(result_dir, episode_key=episode_key)
+    dense_log, dense_logs = _select_dense_log_from_source(source, episode_key=episode_key)
     df = extract_periodic_tax_streams(dense_log)
     if df.empty:
         raise ValueError(
@@ -7109,12 +7610,16 @@ def compare_average_tax_schedules_by_setting(
     errorbar="std",
     show_error=True,
     figsize=(16, 7.5),
+    difference_reference="trade",
+    difference_targets="after_reference",
+    difference_pairs=None,
 ):
     """
     Compare average marginal tax schedules across settings.
 
     Panel A averages each bracket's marginal tax rate over tax periods and dense
-    logs. Panel B plots each non-baseline setting minus the first run.
+    logs. Panel B plots selected setting differences. By default, three settings
+    are compared as Trade - Base and Travel - Trade.
     """
     import numpy as np
     import pandas as pd
@@ -7149,12 +7654,12 @@ def compare_average_tax_schedules_by_setting(
                 n_decisions = max(ptop_rates.shape[0], pbot_rates.shape[0])
                 tax_days = list(range(1, n_decisions + 1))
 
-            def tax_day_to_decision_idx(tax_day, rate_matrix):
+            def tax_period_to_decision_idx(tax_period, rate_matrix):
                 if rate_matrix.shape[0] == len(tax_days):
-                    return min(int(tax_day) - 1, rate_matrix.shape[0] - 1)
+                    return min(int(tax_period) - 1, rate_matrix.shape[0] - 1)
                 if len(tax_days) == 1 or rate_matrix.shape[0] == 1:
                     return 0
-                frac = (tax_day - tax_days[0]) / (tax_days[-1] - tax_days[0])
+                frac = (tax_period - 1) / max(1, len(tax_days) - 1)
                 return int(np.clip(round(frac * (rate_matrix.shape[0] - 1)), 0, rate_matrix.shape[0] - 1))
 
             for region, planner_id, rate_matrix in [
@@ -7162,7 +7667,7 @@ def compare_average_tax_schedules_by_setting(
                 ("bottom", "p_bottom", pbot_rates),
             ]:
                 for tax_period, tax_day in enumerate(tax_days, start=1):
-                    decision_idx = tax_day_to_decision_idx(tax_day, rate_matrix)
+                    decision_idx = tax_period_to_decision_idx(tax_period, rate_matrix)
                     rates = np.asarray(rate_matrix[decision_idx], dtype=float)
                     for bracket_idx, rate in enumerate(rates):
                         rows.append({
@@ -7206,37 +7711,70 @@ def compare_average_tax_schedules_by_setting(
         raise ValueError("errorbar must be None, 'std', or 'sem'.")
 
     if len(run_names) < 2:
-        raise ValueError("Need at least two runs to plot difference from baseline.")
+        raise ValueError("Need at least two runs to plot difference panel.")
 
-    baseline_name = run_names[0]
-    baseline = (
-        summary[summary["run"] == baseline_name]
-        .set_index(["planner_region", "bracket_idx"])
-    )
+    def resolve_run_ref(ref):
+        if isinstance(ref, int):
+            if ref < 0 or ref >= len(run_names):
+                raise ValueError(f"Run index {ref} is outside the runs list.")
+            return run_names[ref]
+        matching = [
+            name for name in run_names
+            if str(name) == str(ref)
+            or str(short_labels.get(name, name)) == str(ref)
+        ]
+        if not matching:
+            raise ValueError(f"Could not find run reference {ref!r}.")
+        return matching[0]
+
+    if difference_pairs is None:
+        if len(run_names) >= 3:
+            difference_pairs = [(0, 1), (1, 2)]
+        else:
+            difference_pairs = [(0, 1)]
+
+    resolved_pairs = []
+    for pair in difference_pairs:
+        if len(pair) != 2:
+            raise ValueError("Each difference pair must be (reference, target).")
+        ref_name = resolve_run_ref(pair[0])
+        target_name = resolve_run_ref(pair[1])
+        resolved_pairs.append((ref_name, target_name))
+
+    if not resolved_pairs:
+        raise ValueError("No settings selected for Panel B difference plot.")
+
     diff_rows = []
-    for run_idx, run_name in enumerate(run_names[1:], start=1):
-        dfr = summary[summary["run"] == run_name]
+    for ref_name, target_name in resolved_pairs:
+        reference = (
+            summary[summary["run"] == ref_name]
+            .set_index(["planner_region", "bracket_idx"])
+        )
+        run_idx = run_names.index(target_name)
+        dfr = summary[summary["run"] == target_name]
         for _, row in dfr.iterrows():
             key = (row["planner_region"], row["bracket_idx"])
-            if key not in baseline.index:
+            if key not in reference.index:
                 continue
-            base_row = baseline.loc[key]
-            base_err = float(base_row[err_col]) if err_col is not None else 0.0
+            ref_row = reference.loc[key]
+            ref_err = float(ref_row[err_col]) if err_col is not None else 0.0
             run_err = float(row[err_col]) if err_col is not None else 0.0
             diff_rows.append({
-                "run": run_name,
+                "reference_run": ref_name,
+                "reference_label": short_labels.get(ref_name, ref_name),
+                "run": target_name,
                 "label": row["label"],
                 "run_idx": run_idx,
                 "planner_region": row["planner_region"],
                 "planner_id": row["planner_id"],
                 "bracket_idx": int(row["bracket_idx"]),
-                "rate_diff": float(row["rate"] - base_row["rate"]),
-                "rate_diff_error": float(np.sqrt(run_err ** 2 + base_err ** 2)),
+                "rate_diff": float(row["rate"] - ref_row["rate"]),
+                "rate_diff_error": float(np.sqrt(run_err ** 2 + ref_err ** 2)),
             })
     diff_df = pd.DataFrame(diff_rows)
 
     n_runs = len(run_names)
-    n_diff = max(1, n_runs - 1)
+    n_diff = max(1, len(resolved_pairs))
     if figsize == (16, 7.5):
         figsize = (14, 11)
     fig = plt.figure(figsize=figsize, constrained_layout=True)
@@ -7265,9 +7803,21 @@ def compare_average_tax_schedules_by_setting(
             color = colors[run_idx % len(colors)]
             y = dfr["rate"].to_numpy(dtype=float)
             err = dfr[err_col].to_numpy(dtype=float) if err_col is not None else np.zeros_like(y)
+            avg_tax = float(np.nanmean(y)) if np.any(np.isfinite(y)) else np.nan
             ax.plot(x[:len(y)], y, marker="o", linewidth=2.1, color=color)
             if show_error and err_col is not None:
                 ax.fill_between(x[:len(y)], y - err, y + err, color=color, alpha=0.16, linewidth=0)
+            avg_text = "avg tax: n/a" if not np.isfinite(avg_tax) else f"avg tax: {avg_tax:.3f}"
+            ax.text(
+                0.97,
+                0.94,
+                avg_text,
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=8.5,
+                bbox=dict(facecolor="white", edgecolor="none", alpha=0.78),
+            )
             ax.set_title(short_labels.get(run_name, run_name), fontsize=10)
             if run_idx == 0:
                 ax.set_ylabel(f"{row_label}\nmarginal tax rate")
@@ -7276,17 +7826,18 @@ def compare_average_tax_schedules_by_setting(
             ax.set_ylim(0, 1)
             ax.grid(True, alpha=0.25)
 
-        for diff_idx, run_name in enumerate(run_names[1:]):
+        for diff_idx, (ref_name, run_name) in enumerate(resolved_pairs):
             ax = fig.add_subplot(gs_b[row_idx, diff_idx])
             axes_b[row_idx, diff_idx] = ax
             dfr = (
                 diff_df[
                     (diff_df["run"] == run_name)
+                    & (diff_df["reference_run"] == ref_name)
                     & (diff_df["planner_region"] == region)
                 ]
                 .sort_values("bracket_idx")
             )
-            color = colors[(diff_idx + 1) % len(colors)]
+            color = colors[run_names.index(run_name) % len(colors)]
             y = dfr["rate_diff"].to_numpy(dtype=float)
             err = dfr["rate_diff_error"].to_numpy(dtype=float)
             avg_diff = float(np.nanmean(y)) if np.any(np.isfinite(y)) else np.nan
@@ -7305,7 +7856,7 @@ def compare_average_tax_schedules_by_setting(
                 fontsize=8.5,
                 bbox=dict(facecolor="white", edgecolor="none", alpha=0.78),
             )
-            ax.set_title(f"{short_labels.get(run_name, run_name)} - {short_labels.get(baseline_name, baseline_name)}", fontsize=10)
+            ax.set_title(f"{short_labels.get(run_name, run_name)} - {short_labels.get(ref_name, ref_name)}", fontsize=10)
             if diff_idx == 0:
                 ax.set_ylabel(f"{row_label}\ndifference")
             ax.set_xticks(x)
@@ -7316,25 +7867,29 @@ def compare_average_tax_schedules_by_setting(
                 ax.set_ylim(-lim, lim)
             ax.grid(True, alpha=0.25)
 
-    axes_a[0, max(0, n_runs // 2)].text(
-        0.5,
-        1.24,
-        "Panel A: average tax schedule by bracket",
-        transform=axes_a[0, max(0, n_runs // 2)].transAxes,
+    axes_a[0, -1].text(
+        1.06,
+        -0.16,
+        "Panel A",
+        transform=axes_a[0, -1].transAxes,
         ha="center",
-        va="bottom",
+        va="center",
+        rotation=90,
         fontsize=12,
         fontweight="bold",
+        clip_on=False,
     )
-    axes_b[0, max(0, n_diff // 2)].text(
-        0.5,
-        1.24,
-        "Panel B: difference from baseline",
-        transform=axes_b[0, max(0, n_diff // 2)].transAxes,
+    axes_b[0, -1].text(
+        1.06,
+        -0.16,
+        "Panel B",
+        transform=axes_b[0, -1].transAxes,
         ha="center",
-        va="bottom",
+        va="center",
+        rotation=90,
         fontsize=12,
         fontweight="bold",
+        clip_on=False,
     )
     fig.suptitle("Tax Schedules Compared Across Settings", fontsize=15, fontweight="bold")
 
@@ -7900,12 +8455,37 @@ def _split_tax_action_matrix(arr, top_first=True):
     return arr[:, half:], arr[:, :half]
 
 
+def _enacted_regional_tax_action_matrix(arr, n_brackets=7):
+    """
+    Return the planner tax-action columns that are actually enacted.
+
+    Some regional-tax runs register two RegionalPeriodicBracketTax components with
+    the same component/action names. BaseAgent stores actions by name, so when the
+    14-column action vector is parsed, the later duplicate 7 columns overwrite the
+    earlier 7 columns. In those logs, the second half is the enacted schedule for
+    both p_top and p_bottom. Newer/fixed logs may contain only one 7-column vector.
+    """
+    arr = np.asarray(arr)
+    if arr.ndim == 1:
+        if arr.shape[0] == 2 * n_brackets:
+            return arr[n_brackets:]
+        return arr[-n_brackets:]
+
+    if arr.shape[1] == 2 * n_brackets:
+        return arr[:, n_brackets:]
+    if arr.shape[1] >= n_brackets:
+        return arr[:, -n_brackets:]
+    return arr
+
+
 def _final_tax_rates(log, env_obj, top_first=True):
     disc_rates = get_disc_rates(env_obj)
     planner_actions = log["planner_actions"]
 
-    top_actions, _ = _split_last_tax_action(planner_actions["p_top"], top_first=top_first)
-    _, bottom_actions = _split_last_tax_action(planner_actions["p_bottom"], top_first=top_first)
+    top_actions = _enacted_regional_tax_action_matrix(planner_actions["p_top"])
+    bottom_actions = _enacted_regional_tax_action_matrix(planner_actions["p_bottom"])
+    top_actions = np.asarray(top_actions)[-1]
+    bottom_actions = np.asarray(bottom_actions)[-1]
 
     top_rates = disc_rates[np.clip(top_actions.astype(int), 0, len(disc_rates) - 1)]
     bottom_rates = disc_rates[np.clip(bottom_actions.astype(int), 0, len(disc_rates) - 1)]
@@ -7919,8 +8499,8 @@ def _tax_rate_matrices(log, env_obj, top_first=True):
     ptop_actions = np.asarray(log["planner_actions"]["p_top"])
     pbot_actions = np.asarray(log["planner_actions"]["p_bottom"])
 
-    ptop_top, _ = _split_tax_action_matrix(ptop_actions, top_first=top_first)
-    _, pbot_bottom = _split_tax_action_matrix(pbot_actions, top_first=top_first)
+    ptop_top = _enacted_regional_tax_action_matrix(ptop_actions)
+    pbot_bottom = _enacted_regional_tax_action_matrix(pbot_actions)
 
     ptop_rates = disc_rates[np.clip(ptop_top.astype(int), 0, len(disc_rates) - 1)]
     pbot_rates = disc_rates[np.clip(pbot_bottom.astype(int), 0, len(disc_rates) - 1)]
@@ -9110,6 +9690,7 @@ def plot_tax_bracket_snapshots_compact(
         sharey=True,
         constrained_layout=True,
     )
+    fig.set_constrained_layout_pads(w_pad=0.08, h_pad=0.08, wspace=0.08, hspace=0.08)
 
     axes = np.asarray(axes).reshape(n_rows, n_cols)
 
@@ -9407,14 +9988,22 @@ def plot_tax_bracket_snapshots_compact_average(
     n_cols = 5
     n_rows = 4
     if figsize is None:
-        figsize = (2.8 * n_cols, 10.8)
+        figsize = (2.8 * n_cols, 9.4)
 
     fig, axes = plt.subplots(
         n_rows,
         n_cols,
         figsize=figsize,
         sharey=True,
-        constrained_layout=True,
+        constrained_layout=False,
+    )
+    fig.subplots_adjust(
+        left=0.06,
+        right=0.90,
+        top=0.92,
+        bottom=0.08,
+        wspace=0.18,
+        hspace=0.38,
     )
     axes = np.asarray(axes).reshape(n_rows, n_cols)
 
@@ -9550,25 +10139,29 @@ def plot_tax_bracket_snapshots_compact_average(
             ax.grid(True, axis="y", alpha=0.25)
 
     suffix = "mean +/- SD" if show_std else "mean"
-    axes[0, n_cols // 2].text(
-        0.5,
-        1.12,
-        "p_top",
-        transform=axes[0, n_cols // 2].transAxes,
+    axes[0, -1].text(
+        1.34,
+        -0.16,
+        "Top Planner",
+        transform=axes[0, -1].transAxes,
         ha="center",
-        va="bottom",
-        fontsize=13,
+        va="center",
+        rotation=90,
+        fontsize=12,
         fontweight="bold",
+        clip_on=False,
     )
-    axes[2, n_cols // 2].text(
-        0.5,
-        1.12,
-        "p_bottom",
-        transform=axes[2, n_cols // 2].transAxes,
+    axes[2, -1].text(
+        1.34,
+        -0.16,
+        "Bottom Planner",
+        transform=axes[2, -1].transAxes,
         ha="center",
-        va="bottom",
-        fontsize=13,
+        va="center",
+        rotation=90,
+        fontsize=12,
         fontweight="bold",
+        clip_on=False,
     )
     fig.suptitle(
         f"Average Tax-Day Snapshots Across Dense Logs ({suffix})",
@@ -9586,15 +10179,16 @@ def tax_bracket_correlation_outcome_table_average(
     top_first=True,
     exclude_highest_bracket=True,
     min_tax_period=1,
+    count_measure="cumulative",
 ):
     """
     Measure how tax rates align with occupied income brackets by tax period.
 
-    The correlation is Pearson corr(tax rate by bracket, number of agents in
-    bracket), computed separately for each rollout, tax period, and planner
-    region. Positive values mean higher rates are assigned to more populated
-    brackets; negative values mean higher rates are assigned to less populated
-    brackets. Outcomes are the same production/equality values used by the
+    The correlation is computed separately for each rollout, tax period, and
+    planner region. By default, ``count_measure="cumulative"`` uses the number
+    of agents in the current bracket plus all lower brackets for each bracket.
+    Set ``count_measure="current"`` to use only the number of agents in each
+    bracket. Outcomes are the same production/equality values used by the
     compact tax-bracket snapshot plots.
     """
     import numpy as np
@@ -9603,6 +10197,8 @@ def tax_bracket_correlation_outcome_table_average(
     log_items = _dense_log_items(run)
     if not log_items:
         raise ValueError("No dense logs found. Pass a run dict, dense_logs, or a dense log.")
+    if count_measure not in {"cumulative", "current"}:
+        raise ValueError("count_measure must be 'cumulative' or 'current'.")
 
     labels = None
     rows = []
@@ -9668,7 +10264,8 @@ def tax_bracket_correlation_outcome_table_average(
                     .to_numpy(dtype=float)
                 )
 
-                corr = pearson_corr(rates[include_idx], day_counts[include_idx])
+                count_values = np.cumsum(day_counts) if count_measure == "cumulative" else day_counts
+                corr = pearson_corr(rates[include_idx], count_values[include_idx])
                 swf_row = df_swf_one[
                     (df_swf_one["tax_day_number"] == tax_day)
                     & (df_swf_one["planner_region"] == region)
@@ -9688,6 +10285,8 @@ def tax_bracket_correlation_outcome_table_average(
                     "planner_id": planner_id,
                     "tax_count_corr": corr,
                     "mean_tax_rate_included": float(np.nanmean(rates[include_idx])) if len(include_idx) else np.nan,
+                    "count_measure": count_measure,
+                    "mean_count_measure_included": float(np.nanmean(count_values[include_idx])) if len(include_idx) else np.nan,
                     "mean_agents_per_bracket_included": float(np.nanmean(day_counts[include_idx])) if len(include_idx) else np.nan,
                     "total_agents_included": float(np.nansum(day_counts[include_idx])) if len(include_idx) else np.nan,
                     "production": production,
@@ -9731,6 +10330,7 @@ def plot_tax_bracket_correlation_outcomes_average(
     top_first=True,
     exclude_highest_bracket=True,
     min_tax_period=1,
+    count_measure="cumulative",
     show_std=True,
     figsize=(14, 10),
 ):
@@ -9753,6 +10353,7 @@ def plot_tax_bracket_correlation_outcomes_average(
         top_first=top_first,
         exclude_highest_bracket=exclude_highest_bracket,
         min_tax_period=min_tax_period,
+        count_measure=count_measure,
     )
 
     colors = {"top": "#1f77b4", "bottom": "#d62728"}
@@ -9828,35 +10429,66 @@ def plot_tax_bracket_correlation_outcomes_average(
             ax.plot(xs, slope * xs + intercept, color="0.2", linewidth=1.8, linestyle="--")
 
     ax_corr.axhline(0, color="0.25", linewidth=1.0, linestyle="--")
+    count_label = (
+        "cumulative n agents"
+        if count_measure == "cumulative"
+        else "n agents"
+    )
+
     ax_corr.set_title("Tax-Count Correlation by Tax Period")
     ax_corr.set_xlabel("tax period")
-    ax_corr.set_ylabel("corr(tax rate, n agents)")
+    ax_corr.set_ylabel(f"corr(tax rate, {count_label})")
     ax_corr.set_ylim(-1.05, 1.05)
     ax_corr.grid(True, alpha=0.25)
     ax_corr.legend(frameon=True)
+    avg_corr_lines = []
+    for region in ["top", "bottom"]:
+        vals = summary.loc[
+            summary["planner_region"].eq(region),
+            "tax_count_corr",
+        ].to_numpy(dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if len(vals):
+            avg_corr_lines.append(f"{region} avg corr: {float(np.nanmean(vals)):+.3f}")
+    if avg_corr_lines:
+        ax_corr.text(
+            0.5,
+            0.04,
+            "\n".join(avg_corr_lines),
+            transform=ax_corr.transAxes,
+            ha="center",
+            va="bottom",
+            fontsize=9,
+            bbox=dict(facecolor="white", edgecolor="0.75", alpha=0.86),
+        )
 
     ax_eq.axvline(0, color="0.25", linewidth=1.0, linestyle="--")
     ax_eq.set_title("Equality vs Tax-Count Correlation")
-    ax_eq.set_xlabel("corr(tax rate, n agents)")
+    ax_eq.set_xlabel(f"corr(tax rate, {count_label})")
     ax_eq.set_ylabel("equality")
     ax_eq.grid(True, alpha=0.25)
     ax_eq.legend(frameon=True)
 
     ax_prod.axvline(0, color="0.25", linewidth=1.0, linestyle="--")
     ax_prod.set_title("Production vs Tax-Count Correlation")
-    ax_prod.set_xlabel("corr(tax rate, n agents)")
+    ax_prod.set_xlabel(f"corr(tax rate, {count_label})")
     ax_prod.set_ylabel("production")
     ax_prod.grid(True, alpha=0.25)
     ax_prod.legend(frameon=True)
 
     bracket_note = "excluding highest bracket" if exclude_highest_bracket else "including all brackets"
+    count_note = (
+        "cumulative bracket counts"
+        if count_measure == "cumulative"
+        else "current bracket counts"
+    )
     period_note = (
         f", tax periods >= {int(min_tax_period)}"
         if int(min_tax_period) > 1
         else ""
     )
     fig.suptitle(
-        f"Tax Bracket Alignment vs Equality and Production ({bracket_note}{period_note})",
+        f"Tax Bracket Alignment vs Equality and Production ({count_note}, {bracket_note}{period_note})",
         fontsize=14,
         fontweight="bold",
     )
@@ -12988,6 +13620,346 @@ def travel_tax_regression_table_for_run(
     else:
         raise ValueError("cluster_by must be 'agent' or 'rollout_agent'.")
     return out
+
+
+def plot_travel_probability_regression_all_variables(
+    run,
+    period=100,
+    visible_radius=5,
+    income_window=100,
+    rate_disc=0.05,
+    cluster_by="agent",
+    include_tax_period_fixed_effects=True,
+    include_agent_fixed_effects=False,
+    figsize=(14, 6.2),
+):
+    """
+    Logistic regression for travel probability using environmental, market, and tax variables.
+
+    This combines the variables from ``plot_travel_probability_regression`` and
+    ``plot_travel_probability_regression_tax`` in one model. If agent fixed
+    effects are included, skill is omitted because it is time-invariant for each
+    agent and is absorbed by the fixed effects.
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    try:
+        import statsmodels.api as sm
+    except ModuleNotFoundError:
+        sm = None
+
+    df = travel_tax_regression_table_for_run(
+        run,
+        period=period,
+        visible_radius=visible_radius,
+        income_window=income_window,
+        rate_disc=rate_disc,
+        cluster_by=cluster_by,
+    )
+
+    base_features = [
+        "mean_coin",
+        "period_coin_change",
+        "other_minus_current_local_market_price",
+        "mean_visible_resources",
+        "mean_visible_other_houses",
+        "mean_visible_own_houses",
+        "current_region_avg_tax",
+        "other_minus_current_tax_due",
+        "skill_build_payment",
+    ]
+    within_agent_features = [
+        "mean_coin",
+        "period_coin_change",
+        "other_minus_current_local_market_price",
+        "mean_visible_resources",
+        "mean_visible_other_houses",
+        "mean_visible_own_houses",
+        "current_region_avg_tax",
+        "other_minus_current_tax_due",
+    ]
+    feature_labels = {
+        "mean_coin": "Mean coin",
+        "period_coin_change": "Period income / coin change",
+        "other_minus_current_local_market_price": "Other minus current local market price",
+        "mean_visible_resources": "Visible resources",
+        "mean_visible_other_houses": "Visible other houses",
+        "mean_visible_own_houses": "Visible own houses",
+        "current_region_avg_tax": "Average tax faced",
+        "other_minus_current_tax_due": "Other minus current tax due",
+        "skill_build_payment": "Skill",
+    }
+
+    model_features = within_agent_features if include_agent_fixed_effects else base_features
+    model_cols = [
+        "did_travel_int",
+        "tax_period",
+        "agent",
+        "cluster_id",
+        *model_features,
+    ]
+    model_df = df[model_cols].copy()
+    model_df["did_travel_int"] = pd.to_numeric(model_df["did_travel_int"], errors="coerce")
+    for feature in model_features:
+        model_df[feature] = pd.to_numeric(model_df[feature], errors="coerce")
+    model_df = model_df.dropna(subset=model_cols).copy()
+
+    if model_df["did_travel_int"].nunique() < 2:
+        event_rate = float(model_df["did_travel_int"].mean()) if len(model_df) else np.nan
+        coef_df = pd.DataFrame([{
+            "feature": feature,
+            "label": feature_labels[feature],
+            "coef": np.nan,
+            "std_error": np.nan,
+            "p_value": np.nan,
+            "odds_ratio": np.nan,
+            "ci_low": np.nan,
+            "ci_high": np.nan,
+        } for feature in model_features])
+        fit_df = pd.DataFrame([{
+            "n_obs": int(len(model_df)),
+            "n_events": int(model_df["did_travel_int"].sum()) if len(model_df) else 0,
+            "event_rate": event_rate,
+            "n_clusters": int(model_df["cluster_id"].nunique()) if len(model_df) else 0,
+            "mcfadden_pseudo_r2": np.nan,
+            "log_likelihood": np.nan,
+            "ll_null": np.nan,
+            "aic": np.nan,
+            "bic": np.nan,
+            "auc": np.nan,
+            "tax_period_fixed_effects": bool(include_tax_period_fixed_effects),
+            "agent_fixed_effects": bool(include_agent_fixed_effects),
+            "clustered_se_by": cluster_by,
+            "note": "not estimated: did_travel has no variation after filtering",
+        }])
+        fig, ax = plt.subplots(figsize=(9, 4), constrained_layout=True)
+        ax.axis("off")
+        ax.text(
+            0.02,
+            0.72,
+            "Logistic regression was not estimated.\n\n"
+            "The dependent variable did_travel has no variation after filtering:\n"
+            f"observations = {fit_df.at[0, 'n_obs']}, "
+            f"travel events = {fit_df.at[0, 'n_events']}, "
+            f"event rate = {event_rate:.3f}.",
+            va="top",
+            ha="left",
+            fontsize=12,
+        )
+        fig.suptitle("All-Variable Logistic Regression: Probability of Travel", fontsize=14, fontweight="bold")
+        fit_summary = pd.DataFrame([
+            ["Observations", f"{fit_df.at[0, 'n_obs']}"],
+            ["Travel events", f"{fit_df.at[0, 'n_events']}"],
+            ["Event rate", f"{fit_df.at[0, 'event_rate']:.3f}"],
+            ["Clusters", f"{fit_df.at[0, 'n_clusters']} ({cluster_by})"],
+            ["Pseudo-R2 (McFadden)", "not estimated"],
+            ["AUC", "not estimated"],
+            ["Tax-period FE", "yes" if include_tax_period_fixed_effects else "no"],
+            ["Agent FE", "yes" if include_agent_fixed_effects else "no"],
+        ], columns=["statistic", "value"])
+        model_tables = {"coefficients": coef_df, "fit": fit_df, "fit_summary": fit_summary}
+        results = {"main": None, "X": None, "y": None, "model_df": model_df}
+        return fig, model_tables, df, results
+
+    for feature in model_features:
+        std = float(model_df[feature].std())
+        mean = float(model_df[feature].mean())
+        model_df[f"z_{feature}"] = 0.0 if std <= 1e-12 else (model_df[feature] - mean) / std
+
+    x_parts = [model_df[[f"z_{feature}" for feature in model_features]]]
+    if include_tax_period_fixed_effects:
+        x_parts.append(pd.get_dummies(model_df["tax_period"].astype(int), prefix="period", drop_first=True, dtype=float))
+    if include_agent_fixed_effects:
+        x_parts.append(pd.get_dummies(model_df["agent"].astype(int), prefix="agent", drop_first=True, dtype=float))
+    X = pd.concat(x_parts, axis=1)
+    if sm is not None:
+        X = sm.add_constant(X, has_constant="add")
+    else:
+        X.insert(0, "const", 1.0)
+    y = model_df["did_travel_int"].astype(float)
+
+    if sm is not None:
+        model = sm.Logit(y, X)
+        try:
+            result = model.fit(
+                disp=False,
+                maxiter=300,
+                cov_type="cluster",
+                cov_kwds={"groups": model_df["cluster_id"]},
+            )
+        except Exception:
+            result = model.fit(disp=False, maxiter=300)
+        params = result.params
+        pvalues = result.pvalues
+        conf = result.conf_int()
+        pred = np.asarray(result.predict(X), dtype=float)
+        llf = float(result.llf)
+        llnull = float(result.llnull) if hasattr(result, "llnull") else np.nan
+        pseudo_r2 = float(getattr(result, "prsquared", np.nan))
+        aic = float(result.aic)
+        bic = float(result.bic)
+        result_obj = result
+    else:
+        import math
+
+        def normal_cdf(x):
+            return 0.5 * (1.0 + math.erf(float(x) / math.sqrt(2.0)))
+
+        def sigmoid(z):
+            z = np.clip(z, -35, 35)
+            return 1.0 / (1.0 + np.exp(-z))
+
+        X_np = X.to_numpy(dtype=float)
+        y_np = y.to_numpy(dtype=float)
+        beta = np.zeros(X_np.shape[1], dtype=float)
+        ridge = 1e-8
+
+        for _ in range(300):
+            eta = X_np @ beta
+            prob = sigmoid(eta)
+            w = np.clip(prob * (1.0 - prob), 1e-8, None)
+            hessian = X_np.T @ (X_np * w[:, None])
+            grad = X_np.T @ (y_np - prob)
+            step = np.linalg.solve(
+                hessian + ridge * np.eye(hessian.shape[0]),
+                grad,
+            )
+            beta_new = beta + step
+            if np.max(np.abs(step)) < 1e-8:
+                beta = beta_new
+                break
+            beta = beta_new
+
+        pred = sigmoid(X_np @ beta)
+        w = np.clip(pred * (1.0 - pred), 1e-8, None)
+        bread = np.linalg.pinv(X_np.T @ (X_np * w[:, None]))
+        scores = X_np * (y_np - pred)[:, None]
+        meat = np.zeros((X_np.shape[1], X_np.shape[1]), dtype=float)
+        groups = model_df["cluster_id"].to_numpy()
+        unique_groups = pd.unique(groups)
+        for group in unique_groups:
+            sg = scores[groups == group].sum(axis=0)
+            meat += np.outer(sg, sg)
+        cov = bread @ meat @ bread
+        n_obs = X_np.shape[0]
+        n_params = X_np.shape[1]
+        n_clusters = len(unique_groups)
+        if n_clusters > 1 and n_obs > n_params:
+            cov *= (n_clusters / (n_clusters - 1.0)) * ((n_obs - 1.0) / (n_obs - n_params))
+        se = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+        z_vals = np.divide(beta, se, out=np.zeros_like(beta), where=se > 0)
+        p_vals = np.asarray([2.0 * (1.0 - normal_cdf(abs(z))) for z in z_vals])
+        ci_low = beta - 1.96 * se
+        ci_high = beta + 1.96 * se
+
+        params = pd.Series(beta, index=X.columns)
+        pvalues = pd.Series(p_vals, index=X.columns)
+        conf = pd.DataFrame({0: ci_low, 1: ci_high}, index=X.columns)
+        eps = 1e-12
+        llf = float(np.sum(y_np * np.log(pred + eps) + (1.0 - y_np) * np.log(1.0 - pred + eps)))
+        mean_y = np.clip(float(np.mean(y_np)), eps, 1.0 - eps)
+        llnull = float(np.sum(y_np * np.log(mean_y) + (1.0 - y_np) * np.log(1.0 - mean_y)))
+        pseudo_r2 = float(1.0 - llf / llnull) if llnull != 0 else np.nan
+        aic = float(2 * n_params - 2 * llf)
+        bic = float(np.log(n_obs) * n_params - 2 * llf)
+        result_obj = {
+            "params": params,
+            "pvalues": pvalues,
+            "conf_int": conf,
+            "cov_cluster": cov,
+            "method": "numpy_logit_cluster_fallback",
+        }
+
+    coef_rows = []
+    for feature in model_features:
+        name = f"z_{feature}"
+        coef = float(params[name])
+        ci_low, ci_high = conf.loc[name].astype(float).tolist()
+        coef_rows.append({
+            "feature": feature,
+            "label": feature_labels[feature],
+            "coef": coef,
+            "odds_ratio": float(np.exp(coef)),
+            "ci_low": float(np.exp(ci_low)),
+            "ci_high": float(np.exp(ci_high)),
+            "p_value": float(pvalues[name]),
+        })
+    coef_df = pd.DataFrame(coef_rows).sort_values("odds_ratio")
+
+    y_arr = y.to_numpy(dtype=float)
+    pos = pred[y_arr == 1]
+    neg = pred[y_arr == 0]
+    if len(pos) and len(neg):
+        ranks = pd.Series(pred).rank(method="average").to_numpy(dtype=float)
+        auc = float((np.sum(ranks[y_arr == 1]) - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg)))
+    else:
+        auc = np.nan
+
+    fit_df = pd.DataFrame([{
+        "n_obs": int(len(model_df)),
+        "n_events": int(y.sum()),
+        "event_rate": float(y.mean()),
+        "n_clusters": int(model_df["cluster_id"].nunique()),
+        "mcfadden_pseudo_r2": pseudo_r2,
+        "log_likelihood": llf,
+        "ll_null": llnull,
+        "aic": aic,
+        "bic": bic,
+        "auc": auc,
+        "tax_period_fixed_effects": bool(include_tax_period_fixed_effects),
+        "agent_fixed_effects": bool(include_agent_fixed_effects),
+        "clustered_se_by": cluster_by,
+    }])
+
+    fig, (ax_or, ax_p) = plt.subplots(1, 2, figsize=figsize, constrained_layout=True)
+    y_pos = np.arange(len(coef_df))
+    ax_or.errorbar(
+        coef_df["odds_ratio"],
+        y_pos,
+        xerr=[
+            coef_df["odds_ratio"] - coef_df["ci_low"],
+            coef_df["ci_high"] - coef_df["odds_ratio"],
+        ],
+        fmt="o",
+        color="#1f77b4",
+        ecolor="0.35",
+        capsize=4,
+    )
+    ax_or.axvline(1.0, color="0.25", linestyle="--", linewidth=1)
+    ax_or.set_yticks(y_pos)
+    ax_or.set_yticklabels(coef_df["label"])
+    ax_or.set_xscale("log")
+    ax_or.set_xlabel("Odds ratio for +1 std increase")
+    ax_or.set_title("Variable Significance: Odds Ratios")
+    ax_or.grid(True, axis="x", alpha=0.25)
+
+    p_df = coef_df.sort_values("p_value", ascending=False)
+    colors = ["#c92a2a" if p < 0.05 else "0.65" for p in p_df["p_value"]]
+    ax_p.barh(p_df["label"], p_df["p_value"], color=colors, alpha=0.85)
+    ax_p.axvline(0.05, color="0.2", linestyle="--", linewidth=1, label="p = 0.05")
+    ax_p.set_xlim(0, min(1.0, max(0.1, float(np.nanmax(p_df["p_value"])) * 1.15)))
+    ax_p.set_xlabel("Cluster-robust p-value")
+    ax_p.set_title("Statistical Significance")
+    ax_p.legend(frameon=True)
+    ax_p.grid(True, axis="x", alpha=0.25)
+
+    fit_summary = pd.DataFrame([
+        ["Observations", f"{fit_df.at[0, 'n_obs']}"],
+        ["Travel events", f"{fit_df.at[0, 'n_events']}"],
+        ["Event rate", f"{fit_df.at[0, 'event_rate']:.3f}"],
+        ["Clusters", f"{fit_df.at[0, 'n_clusters']} ({cluster_by})"],
+        ["Pseudo-R2 (McFadden)", f"{fit_df.at[0, 'mcfadden_pseudo_r2']:.3f}"],
+        ["AUC", f"{fit_df.at[0, 'auc']:.3f}"],
+        ["Tax-period FE", "yes" if include_tax_period_fixed_effects else "no"],
+        ["Agent FE", "yes" if include_agent_fixed_effects else "no"],
+    ], columns=["statistic", "value"])
+
+    fig.suptitle("All-Variable Logistic Regression: Probability of Travel", fontsize=16, fontweight="bold")
+    model_tables = {"coefficients": coef_df, "fit": fit_df, "fit_summary": fit_summary}
+    results = {"main": result_obj, "X": X, "y": y, "model_df": model_df}
+    return fig, model_tables, df, results
 
 
 def plot_travel_probability_regression(
