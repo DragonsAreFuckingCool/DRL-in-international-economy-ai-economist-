@@ -1,0 +1,6 @@
+{
+  "phase1": "C:\\Users\\adria/ray_results\\PPO_RLlibEnvWrapper_2026-05-19_19-41-35i9wdss52\\checkpoint_5\\checkpoint-5",
+  "phase2": "C:\\Users\\adria/ray_results\\PPO_RLlibEnvWrapper_2026-05-19_19-43-57m1r67p4i\\checkpoint_15\\checkpoint-15",
+  "phase3a": "C:\\Users\\adria/ray_results\\PPO_RLlibEnvWrapper_2026-05-19_19-52-24pj129n1f\\checkpoint_5\\checkpoint-5",
+  "phase3b": "results\\travel-on__regionaltrade-off__layout-stacked_51x25_symetric_original__final_travel_v2_10_12_20260519_194135\\ray_checkpoints\\phase3b\\checkpoint_15\\checkpoint-15"
+}

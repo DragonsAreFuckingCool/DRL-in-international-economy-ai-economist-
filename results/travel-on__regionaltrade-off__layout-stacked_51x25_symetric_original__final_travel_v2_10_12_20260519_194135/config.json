@@ -1,0 +1,646 @@
+{
+  "framework": "tf",
+  "phase1_iters": 5,
+  "phase2_iters": 15,
+  "phase3a_iters": 5,
+  "phase3b_iters": 15,
+  "num_workers": 1,
+  "num_envs_per_worker": 1,
+  "num_gpus": 1,
+  "num_cpus_per_worker": 1,
+  "rollout_fragment_length": 200,
+  "train_batch_size": 200,
+  "sgd_minibatch_size": 100,
+  "num_sgd_iter": 4,
+  "min_band": 3,
+  "period": 100,
+  "episode_length": 1000,
+  "world_size": [
+    51,
+    25
+  ],
+  "layout_file": "stacked_51x25_symetric_original.txt",
+  "save_results": true,
+  "results_dir": "results",
+  "restrict_trade_to_region": false,
+  "travel_enabled_phase1": false,
+  "travel_enabled_phase2": false,
+  "travel_enabled_phase3a": true,
+  "travel_enabled_phase3b": true,
+  "travel_cost_coin_phase1": 2,
+  "travel_cost_labor_phase1": 2,
+  "travel_cooldown_phase1": 20,
+  "travel_cost_coin_phase2": 2,
+  "travel_cost_labor_phase2": 2,
+  "travel_cooldown_phase2": 20,
+  "travel_cost_coin_phase3a": 10,
+  "travel_cost_labor_phase3a": 12,
+  "travel_cooldown_phase3a": 101,
+  "travel_cost_coin_phase3b": 10,
+  "travel_cost_labor_phase3b": 12,
+  "travel_cooldown_phase3b": 101,
+  "fixed_tax_planner_id": null,
+  "fixed_tax_bracket_rates": [
+    0.3,
+    0.25,
+    0.2,
+    0.15,
+    0.1,
+    0.05,
+    0.0
+  ],
+  "fixed_tax_bracket_rates_top": [
+    0.05,
+    0.07,
+    0.17,
+    0.19,
+    0.27,
+    0.3,
+    0.32
+  ],
+  "fixed_tax_bracket_rates_bottom": [
+    0.1,
+    0.12,
+    0.22,
+    0.24,
+    0.32,
+    0.35,
+    0.37
+  ],
+  "experiment_extra_tag": "final_travel_v2_10_12",
+  "experiment_name": "travel-on__regionaltrade-off__layout-stacked_51x25_symetric_original__final_travel_v2_10_12",
+  "env_config_dict_phase1": {
+    "scenario_name": "custom/splitworld_overlay_regional",
+    "env_layout_file": "stacked_51x25_symetric_original.txt",
+    "world_size": [
+      51,
+      25
+    ],
+    "episode_length": 1000,
+    "starting_agent_coin": 0,
+    "fixed_four_skill_and_loc": false,
+    "n_agents": 8,
+    "planner_subclasses": [
+      "TopPlanner",
+      "BottomPlanner"
+    ],
+    "multi_action_mode_planner": true,
+    "multi_action_mode_agents": true,
+    "flatten_observations": true,
+    "flatten_masks": true,
+    "dense_log_frequency": 1,
+    "agent_start_locs": [
+      [
+        0,
+        0
+      ],
+      [
+        24,
+        0
+      ],
+      [
+        0,
+        24
+      ],
+      [
+        24,
+        24
+      ],
+      [
+        26,
+        0
+      ],
+      [
+        50,
+        0
+      ],
+      [
+        26,
+        24
+      ],
+      [
+        50,
+        24
+      ]
+    ],
+    "agent_start_build_payment_multipliers": [
+      1.1,
+      1.3,
+      1.6,
+      2.2,
+      1.1,
+      1.3,
+      1.6,
+      2.2
+    ],
+    "components": [
+      [
+        "Build",
+        {
+          "skill_dist": "pareto",
+          "payment_max_skill_multiplier": 3,
+          "build_labor": 2.1,
+          "payment": 10
+        }
+      ],
+      [
+        "ContinuousDoubleAuction",
+        {
+          "max_bid_ask": 10,
+          "order_labor": 0.05,
+          "max_num_orders": 5,
+          "order_duration": 50,
+          "restrict_trade_to_region": false,
+          "cross_region_trade_tax_mode": "percent",
+          "cross_region_trade_tax_flat": 0.0,
+          "cross_region_trade_tax_rate": 0.1,
+          "cross_region_trade_tax_sink": false
+        }
+      ],
+      [
+        "Gather",
+        {
+          "move_labor": 0.21,
+          "collect_labor": 0.21,
+          "skill_dist": "pareto",
+          "custom_gather_multipliers": [
+            1.5,
+            1.5,
+            1.5,
+            1.5,
+            1.5,
+            1.5,
+            1.5,
+            1.5
+          ]
+        }
+      ],
+      [
+        "RegionalPeriodicBracketTax",
+        {
+          "region": "top",
+          "planner_id": "p_top",
+          "period": 100,
+          "bracket_spacing": "us-federal",
+          "usd_scaling": 1000,
+          "disable_taxes": true
+        }
+      ],
+      [
+        "RegionalPeriodicBracketTax",
+        {
+          "region": "bottom",
+          "planner_id": "p_bottom",
+          "period": 100,
+          "bracket_spacing": "us-federal",
+          "usd_scaling": 1000,
+          "disable_taxes": true
+        }
+      ],
+      [
+        "CrossWaterTravel",
+        {
+          "enabled": false,
+          "travel_cost_coin": 2,
+          "travel_cost_labor": 2,
+          "cooldown": 20,
+          "allow_only_agent": null
+        }
+      ]
+    ]
+  },
+  "env_config_dict_phase2": {
+    "scenario_name": "custom/splitworld_overlay_regional",
+    "env_layout_file": "stacked_51x25_symetric_original.txt",
+    "world_size": [
+      51,
+      25
+    ],
+    "episode_length": 1000,
+    "starting_agent_coin": 0,
+    "fixed_four_skill_and_loc": false,
+    "n_agents": 8,
+    "planner_subclasses": [
+      "TopPlanner",
+      "BottomPlanner"
+    ],
+    "multi_action_mode_planner": true,
+    "multi_action_mode_agents": true,
+    "flatten_observations": true,
+    "flatten_masks": true,
+    "dense_log_frequency": 1,
+    "agent_start_locs": [
+      [
+        0,
+        0
+      ],
+      [
+        24,
+        0
+      ],
+      [
+        0,
+        24
+      ],
+      [
+        24,
+        24
+      ],
+      [
+        26,
+        0
+      ],
+      [
+        50,
+        0
+      ],
+      [
+        26,
+        24
+      ],
+      [
+        50,
+        24
+      ]
+    ],
+    "agent_start_build_payment_multipliers": [
+      1.1,
+      1.3,
+      1.6,
+      2.2,
+      1.1,
+      1.3,
+      1.6,
+      2.2
+    ],
+    "components": [
+      [
+        "Build",
+        {
+          "skill_dist": "pareto",
+          "payment_max_skill_multiplier": 3,
+          "build_labor": 2.1,
+          "payment": 10
+        }
+      ],
+      [
+        "ContinuousDoubleAuction",
+        {
+          "max_bid_ask": 10,
+          "order_labor": 0.05,
+          "max_num_orders": 5,
+          "order_duration": 50,
+          "restrict_trade_to_region": false,
+          "cross_region_trade_tax_mode": "percent",
+          "cross_region_trade_tax_flat": 0.0,
+          "cross_region_trade_tax_rate": 0.1,
+          "cross_region_trade_tax_sink": false
+        }
+      ],
+      [
+        "Gather",
+        {
+          "move_labor": 0.21,
+          "collect_labor": 0.21,
+          "skill_dist": "pareto",
+          "custom_gather_multipliers": [
+            1.5,
+            1.5,
+            1.5,
+            1.5,
+            1.5,
+            1.5,
+            1.5,
+            1.5
+          ]
+        }
+      ],
+      [
+        "RegionalPeriodicBracketTax",
+        {
+          "region": "top",
+          "planner_id": "p_top",
+          "period": 100,
+          "bracket_spacing": "us-federal",
+          "usd_scaling": 1000,
+          "disable_taxes": false,
+          "tax_model": "model_wrapper",
+          "tax_annealing_schedule": [
+            0,
+            0.0125
+          ]
+        }
+      ],
+      [
+        "RegionalPeriodicBracketTax",
+        {
+          "region": "bottom",
+          "planner_id": "p_bottom",
+          "period": 100,
+          "bracket_spacing": "us-federal",
+          "usd_scaling": 1000,
+          "disable_taxes": false,
+          "tax_model": "model_wrapper",
+          "tax_annealing_schedule": [
+            0,
+            0.0125
+          ]
+        }
+      ],
+      [
+        "CrossWaterTravel",
+        {
+          "enabled": false,
+          "travel_cost_coin": 2,
+          "travel_cost_labor": 2,
+          "cooldown": 20,
+          "allow_only_agent": null
+        }
+      ]
+    ]
+  },
+  "env_config_dict_phase3a": {
+    "scenario_name": "custom/splitworld_overlay_regional",
+    "env_layout_file": "stacked_51x25_symetric_original.txt",
+    "world_size": [
+      51,
+      25
+    ],
+    "episode_length": 1000,
+    "starting_agent_coin": 0,
+    "fixed_four_skill_and_loc": false,
+    "n_agents": 8,
+    "planner_subclasses": [
+      "TopPlanner",
+      "BottomPlanner"
+    ],
+    "multi_action_mode_planner": true,
+    "multi_action_mode_agents": true,
+    "flatten_observations": true,
+    "flatten_masks": true,
+    "dense_log_frequency": 1,
+    "agent_start_locs": [
+      [
+        0,
+        0
+      ],
+      [
+        24,
+        0
+      ],
+      [
+        0,
+        24
+      ],
+      [
+        24,
+        24
+      ],
+      [
+        26,
+        0
+      ],
+      [
+        50,
+        0
+      ],
+      [
+        26,
+        24
+      ],
+      [
+        50,
+        24
+      ]
+    ],
+    "agent_start_build_payment_multipliers": [
+      1.1,
+      1.3,
+      1.6,
+      2.2,
+      1.1,
+      1.3,
+      1.6,
+      2.2
+    ],
+    "components": [
+      [
+        "Build",
+        {
+          "skill_dist": "pareto",
+          "payment_max_skill_multiplier": 3,
+          "build_labor": 2.1,
+          "payment": 10
+        }
+      ],
+      [
+        "ContinuousDoubleAuction",
+        {
+          "max_bid_ask": 10,
+          "order_labor": 0.05,
+          "max_num_orders": 5,
+          "order_duration": 50,
+          "restrict_trade_to_region": false,
+          "cross_region_trade_tax_mode": "percent",
+          "cross_region_trade_tax_flat": 0.0,
+          "cross_region_trade_tax_rate": 0.1,
+          "cross_region_trade_tax_sink": false
+        }
+      ],
+      [
+        "Gather",
+        {
+          "move_labor": 0.21,
+          "collect_labor": 0.21,
+          "skill_dist": "pareto",
+          "custom_gather_multipliers": [
+            1.5,
+            1.5,
+            1.5,
+            1.5,
+            1.5,
+            1.5,
+            1.5,
+            1.5
+          ]
+        }
+      ],
+      [
+        "RegionalPeriodicBracketTax",
+        {
+          "region": "top",
+          "planner_id": "p_top",
+          "period": 100,
+          "bracket_spacing": "us-federal",
+          "usd_scaling": 1000,
+          "disable_taxes": false,
+          "tax_model": "model_wrapper"
+        }
+      ],
+      [
+        "RegionalPeriodicBracketTax",
+        {
+          "region": "bottom",
+          "planner_id": "p_bottom",
+          "period": 100,
+          "bracket_spacing": "us-federal",
+          "usd_scaling": 1000,
+          "disable_taxes": false,
+          "tax_model": "model_wrapper"
+        }
+      ],
+      [
+        "CrossWaterTravel",
+        {
+          "enabled": true,
+          "travel_cost_coin": 10,
+          "travel_cost_labor": 12,
+          "cooldown": 101,
+          "allow_only_agent": null
+        }
+      ]
+    ]
+  },
+  "env_config_dict_phase3b": {
+    "scenario_name": "custom/splitworld_overlay_regional",
+    "env_layout_file": "stacked_51x25_symetric_original.txt",
+    "world_size": [
+      51,
+      25
+    ],
+    "episode_length": 1000,
+    "starting_agent_coin": 0,
+    "fixed_four_skill_and_loc": false,
+    "n_agents": 8,
+    "planner_subclasses": [
+      "TopPlanner",
+      "BottomPlanner"
+    ],
+    "multi_action_mode_planner": true,
+    "multi_action_mode_agents": true,
+    "flatten_observations": true,
+    "flatten_masks": true,
+    "dense_log_frequency": 1,
+    "agent_start_locs": [
+      [
+        0,
+        0
+      ],
+      [
+        24,
+        0
+      ],
+      [
+        0,
+        24
+      ],
+      [
+        24,
+        24
+      ],
+      [
+        26,
+        0
+      ],
+      [
+        50,
+        0
+      ],
+      [
+        26,
+        24
+      ],
+      [
+        50,
+        24
+      ]
+    ],
+    "agent_start_build_payment_multipliers": [
+      1.1,
+      1.3,
+      1.6,
+      2.2,
+      1.1,
+      1.3,
+      1.6,
+      2.2
+    ],
+    "components": [
+      [
+        "Build",
+        {
+          "skill_dist": "pareto",
+          "payment_max_skill_multiplier": 3,
+          "build_labor": 2.1,
+          "payment": 10
+        }
+      ],
+      [
+        "ContinuousDoubleAuction",
+        {
+          "max_bid_ask": 10,
+          "order_labor": 0.05,
+          "max_num_orders": 5,
+          "order_duration": 50,
+          "restrict_trade_to_region": false,
+          "cross_region_trade_tax_mode": "percent",
+          "cross_region_trade_tax_flat": 0.0,
+          "cross_region_trade_tax_rate": 0.1,
+          "cross_region_trade_tax_sink": false
+        }
+      ],
+      [
+        "Gather",
+        {
+          "move_labor": 0.21,
+          "collect_labor": 0.21,
+          "skill_dist": "pareto",
+          "custom_gather_multipliers": [
+            1.5,
+            1.5,
+            1.5,
+            1.5,
+            1.5,
+            1.5,
+            1.5,
+            1.5
+          ]
+        }
+      ],
+      [
+        "RegionalPeriodicBracketTax",
+        {
+          "region": "top",
+          "planner_id": "p_top",
+          "period": 100,
+          "bracket_spacing": "us-federal",
+          "usd_scaling": 1000,
+          "disable_taxes": false,
+          "tax_model": "model_wrapper"
+        }
+      ],
+      [
+        "RegionalPeriodicBracketTax",
+        {
+          "region": "bottom",
+          "planner_id": "p_bottom",
+          "period": 100,
+          "bracket_spacing": "us-federal",
+          "usd_scaling": 1000,
+          "disable_taxes": false,
+          "tax_model": "model_wrapper"
+        }
+      ],
+      [
+        "CrossWaterTravel",
+        {
+          "enabled": true,
+          "travel_cost_coin": 10,
+          "travel_cost_labor": 12,
+          "cooldown": 101,
+          "allow_only_agent": null
+        }
+      ]
+    ]
+  }
+}

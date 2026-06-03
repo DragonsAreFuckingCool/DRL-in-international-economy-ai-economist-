@@ -1,0 +1,16 @@
+{
+  "mean_final_coin": 944.0875,
+  "std_final_coin": 421.96538526959546,
+  "mean_final_labor": 340.9237500000031,
+  "n_trades": 2339,
+  "n_builds": 415,
+  "total_build_income": 7762.0,
+  "n_travel": 66,
+  "n_top_final": 4,
+  "n_bottom_final": 4,
+  "experiment_name": "travel-on__regionaltrade-off__layout-stacked_51x25_symetric_original__fixed_2_2_short",
+  "phase1_iters": 500,
+  "phase2_iters": 1500,
+  "phase3a_iters": 500,
+  "phase3b_iters": 1500
+}

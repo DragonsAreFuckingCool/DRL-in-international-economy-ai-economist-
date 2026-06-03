@@ -1,0 +1,6 @@
+{
+  "phase1": "/home/adbo/ray_results/PPO_RLlibEnvWrapper_2026-05-25_22-07-17ln7heo50/checkpoint_500/checkpoint-500",
+  "phase2": "/home/adbo/ray_results/PPO_RLlibEnvWrapper_2026-05-25_22-49-37syie2pn4/checkpoint_1500/checkpoint-1500",
+  "phase3a": "/home/adbo/ray_results/PPO_RLlibEnvWrapper_2026-05-26_01-00-36279is9yj/checkpoint_500/checkpoint-500",
+  "phase3b": "results/travel-on__regionaltrade-off__layout-stacked_51x25_symetric_original__fixed_seed3_short_20260525_220716/ray_checkpoints/phase3b/checkpoint_1500/checkpoint-1500"
+}
